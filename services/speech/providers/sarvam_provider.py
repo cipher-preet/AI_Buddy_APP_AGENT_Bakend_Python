@@ -1,30 +1,43 @@
 import httpx
 from apps.api_gateway.config.setting import settings
 
-print("this is api ket present", settings.SARVAM_API_KEY)
 
-async def sarvam_transcribe(file):
-
+async def sarvam_transcribe_from_path(
+    file_path: str,
+    filename: str,
+    content_type: str,
+):
     url = "https://api.sarvam.ai/speech-to-text"
 
     headers = {
-        "api-subscription-key": settings.SARVAM_API_KEY
+        "api-subscription-key": settings.SARVAM_API_KEY,
     }
 
-    files = {
-        "file": (
-            file.filename,
-            await file.read(),
-            file.content_type
-        )
+    data = {
+        "model": "saarika:v2.5",
+        "language_code": "unknown",
     }
 
-    async with httpx.AsyncClient() as client:
+    with open(file_path, "rb") as audio_file:
+        files = {
+            "file": (
+                filename,
+                audio_file,
+                content_type or "audio/wav",
+            )
+        }
 
-        response = await client.post(
-            url,
-            headers=headers,
-            files=files
-        )
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                data=data,
+                files=files,
+            )
 
+    if response.status_code >= 400:
+        print("Sarvam status:", response.status_code)
+        print("Sarvam error:", response.text)
+
+    response.raise_for_status()
     return response.json()

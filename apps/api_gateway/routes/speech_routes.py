@@ -1,9 +1,21 @@
-from fastapi import APIRouter, UploadFile, File
+from fastapi import APIRouter, UploadFile, File, Form
 from apps.api_gateway.controllers.speech_controller import (
-    transcribe_audio_controller
+    transcribe_audio_controller,
+    get_transcribe_result_controller,
 )
+
 router = APIRouter()
 
-@router.post("/transcribe")
-async def transcribe(file: UploadFile = File(...)):
-    return await transcribe_audio_controller(file)
+
+@router.post("/transcripting")
+async def transcribe(
+    user_id: str = Form(...), space_id: str = Form(...), file: UploadFile = File(...)
+):
+    return await transcribe_audio_controller(
+        file=file, user_id=user_id, space_id=space_id
+    )
+
+
+@router.get("/transcribe/{job_id}")
+async def get_transcribe_result(job_id: str):
+    return await get_transcribe_result_controller(job_id)
