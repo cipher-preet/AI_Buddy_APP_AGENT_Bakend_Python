@@ -3,7 +3,7 @@
 ### FastAPI + LangGraph + MCP + Multi-Agent AI Architecture
 
 
-### start speech worker  -->>> python -m apps.api_gateway.workers.main
+### start both speech and Vector worker  -->>> python -m apps.api_gateway.workers.main
 ### run command -->>> uvicorn apps.api_gateway.main:app --reload
 
 Enterprise-grade scalable AI agent platform built using:

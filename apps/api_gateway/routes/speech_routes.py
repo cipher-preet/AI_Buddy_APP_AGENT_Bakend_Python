@@ -9,10 +9,12 @@ router = APIRouter()
 
 @router.post("/transcripting")
 async def transcribe(
-    user_id: str = Form(...), space_id: str = Form(...), file: UploadFile = File(...)
+    user_id: str = Form(...),
+    space_id: str = Form(...),
+    files: list[UploadFile] = File(..., alias="file"),
 ):
     return await transcribe_audio_controller(
-        file=file, user_id=user_id, space_id=space_id
+        files=files, user_id=user_id, space_id=space_id
     )
 
 

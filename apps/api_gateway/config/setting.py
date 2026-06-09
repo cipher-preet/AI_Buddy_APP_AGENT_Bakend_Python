@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str
     VECTOR_SIZE: int
     QDRANT_COLLECTION: str
+    MONGO_URL: str
+    MONGO_DB_NAME:str
+    OPENAI_CHAT_MODEL: str = "gpt-4o-mini"
 
     class Config:
         env_file = ".env"

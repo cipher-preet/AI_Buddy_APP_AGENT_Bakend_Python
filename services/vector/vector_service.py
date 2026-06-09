@@ -20,5 +20,5 @@ async def store_transcript_in_vector_db(
         language_code=language_code,
         request_id=request_id,
     )
-    
+
     return result

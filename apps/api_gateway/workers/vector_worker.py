@@ -6,6 +6,7 @@ from services.queue.redis_queue import (
     pop_completed_speech_job,
     get_job_result,
     delete_speech_job,
+    push_analysis_job,
 )
 
 from services.vector.vector_service import (
@@ -24,16 +25,13 @@ async def start_vector_consumer():
                 await asyncio.sleep(1)
                 continue
 
-            print("Vector worker picked job:", job_id)
 
             job = await get_job_result(job_id)
 
             if not job:
-                print("Job not found in Redis:", job_id)
                 continue
 
             if job.get("status") != "completed":
-                print("Job not completed yet:", job_id)
                 continue
 
             result = job.get("result") or {}
@@ -58,9 +56,15 @@ async def start_vector_consumer():
                 request_id=request_id,
             )
 
-            await delete_speech_job(job_id)
+            await push_analysis_job(
+                {
+                    "user_id": user_id,
+                    "space_id": space_id,
+                    "request_id": request_id,
+                }
+            )
 
-            print("Job stored in vector DB and deleted from Redis:", job_id)
+            await delete_speech_job(job_id)
 
         except Exception as error:
             print("Vector worker error:", str(error))

@@ -34,28 +34,36 @@ async def store_transcript_in_vector_db(
 
     for index, chunk in enumerate(chunks):
         vector = await generate_embedding(chunk)
+        chunk_id = str(uuid4())
 
         point = PointStruct(
-            id=str(uuid4()),
+            id=chunk_id,
             vector=vector,
             payload={
+                "user_id": user_id,
+                "space_id": space_id,
                 "userId": user_id,
                 "spaceId": space_id,
+                "request_id": request_id,
                 "text": chunk,
+                "source": "speech",
+                "sourceType": "speech",
                 "chunkIndex": index,
+                "chunkId": chunk_id,
                 "isPublish": False,
+                "isDamaged": False,
+                "isUseful": True,
+                "chunkStatus": "active",
                 "createdAt": datetime.now(timezone.utc).isoformat(),
             },
         )
 
         points.append(point)
 
-    response = await qdrant_client.upsert(
+    await qdrant_client.upsert(
         collection_name=QDRANT_COLLECTION,
         points=points,
     )
-
-    print("thi sis quadarnt lenlpoint ", response)
 
     return {
         "success": True,

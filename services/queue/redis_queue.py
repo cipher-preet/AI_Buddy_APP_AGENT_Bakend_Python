@@ -8,6 +8,7 @@ from apps.api_gateway.config.setting import settings
 
 SPEECH_QUEUE = "speech_transcribe_queue"
 COMPLETED_SPEECH_QUEUE = "completed_speech_queue"
+ANALYSIS_QUEUE = "analysis_queue"
 
 
 redis_client = redis.from_url(
@@ -29,6 +30,10 @@ async def test_redis_connection():
 
 async def push_speech_job(job: dict):
     await redis_client.lpush(SPEECH_QUEUE, json.dumps(job))
+
+
+async def push_analysis_job(job: dict):
+    await redis_client.lpush(ANALYSIS_QUEUE, json.dumps(job))
 
 
 async def pop_speech_job():
@@ -115,6 +120,30 @@ async def pop_completed_speech_job():
 
     except RedisError as error:
         print("Redis completed queue error:", str(error))
+        await asyncio.sleep(2)
+        return None
+
+
+async def pop_analysis_job():
+    try:
+        data = await redis_client.brpop(ANALYSIS_QUEUE, timeout=5)
+
+        if not data:
+            return None
+
+        _, job = data
+        return json.loads(job)
+
+    except TimeoutError:
+        return None
+
+    except ConnectionError as error:
+        print("Redis analysis queue connection error:", str(error))
+        await asyncio.sleep(2)
+        return None
+
+    except RedisError as error:
+        print("Redis analysis queue error:", str(error))
         await asyncio.sleep(2)
         return None
 
