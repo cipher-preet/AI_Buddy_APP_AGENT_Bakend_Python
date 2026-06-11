@@ -5,6 +5,7 @@
 
 ### start both speech and Vector worker  -->>> python -m apps.api_gateway.workers.main
 ### run command -->>> uvicorn apps.api_gateway.main:app --reload
+### fro exposing endpoint call -->>>  uvicorn apps.api_gateway.main:app --host 0.0.0.0 --port 8000 --reload
 
 Enterprise-grade scalable AI agent platform built using:
 

@@ -1,8 +1,8 @@
 """MongoDB persistence service for AI-generated memory tasks and notes."""
 
 from datetime import datetime, timezone
-from uuid import uuid4
 
+from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, UpdateOne
 from pymongo.errors import BulkWriteError
@@ -64,10 +64,14 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _object_id(value: str) -> ObjectId:
+    return ObjectId(value)
+
+
 def _task_document(
     *,
-    user_id: str,
-    space_id: str,
+    user_id: ObjectId,
+    space_id: ObjectId,
     request_id: str | None,
     task: GeneratedTask,
 ) -> dict[str, object]:
@@ -75,7 +79,6 @@ def _task_document(
     due_date = task.due_date.isoformat() if task.due_date else None
 
     return {
-        "_id": str(uuid4()),
         "user_id": user_id,
         "space_id": space_id,
         "request_id": request_id,
@@ -93,14 +96,13 @@ def _task_document(
 
 def _note_document(
     *,
-    user_id: str,
-    space_id: str,
+    user_id: ObjectId,
+    space_id: ObjectId,
     request_id: str | None,
     note: GeneratedNote,
 ) -> dict[str, object]:
     now = _now()
     return {
-        "_id": str(uuid4()),
         "user_id": user_id,
         "space_id": space_id,
         "request_id": request_id,
@@ -128,8 +130,8 @@ def _is_duplicate_bulk_error(error: BulkWriteError) -> bool:
 
 async def _bulk_insert_tasks_if_new(
     *,
-    user_id: str,
-    space_id: str,
+    user_id: ObjectId,
+    space_id: ObjectId,
     request_id: str | None,
     tasks: list[GeneratedTask],
 ) -> int:
@@ -173,8 +175,8 @@ async def _bulk_insert_tasks_if_new(
 
 async def _bulk_insert_notes_if_new(
     *,
-    user_id: str,
-    space_id: str,
+    user_id: ObjectId,
+    space_id: ObjectId,
     request_id: str | None,
     notes: list[GeneratedNote],
 ) -> int:
@@ -224,15 +226,18 @@ async def save_generated_tasks_and_notes(
     output: MemoryAnalysisOutput,
 ) -> dict[str, int]:
     """Persist generated records in MongoDB and skip duplicates."""
+    user_object_id = _object_id(user_id)
+    space_object_id = _object_id(space_id)
+
     task_count = await _bulk_insert_tasks_if_new(
-        user_id=user_id,
-        space_id=space_id,
+        user_id=user_object_id,
+        space_id=space_object_id,
         request_id=request_id,
         tasks=output.tasks,
     )
     note_count = await _bulk_insert_notes_if_new(
-        user_id=user_id,
-        space_id=space_id,
+        user_id=user_object_id,
+        space_id=space_object_id,
         request_id=request_id,
         notes=output.notes,
     )
