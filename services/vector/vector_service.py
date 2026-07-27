@@ -10,7 +10,6 @@ async def store_transcript_in_vector_db(
     transcript: str,
     language_code: str | None = None,
     request_id: str | None = None,
-    session_id: str | None = None,
 ):
 
     result = await save_to_qdrant(
@@ -20,7 +19,6 @@ async def store_transcript_in_vector_db(
         transcript=transcript,
         language_code=language_code,
         request_id=request_id,
-        session_id=session_id,
     )
 
     return result

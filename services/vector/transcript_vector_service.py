@@ -10,6 +10,7 @@ from services.vector.qdrant_client import (
 )
 from services.vector.embedding_service import generate_embedding
 from services.vector.chunking import chunk_text
+from services.vector.text_sanitization import repair_transcript_text
 
 
 async def store_transcript_in_vector_db(
@@ -19,7 +20,6 @@ async def store_transcript_in_vector_db(
     transcript: str,
     language_code: str | None = None,
     request_id: str | None = None,
-    session_id: str | None = None,
 ):
     if not transcript or not transcript.strip():
         return {
@@ -32,6 +32,7 @@ async def store_transcript_in_vector_db(
 
     await ensure_collection_exists()
 
+    transcript = repair_transcript_text(transcript)
     chunks = chunk_text(transcript)
 
     points: list[PointStruct] = []
@@ -49,16 +50,12 @@ async def store_transcript_in_vector_db(
                 "userId": user_id,
                 "spaceId": space_id,
                 "request_id": request_id,
-                "session_id": session_id,
+                "job_id": job_id,
                 "text": chunk,
                 "source": "speech",
                 "sourceType": "speech",
                 "chunkIndex": index,
                 "chunkId": chunk_id,
-                "isPublish": False,
-                "isDamaged": False,
-                "isUseful": True,
-                "chunkStatus": "active",
                 "createdAt": datetime.now(timezone.utc).isoformat(),
             },
         )
