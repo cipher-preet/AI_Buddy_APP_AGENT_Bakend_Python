@@ -7,6 +7,7 @@ from openai import AsyncOpenAI
 from apps.agent_runtime.llms.prompts.memory_analysis_prompt import (
     MEMORY_ANALYSIS_CHAT_PROMPT,
 )
+from apps.agent_runtime.llms.openai.structured import parse_chat_completion
 from apps.api_gateway.config.setting import settings
 from packages.schemas.memory_analysis_schema import MemoryAnalysisOutput
 
@@ -26,16 +27,12 @@ async def generate_tasks_and_notes(
         new_context=new_context,
     )
 
-    response = await client.chat.completions.parse(
+    parsed = await parse_chat_completion(
+        client,
         model=settings.OPENAI_CHAT_MODEL,
         temperature=0,
-        response_format=MemoryAnalysisOutput,
+        response_model=MemoryAnalysisOutput,
         messages=messages,
     )
-
-    parsed = response.choices[0].message.parsed
-    if not parsed:
-        logger.error("OpenAI returned no parsed memory analysis output.")
-        raise ValueError("OpenAI returned no parsed memory analysis output.")
 
     return parsed

@@ -1,1 +1,1 @@
-"""Task and note orchestration state."""
+"""State models for agent runtime graphs."""

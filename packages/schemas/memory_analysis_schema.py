@@ -23,6 +23,10 @@ class AnalysisJob(BaseModel):
     user_id: str = Field(min_length=1)
     space_id: str = Field(min_length=1)
     request_id: str | None = None
+    job_type: str = "analyze_transcript_window"
+    window_id: str | None = None
+    chunk_ids: list[str] = Field(default_factory=list)
+    attempt: int = 1
 
 
 class GeneratedTask(BaseModel):

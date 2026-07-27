@@ -40,4 +40,11 @@ async def sarvam_transcribe_from_path(
         print("Sarvam error:", response.text)
 
     response.raise_for_status()
-    return response.json()
+    result = response.json()
+    transcript = str(result.get("transcript") or "").strip()
+    if transcript:
+        result["transcript"] = transcript
+        result["provider"] = "sarvam"
+        return result
+
+    raise ValueError("Sarvam speech transcription returned an empty transcript.")

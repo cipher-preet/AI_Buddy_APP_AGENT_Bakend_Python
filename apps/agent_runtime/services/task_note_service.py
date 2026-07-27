@@ -17,6 +17,7 @@ from packages.schemas.memory_analysis_schema import (
 SOURCE = "ai_memory_analysis"
 TASKS_COLLECTION = "ai_memory_tasks"
 NOTES_COLLECTION = "ai_memory_notes"
+SUMMARIES_COLLECTION = "ai_memory_space_summaries"
 
 mongo_client = AsyncIOMotorClient(settings.MONGO_URL)
 mongo_db = mongo_client[settings.MONGO_DB_NAME]
@@ -58,6 +59,27 @@ async def ensure_memory_collections() -> None:
         [("user_id", ASCENDING), ("space_id", ASCENDING), ("request_id", ASCENDING)],
         name="idx_ai_memory_notes_scope",
     )
+    await tasks.create_index(
+        [("user_id", ASCENDING), ("space_id", ASCENDING), ("fingerprint", ASCENDING)],
+        name="uq_ai_memory_tasks_fingerprint",
+        unique=True,
+        sparse=True,
+    )
+    await tasks.create_index(
+        [("user_id", ASCENDING), ("space_id", ASCENDING), ("status", ASCENDING), ("updated_at", ASCENDING)],
+        name="idx_ai_memory_tasks_status",
+    )
+    await notes.create_index(
+        [("user_id", ASCENDING), ("space_id", ASCENDING), ("normalized_title", ASCENDING)],
+        name="idx_ai_memory_notes_normalized_title",
+    )
+
+    summaries = mongo_db[SUMMARIES_COLLECTION]
+    await summaries.create_index(
+        [("user_id", ASCENDING), ("space_id", ASCENDING)],
+        name="uq_ai_memory_space_summary_scope",
+        unique=True,
+    )
 
 
 def _now() -> datetime:
@@ -65,7 +87,7 @@ def _now() -> datetime:
 
 
 def _object_id(value: str) -> ObjectId:
-    return ObjectId(value)
+    return ObjectId(str(value).strip())
 
 
 def _task_document(

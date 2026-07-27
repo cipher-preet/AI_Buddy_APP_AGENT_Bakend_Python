@@ -50,3 +50,5 @@ storage/
 
 # Docker
 docker-compose.override.yml
+
+resources/

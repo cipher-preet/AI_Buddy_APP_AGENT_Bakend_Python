@@ -113,17 +113,21 @@ Strict rules:
 1. Do not create anything if context is weak, unrelated, damaged, incomplete, duplicated, or neither actionable nor memorable.
 2. Ignore unused, noisy, duplicate, random, or broken chunks.
 3. Do not guess missing information.
-4. Create tasks only when the user clearly wants a future action tracked, with a concrete action, owner/responsibility, deadline, follow-up, or implementation step. Do not create a task merely because a chunk mentions a plan, instruction, testing, task division, invoice handling, API behavior, or database work.
+4. Create tasks when the user clearly wants future work tracked, with a concrete action, owner/responsibility, deadline, follow-up, implementation step, test, bug fix, optimization, integration, deployment, QA/client handoff, release step, API/database work, or task division.
 5. Create notes when the information is important for future understanding, including project context, decisions, technical observations, API/database behavior, testing status, task division, invoice handling, handoffs, constraints, and relevant problems.
 6. If context does not match a meaningful goal, return empty arrays.
 7. Do not create unnecessary tasks.
 8. Every task and note must include sourceChunkIds from the provided chunks.
 9. Confidence must be between 0 and 1.
-10. Output only valid JSON matching the structured schema.
+10. Do not create tasks for work already completed unless the speaker explicitly says to mark/update an existing task as completed.
+11. Avoid vague umbrella items such as "Finalize testing", "Integrate new features", or "Improve user experience" when the source names the real module, bug, owner, condition, sequence, or handoff.
+12. If the source contains multiple distinct next steps, create separate specific tasks. Each task description must be self-contained and include the concrete outcome and context.
+13. Notes must be detailed enough to understand later without reopening the transcript. Use organized English lines for status, key details, planned sequence, owners/handoffs, and risks/conditions when present.
+14. Output only valid JSON matching the structured schema.
 
 Task vs note policy:
 - If the source says something useful happened, is being discussed, or should be remembered, save it as a note.
-- If the source asks the assistant/user/team to do a specific future action, save it as a task.
+- If the source asks the assistant/user/team to do a specific future action, save it as a task. This includes planned engineering work, testing, QA, deployment, integration, optimization, bug fixing, and handoffs.
 - When unsure between task and note, prefer a descriptive note and leave tasks empty.
 - Notes should be descriptive enough to stand alone later: summarize what the speaker discussed, why it matters, and any concrete project/technical details present in the chunks.
 

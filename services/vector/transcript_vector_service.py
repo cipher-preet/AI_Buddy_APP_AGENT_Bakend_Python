@@ -19,12 +19,16 @@ async def store_transcript_in_vector_db(
     transcript: str,
     language_code: str | None = None,
     request_id: str | None = None,
+    session_id: str | None = None,
 ):
     if not transcript or not transcript.strip():
         return {
             "success": False,
             "message": "Transcript is empty",
         }
+
+    user_id = user_id.strip()
+    space_id = space_id.strip()
 
     await ensure_collection_exists()
 
@@ -45,6 +49,7 @@ async def store_transcript_in_vector_db(
                 "userId": user_id,
                 "spaceId": space_id,
                 "request_id": request_id,
+                "session_id": session_id,
                 "text": chunk,
                 "source": "speech",
                 "sourceType": "speech",

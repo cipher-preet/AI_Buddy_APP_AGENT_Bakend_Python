@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 from apps.agent_runtime.llms.prompts.task_note_orchestration_prompt import (
     FILTER_CHUNKS_CHAT_PROMPT,
 )
+from apps.agent_runtime.llms.openai.structured import parse_chat_completion
 from apps.agent_runtime.nodes.chunk_prompting import render_chunk_context
 from apps.agent_runtime.state.task_note_state import TaskNoteState, append_error
 from apps.api_gateway.config.setting import settings
@@ -42,15 +43,13 @@ async def filter_noise_chunks(state: TaskNoteState) -> dict[str, Any]:
     )
 
     try:
-        response = await client.chat.completions.parse(
+        parsed = await parse_chat_completion(
+            client,
             model=settings.OPENAI_CHAT_MODEL,
             temperature=0,
-            response_format=ChunkFilterOutput,
+            response_model=ChunkFilterOutput,
             messages=messages,
         )
-        parsed = response.choices[0].message.parsed
-        if not parsed:
-            raise ValueError("OpenAI returned no parsed chunk filter output.")
 
         print("this is parsed chunks ------->> ", parsed)
 
