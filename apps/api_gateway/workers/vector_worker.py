@@ -3,11 +3,15 @@
 import asyncio
 from pathlib import Path
 
+from apps.api_gateway.config.setting import settings
+from services.conversation.repository import ConversationRepository
+from services.db.mongo import get_database
 from services.queue.redis_queue import (
     delete_speech_job,
     get_job_result,
     pop_completed_speech_job,
 )
+from services.queue.streams import EventEnvelope, RedisStreamProducer
 
 from services.vector.vector_service import (
     store_transcript_in_vector_db,
@@ -72,6 +76,32 @@ async def start_vector_consumer():
                 print("Invalid completed job data:", job)
                 continue
 
+            conversation_id = str(job.get("conversation_id") or "").strip()
+            sequence_number = job.get("sequence_number")
+            if conversation_id and sequence_number is not None:
+                repository = ConversationRepository(get_database())
+                await repository.complete_transcript_chunk(
+                    conversation_id=conversation_id,
+                    sequence_number=int(sequence_number),
+                    raw_text=transcript,
+                    language_code=language_code,
+                    request_id=request_id,
+                    provider="sarvam",
+                )
+                conversation = await repository.get_conversation(conversation_id)
+                if conversation and conversation.expectedLastSequence is not None:
+                    await RedisStreamProducer().publish(
+                        settings.REDIS_FINALIZATION_STREAM,
+                        EventEnvelope(
+                            eventType="conversation.finalization.requested",
+                            correlationId=conversation_id,
+                            userId=user_id,
+                            spaceId=space_id,
+                            conversationId=conversation_id,
+                            payload={"expectedLastSequence": conversation.expectedLastSequence},
+                        ),
+                    )
+
             await store_transcript_in_vector_db(
                 user_id=user_id,
                 space_id=space_id,
@@ -88,6 +118,8 @@ async def start_vector_consumer():
                     "job_id": job_id,
                     "user_id": user_id,
                     "space_id": space_id,
+                    "conversation_id": conversation_id or None,
+                    "sequence_number": sequence_number,
                     "audio_removed": audio_removed,
                 },
             )
