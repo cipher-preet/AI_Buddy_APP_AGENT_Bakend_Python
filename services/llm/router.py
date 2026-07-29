@@ -34,7 +34,9 @@ class LLMRouter:
             LLMCapability.COMPLEX_TASK_MATCHING,
         }:
             model = settings.LLM_VALIDATION_MODEL
-        elif capability in {LLMCapability.SIMPLE_SUMMARY, LLMCapability.NORMALIZATION}:
+        elif capability == LLMCapability.SIMPLE_SUMMARY:
+            model = settings.LLM_SUMMARY_MODEL
+        elif capability == LLMCapability.NORMALIZATION:
             model = settings.LLM_FAST_MODEL
         elif capability == LLMCapability.FALLBACK:
             provider_name = settings.LLM_SECONDARY_PROVIDER

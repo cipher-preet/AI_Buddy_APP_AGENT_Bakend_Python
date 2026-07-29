@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ValidationError
 
+from apps.api_gateway.config.setting import settings
 from services.llm.errors import LLMProviderError, is_retryable_status
 from services.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StructuredLLMRequest
 
@@ -25,10 +26,12 @@ class OpenAICompatibleProvider:
         max_concurrency: int,
         auth_header: str = "Authorization",
         auth_prefix: str = "Bearer ",
+        max_tokens_limit: int | None = None,
     ):
         self.name = name
         self.default_model = default_model
         self.max_retries = max_retries
+        self.max_tokens_limit = max_tokens_limit
         self._auth_header = auth_header
         self._auth_value = f"{auth_prefix}{api_key}" if auth_prefix else api_key
         self._semaphore = asyncio.Semaphore(max_concurrency)
@@ -48,8 +51,9 @@ class OpenAICompatibleProvider:
             "temperature": request.temperature,
         }
         payload.update(request.metadata.get("extra_body") or {})
-        if request.max_tokens:
-            payload["max_tokens"] = request.max_tokens
+        max_tokens = self._bounded_max_tokens(request.max_tokens)
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
         started = time.perf_counter()
         async with self._semaphore:
             response = await self._post_with_retries("/chat/completions", payload)
@@ -117,6 +121,7 @@ class OpenAICompatibleProvider:
         schema_instruction: str | None = None,
     ) -> StructuredLLMRequest:
         structured_request = request.model_copy(deep=True)
+        structured_request.max_tokens = structured_request.max_tokens or settings.LLM_STRUCTURED_MAX_TOKENS
         structured_request.metadata.setdefault("extra_body", {})
         structured_request.metadata["extra_body"].update(
             {
@@ -139,7 +144,7 @@ class OpenAICompatibleProvider:
         response_schema: type[BaseModel],
     ) -> BaseModel:
         last_error: Exception | None = None
-        for _ in range(2):
+        for _ in range(3):
             response = await self.generate(structured_request)
             try:
                 return response_schema.model_validate_json(response.content)
@@ -193,6 +198,11 @@ class OpenAICompatibleProvider:
                 last_error = error
                 await asyncio.sleep(_retry_delay(attempt, None))
         raise LLMProviderError(f"{self.name} request failed: {last_error}", retryable=True)
+
+    def _bounded_max_tokens(self, max_tokens: int | None) -> int | None:
+        if max_tokens is None or self.max_tokens_limit is None:
+            return max_tokens
+        return min(max_tokens, self.max_tokens_limit)
 
 
 def _retry_delay(attempt: int, retry_after: str | None) -> float:

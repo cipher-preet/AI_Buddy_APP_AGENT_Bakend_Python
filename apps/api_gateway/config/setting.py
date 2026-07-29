@@ -14,10 +14,11 @@ class Settings(BaseSettings):
     SARVAM_BASE_URL: str = "https://api.sarvam.ai/v1"
     SARVAM_SPEECH_BASE_URL: str = "https://api.sarvam.ai"
     SARVAM_DEFAULT_MODEL: str = "sarvam-105b"
-    SARVAM_FAST_MODEL: str = "sarvam-30b"
+    SARVAM_FAST_MODEL: str = "sarvam-105b"
     SARVAM_TIMEOUT_SECONDS: float = 60
     SARVAM_MAX_RETRIES: int = 3
     SARVAM_MAX_CONCURRENCY: int = 8
+    SARVAM_MAX_TOKENS: int = 4096
 
     OPENAI_API_KEY: str
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
@@ -61,16 +62,19 @@ class Settings(BaseSettings):
     LLM_DEFAULT_PROVIDER: str = "sarvam"
     LLM_SECONDARY_PROVIDER: str = "openai"
     LLM_DEFAULT_MODEL: str = "sarvam-105b"
-    LLM_FAST_MODEL: str = "sarvam-30b"
+    LLM_FAST_MODEL: str = "sarvam-105b"
     LLM_VALIDATION_MODEL: str = "sarvam-105b"
-    LLM_SUMMARY_MODEL: str = "sarvam-30b"
+    LLM_SUMMARY_MODEL: str = "sarvam-105b"
     LLM_TIMEOUT_SECONDS: float = 60
     LLM_MAX_CONCURRENCY: int = 8
     LLM_TEMPERATURE: float = 0.1
+    LLM_STRUCTURED_MAX_TOKENS: int = 4096
 
     MAX_QUEUED_CONVERSATIONS_PER_USER: int = 50
     MAX_ACTIVE_PROCESSING_JOBS_PER_USER: int = 2
     MAX_ACTIVE_LLM_CALLS_PER_CONVERSATION: int = 4
+    CONVERSATION_PROCESSING_TIMEOUT_SECONDS: float = 1800
+    ENABLE_REQUEST_LOGS: bool = False
     ENABLE_TRANSCRIPT_DEBUG_LOGS: bool = False
 
     class Config:

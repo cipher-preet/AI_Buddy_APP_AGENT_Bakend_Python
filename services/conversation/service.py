@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiofiles
@@ -9,7 +9,7 @@ from fastapi import UploadFile
 
 from apps.api_gateway.config.setting import settings
 from services.conversation.models import AudioChunkMetadata, ConversationStatus, utc_now
-from services.conversation.repository import ConversationRepository
+from services.conversation.repository import ConversationRepository, same_mongo_id
 from services.db.mongo import get_database
 from services.queue.streams import EventEnvelope, RedisStreamProducer
 
@@ -31,8 +31,8 @@ class ConversationService:
         conversation_id = str(conversation.id)
         return {
             "conversationId": conversation_id,
-            "userId": conversation.userId,
-            "spaceId": conversation.spaceId,
+            "userId": str(conversation.userId),
+            "spaceId": str(conversation.spaceId),
             "status": conversation.status.value,
             "startedAt": conversation.startedAt,
         }
@@ -51,7 +51,7 @@ class ConversationService:
         conversation = await self.repository.get_conversation(conversation_id)
         if not conversation:
             raise ValueError("Conversation not found")
-        if conversation.userId != user_id or conversation.spaceId != space_id:
+        if not same_mongo_id(conversation.userId, user_id) or not same_mongo_id(conversation.spaceId, space_id):
             raise PermissionError("Conversation does not belong to this user and space")
         if conversation.status not in {ConversationStatus.RECORDING, ConversationStatus.STOP_REQUESTED}:
             raise ValueError(f"Conversation is not accepting audio: {conversation.status.value}")
@@ -108,7 +108,7 @@ class ConversationService:
         conversation = await self.repository.get_conversation(conversation_id)
         if not conversation:
             raise ValueError("Conversation not found")
-        if conversation.userId != user_id or conversation.spaceId != space_id:
+        if not same_mongo_id(conversation.userId, user_id) or not same_mongo_id(conversation.spaceId, space_id):
             raise PermissionError("Conversation does not belong to this user and space")
 
         stopped = await self.repository.transition(
@@ -139,13 +139,42 @@ class ConversationService:
         conversation = await self.repository.get_conversation(conversation_id)
         if not conversation:
             raise ValueError("Conversation not found")
-        if conversation.userId != user_id or conversation.spaceId != space_id:
+        if not same_mongo_id(conversation.userId, user_id) or not same_mongo_id(conversation.spaceId, space_id):
             raise PermissionError("Conversation does not belong to this user and space")
-        return _serialize_conversation(conversation.model_dump(by_alias=True))
+        if _is_stale_processing(conversation):
+            await self.repository.mark_active_extraction_run_failed(
+                conversation_id,
+                f"Conversation processing timed out after {settings.CONVERSATION_PROCESSING_TIMEOUT_SECONDS} seconds.",
+            )
+            await self.repository.mark_conversation_failed(
+                conversation_id,
+                f"Conversation processing timed out after {settings.CONVERSATION_PROCESSING_TIMEOUT_SECONDS} seconds.",
+            )
+            conversation = await self.repository.get_conversation(conversation_id) or conversation
+        data = _serialize_conversation(conversation.model_dump(by_alias=True))
+        if conversation.activeExtractionRunId is not None:
+            run = await self.repository.get_extraction_run(conversation.activeExtractionRunId)
+            if run:
+                data["activeExtractionRun"] = {
+                    "id": str(run.id),
+                    "status": run.status.value,
+                    "coverageScore": run.coverageScore,
+                    "validationErrors": run.validationErrors,
+                    "checkpoints": run.checkpoints,
+                    "updatedAt": run.updatedAt,
+                }
+        return data
 
 
 def _serialize_conversation(data: dict) -> dict:
-    for key in {"_id", "activeExtractionRunId"}:
+    for key in {"_id", "activeExtractionRunId", "userId", "spaceId"}:
         if data.get(key) is not None:
             data[key] = str(data[key])
     return data
+
+
+def _is_stale_processing(conversation) -> bool:
+    if conversation.status != ConversationStatus.PROCESSING:
+        return False
+    timeout = timedelta(seconds=settings.CONVERSATION_PROCESSING_TIMEOUT_SECONDS)
+    return utc_now() - conversation.updatedAt > timeout

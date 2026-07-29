@@ -123,8 +123,8 @@ class FailureClass(str, Enum):
 
 class ConversationDocument(BaseModel):
     id: Any = Field(default_factory=new_id, alias="_id")
-    userId: str
-    spaceId: str
+    userId: Any
+    spaceId: Any
     status: ConversationStatus = ConversationStatus.RECORDING
     startedAt: datetime = Field(default_factory=utc_now)
     stoppedAt: datetime | None = None
@@ -136,6 +136,7 @@ class ConversationDocument(BaseModel):
     processingVersion: int = 1
     activeExtractionRunId: Any | None = None
     missingSequences: list[int] = Field(default_factory=list)
+    lastError: str | None = None
     lastActivityAt: datetime = Field(default_factory=utc_now)
     processedAt: datetime | None = None
     createdAt: datetime = Field(default_factory=utc_now)
@@ -146,9 +147,9 @@ class ConversationDocument(BaseModel):
 
 
 class AudioChunkMetadata(BaseModel):
-    conversationId: str
-    userId: str
-    spaceId: str
+    conversationId: Any
+    userId: Any
+    spaceId: Any
     chunkId: str
     sequenceNumber: int = Field(ge=0)
     capturedAt: datetime | None = None
@@ -161,9 +162,9 @@ class AudioChunkMetadata(BaseModel):
 
 class TranscriptChunkDocument(BaseModel):
     id: Any = Field(default_factory=new_id, alias="_id")
-    conversationId: str
-    userId: str
-    spaceId: str
+    conversationId: Any
+    userId: Any
+    spaceId: Any
     chunkId: str
     sequenceNumber: int = Field(ge=0)
     rawText: str | None = None
@@ -279,9 +280,9 @@ class CoverageReport(BaseModel):
 
 class ExtractionRunDocument(BaseModel):
     id: Any = Field(default_factory=new_id, alias="_id")
-    conversationId: str
-    userId: str
-    spaceId: str
+    conversationId: Any
+    userId: Any
+    spaceId: Any
     processingVersion: int
     status: ExtractionRunStatus = ExtractionRunStatus.PROCESSING
     segmentCount: int = 0
@@ -308,9 +309,9 @@ class ExtractionRunDocument(BaseModel):
 
 class ConversationSummaryDocument(BaseModel):
     id: Any = Field(default_factory=new_id, alias="_id")
-    conversationId: str
-    userId: str
-    spaceId: str
+    conversationId: Any
+    userId: Any
+    spaceId: Any
     summary: str
     topics: list[str] = Field(default_factory=list)
     importantFacts: list[str] = Field(default_factory=list)
@@ -331,8 +332,8 @@ class ConversationSummaryDocument(BaseModel):
 
 class SpaceMemoryDocument(BaseModel):
     id: Any = Field(default_factory=new_id, alias="_id")
-    userId: str
-    spaceId: str
+    userId: Any
+    spaceId: Any
     currentSummary: str = ""
     importantFacts: list[str] = Field(default_factory=list)
     importantDecisions: list[str] = Field(default_factory=list)
@@ -340,7 +341,7 @@ class SpaceMemoryDocument(BaseModel):
     activeTaskIds: list[Any] = Field(default_factory=list)
     blockerIds: list[Any] = Field(default_factory=list)
     recentConversationSummaryIds: list[Any] = Field(default_factory=list)
-    lastUpdatedConversationId: str | None = None
+    lastUpdatedConversationId: Any | None = None
     version: int = 1
     updatedAt: datetime = Field(default_factory=utc_now)
 

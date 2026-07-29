@@ -63,37 +63,42 @@ async def extract_segment(
 ) -> SectionExtractionResult:
     background = json.dumps(context, default=str, ensure_ascii=True)
     current = segment.text
-    tasks = await _structured(
+    warnings: list[str] = []
+    tasks = await _structured_or_empty(
         router,
         "task-extractor-v1",
         TaskExtractionResponse,
         background,
         current,
         LLMCapability.HIGH_ACCURACY_REASONING,
+        warnings,
     )
-    notes = await _structured(
+    notes = await _structured_or_empty(
         router,
         "note-extractor-v1",
         NoteExtractionResponse,
         background,
         current,
         LLMCapability.HIGH_ACCURACY_REASONING,
+        warnings,
     )
-    decisions = await _structured(
+    decisions = await _structured_or_empty(
         router,
         "decision-extractor-v1",
         DecisionExtractionResponse,
         background,
         current,
         LLMCapability.HIGH_ACCURACY_REASONING,
+        warnings,
     )
-    issues = await _structured(
+    issues = await _structured_or_empty(
         router,
         "risk-question-extractor-v1",
         IssueExtractionResponse,
         background,
         current,
         LLMCapability.HIGH_ACCURACY_REASONING,
+        warnings,
     )
     result = SectionExtractionResult(
         segmentId=segment.segmentId,
@@ -101,6 +106,7 @@ async def extract_segment(
         notes=notes.notes,
         decisions=decisions.decisions,
         issues=issues.issues,
+        warnings=warnings,
     )
     for task in result.tasks:
         task.sourceConversationId = segment.conversationId
@@ -218,3 +224,19 @@ async def _structured(
         ],
     )
     return await provider.generate_structured(request, schema)
+
+
+async def _structured_or_empty(
+    router: LLMRouter,
+    prompt_name: str,
+    schema: type[BaseModel],
+    background: str,
+    current: str,
+    capability: LLMCapability,
+    warnings: list[str],
+) -> Any:
+    try:
+        return await _structured(router, prompt_name, schema, background, current, capability)
+    except Exception as error:
+        warnings.append(f"{prompt_name} failed: {str(error)[:500]}")
+        return schema()

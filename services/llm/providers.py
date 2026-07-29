@@ -20,6 +20,7 @@ def build_sarvam_provider() -> OpenAICompatibleProvider:
         max_concurrency=settings.SARVAM_MAX_CONCURRENCY,
         auth_header="api-subscription-key",
         auth_prefix="",
+        max_tokens_limit=settings.SARVAM_MAX_TOKENS,
     )
 
 

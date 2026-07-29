@@ -28,12 +28,9 @@ class ConversationProcessingWorkflow:
         conversation = await self.repository.get_conversation(conversation_id)
         if not conversation:
             raise ValueError(f"Conversation not found: {conversation_id}")
-        if conversation.status in {
-            ConversationStatus.VALIDATING,
-            ConversationStatus.COMPLETED,
-        }:
+        if conversation.status == ConversationStatus.COMPLETED:
             return
-        if conversation.status == ConversationStatus.FAILED:
+        if conversation.status in {ConversationStatus.FAILED, ConversationStatus.VALIDATING}:
             conversation = await self.repository.transition(
                 conversation_id,
                 ConversationStatus.RETRY_PENDING,
@@ -46,114 +43,119 @@ class ConversationProcessingWorkflow:
             ConversationStatus.RETRY_PENDING,
         }:
             raise ValueError(f"Conversation is not ready for processing: {conversation.status.value}")
-        provider, model = self.router.route(LLMCapability.HIGH_ACCURACY_REASONING)
-        run = await self.repository.create_extraction_run(conversation, provider.name, model)
-        await self.repository.transition(
-            conversation_id,
-            ConversationStatus.PROCESSING,
-            {"activeExtractionRunId": run.id},
-        )
-
-        chunks = await self.repository.list_transcript_chunks(conversation_id)
-        assembled = assemble_transcript(chunks)
-        context = await load_space_context(self.repository, conversation.userId, conversation.spaceId)
-        segments = segment_transcript(
-            conversation_id,
-            chunks,
-            settings.TRANSCRIPT_SEGMENT_TARGET_TOKENS,
-            settings.TRANSCRIPT_SEGMENT_OVERLAP_RATIO,
-            settings.MAX_TRANSCRIPT_SEGMENTS,
-        )
-        run.segmentCount = len(segments)
-        run.checkpoints["assembled_transcript"] = {"chunkCount": len(chunks)}
-        run.checkpoints["loaded_space_context"] = {
-            "activeTaskCount": len(context["activeTasks"]),
-            "recentSummaryCount": len(context["recentSummaries"]),
-        }
-        run.checkpoints["segmented_transcript"] = {"segmentCount": len(segments)}
-        await self.repository.save_extraction_run(run)
-        state = ConversationGraphState(
-            conversation_id=conversation_id,
-            user_id=conversation.userId,
-            space_id=conversation.spaceId,
-            processing_version=conversation.processingVersion,
-            extraction_run_id=str(run.id),
-            conversation_status=ConversationStatus.PROCESSING,
-            raw_transcript=assembled.raw_transcript,
-            normalized_transcript=assembled.normalized_transcript,
-            segments=segments,
-            space_memory=context["spaceMemory"],
-            relevant_previous_summaries=context["recentSummaries"],
-            active_tasks=context["activeTasks"],
-        )
-
-        section_results = await self._parallel_section_extraction(state, context)
-        state.section_results = section_results
-        self._merge(state)
-        self._deterministic_validate(state)
-        run.processedSegmentCount = len(section_results)
-        run.checkpoints["parallel_section_extraction"] = {"processedSegmentCount": len(section_results)}
-        run.checkpoints["merge_results"] = {
-            "taskCount": len(state.merged_tasks),
-            "noteCount": len(state.merged_notes),
-            "decisionCount": len(state.merged_decisions),
-            "issueCount": len(state.merged_questions) + len(state.merged_blockers),
-        }
-        await self.repository.save_extraction_run(run)
-        outputs = {
-            "tasks": [item.model_dump() for item in state.merged_tasks],
-            "notes": [item.model_dump() for item in state.merged_notes],
-            "decisions": [item.model_dump() for item in state.merged_decisions],
-            "issues": [item.model_dump() for item in state.merged_questions + state.merged_blockers],
-        }
-        state.coverage_report = await agents.validate_coverage(
-            self.router,
-            state.normalized_transcript,
-            outputs,
-            context,
-        )
-        if state.coverage_report.criticalMissingCount:
-            state.validation_errors.append(
-                {
-                    "code": "CRITICAL_COVERAGE_GAP",
-                    "coverage": state.coverage_report.model_dump(),
-                }
+        run = None
+        try:
+            provider, model = self.router.route(LLMCapability.HIGH_ACCURACY_REASONING)
+            run = await self.repository.create_extraction_run(conversation, provider.name, model)
+            run.status = ExtractionRunStatus.PROCESSING
+            await self.repository.transition(
+                conversation_id,
+                ConversationStatus.PROCESSING,
+                {"activeExtractionRunId": run.id},
             )
-        run.coverageScore = state.coverage_report.score if state.coverage_report else None
-        run.validationErrors = state.validation_errors
-        run.warningCount = len(state.warnings)
-        run.stagedTasks = state.merged_tasks
-        run.stagedNotes = state.merged_notes
-        run.stagedDecisions = state.merged_decisions
-        run.stagedIssues = state.merged_questions + state.merged_blockers
-        run.checkpoints["coverage_validation"] = {
-            "score": run.coverageScore,
-            "validationErrorCount": len(run.validationErrors),
-        }
 
-        await self.repository.transition(conversation_id, ConversationStatus.VALIDATING)
-        if state.validation_errors:
-            run.status = ExtractionRunStatus.FAILED
+            chunks = await self.repository.list_transcript_chunks(conversation_id)
+            assembled = assemble_transcript(chunks)
+            context = await load_space_context(self.repository, conversation.userId, conversation.spaceId)
+            segments = segment_transcript(
+                conversation_id,
+                chunks,
+                settings.TRANSCRIPT_SEGMENT_TARGET_TOKENS,
+                settings.TRANSCRIPT_SEGMENT_OVERLAP_RATIO,
+                settings.MAX_TRANSCRIPT_SEGMENTS,
+            )
+            run.segmentCount = len(segments)
+            run.checkpoints["assembled_transcript"] = {"chunkCount": len(chunks)}
+            run.checkpoints["loaded_space_context"] = {
+                "activeTaskCount": len(context["activeTasks"]),
+                "recentSummaryCount": len(context["recentSummaries"]),
+            }
+            run.checkpoints["segmented_transcript"] = {"segmentCount": len(segments)}
             await self.repository.save_extraction_run(run)
-            await self.repository.transition(conversation_id, ConversationStatus.FAILED)
-            return
+            state = ConversationGraphState(
+                conversation_id=conversation_id,
+                user_id=str(conversation.userId),
+                space_id=str(conversation.spaceId),
+                processing_version=conversation.processingVersion,
+                extraction_run_id=str(run.id),
+                conversation_status=ConversationStatus.PROCESSING,
+                raw_transcript=assembled.raw_transcript,
+                normalized_transcript=assembled.normalized_transcript,
+                segments=segments,
+                space_memory=context["spaceMemory"],
+                relevant_previous_summaries=context["recentSummaries"],
+                active_tasks=context["activeTasks"],
+            )
 
-        summary = await agents.summarize_conversation(
-            self.router,
-            conversation_id,
-            conversation.userId,
-            conversation.spaceId,
-            state.normalized_transcript,
-            outputs,
-            conversation.processingVersion,
-        )
-        previous_memory = await self.repository.get_space_memory(conversation.userId, conversation.spaceId)
-        memory = await agents.update_space_memory(self.router, previous_memory, summary)
-        await self.repository.publish_outputs(run, summary, memory)
-        await self.repository.schedule_transcript_expiry(conversation_id)
-        run.status = ExtractionRunStatus.PUBLISHED
-        await self.repository.save_extraction_run(run)
-        await self.repository.transition(conversation_id, ConversationStatus.COMPLETED)
+            section_results = await self._parallel_section_extraction(state, context)
+            state.section_results = section_results
+            self._merge(state)
+            self._deterministic_validate(state)
+            run.processedSegmentCount = len(section_results)
+            run.checkpoints["parallel_section_extraction"] = {"processedSegmentCount": len(section_results)}
+            run.checkpoints["merge_results"] = {
+                "taskCount": len(state.merged_tasks),
+                "noteCount": len(state.merged_notes),
+                "decisionCount": len(state.merged_decisions),
+                "issueCount": len(state.merged_questions) + len(state.merged_blockers),
+            }
+            await self.repository.save_extraction_run(run)
+            outputs = {
+                "tasks": [item.model_dump() for item in state.merged_tasks],
+                "notes": [item.model_dump() for item in state.merged_notes],
+                "decisions": [item.model_dump() for item in state.merged_decisions],
+                "issues": [item.model_dump() for item in state.merged_questions + state.merged_blockers],
+            }
+            state.coverage_report = await agents.validate_coverage(
+                self.router,
+                state.normalized_transcript,
+                outputs,
+                context,
+            )
+            if state.coverage_report.criticalMissingCount:
+                state.validation_errors.append(
+                    {
+                        "code": "CRITICAL_COVERAGE_GAP",
+                        "coverage": state.coverage_report.model_dump(),
+                    }
+                )
+            run.coverageScore = state.coverage_report.score if state.coverage_report else None
+            run.validationErrors = state.validation_errors
+            run.warningCount = len(state.warnings)
+            run.stagedTasks = state.merged_tasks
+            run.stagedNotes = state.merged_notes
+            run.stagedDecisions = state.merged_decisions
+            run.stagedIssues = state.merged_questions + state.merged_blockers
+            run.checkpoints["coverage_validation"] = {
+                "score": run.coverageScore,
+                "validationErrorCount": len(run.validationErrors),
+            }
+
+            await self.repository.transition(conversation_id, ConversationStatus.VALIDATING)
+            summary = await agents.summarize_conversation(
+                self.router,
+                conversation_id,
+                conversation.userId,
+                conversation.spaceId,
+                state.normalized_transcript,
+                outputs,
+                conversation.processingVersion,
+            )
+            previous_memory = await self.repository.get_space_memory(conversation.userId, conversation.spaceId)
+            memory = await agents.update_space_memory(self.router, previous_memory, summary)
+            await self.repository.publish_outputs(run, summary, memory)
+            await self.repository.schedule_transcript_expiry(conversation_id)
+            run.status = ExtractionRunStatus.PUBLISHED
+            await self.repository.save_extraction_run(run)
+            terminal_status = ConversationStatus.PARTIAL if state.validation_errors else ConversationStatus.COMPLETED
+            await self.repository.transition(conversation_id, terminal_status)
+        except Exception as error:
+            if run is not None:
+                await self.repository.mark_extraction_run_failed(run.id, error)
+            latest = await self.repository.get_conversation(conversation_id)
+            if latest and latest.status != ConversationStatus.COMPLETED:
+                await self.repository.transition(conversation_id, ConversationStatus.FAILED)
+            raise
 
     async def _parallel_section_extraction(self, state: ConversationGraphState, context: dict) -> list:
         semaphore = asyncio.Semaphore(settings.MAX_ACTIVE_LLM_CALLS_PER_CONVERSATION)
@@ -168,6 +170,7 @@ class ConversationProcessingWorkflow:
         seen_tasks: set[str] = set()
         seen_notes: set[str] = set()
         for result in state.section_results:
+            state.warnings.extend(result.warnings)
             for task in result.tasks:
                 task.fingerprint = task.fingerprint or task_fingerprint(state.space_id, task)
                 if task.fingerprint not in seen_tasks:

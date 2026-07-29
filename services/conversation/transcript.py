@@ -44,7 +44,7 @@ def normalize_chunk_text(text: str, previous_text: str = "") -> str:
 
     previous_tail = previous_text[-120:].lower()
     lowered = text.lower()
-    for size in range(min(80, len(text)), 20, -1):
+    for size in range(min(80, len(text)), 7, -1):
         prefix = lowered[:size]
         if prefix and prefix in previous_tail:
             text = text[size:].lstrip(" ,.-")

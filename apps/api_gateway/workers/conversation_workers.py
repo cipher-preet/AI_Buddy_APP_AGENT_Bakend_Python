@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from uuid import uuid4
 
 from apps.api_gateway.config.setting import settings
@@ -75,7 +76,18 @@ async def handle_finalization_event(event: EventEnvelope) -> None:
 
 async def handle_processing_event(event: EventEnvelope) -> None:
     repository = ConversationRepository(get_database())
-    await ConversationProcessingWorkflow(repository).run(event.conversationId)
+    try:
+        await asyncio.wait_for(
+            ConversationProcessingWorkflow(repository).run(event.conversationId),
+            timeout=settings.CONVERSATION_PROCESSING_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as error:
+        message = f"Conversation processing timed out after {settings.CONVERSATION_PROCESSING_TIMEOUT_SECONDS} seconds."
+        await repository.mark_active_extraction_run_failed(event.conversationId, message)
+        await repository.mark_conversation_failed(
+            event.conversationId,
+            message,
+        )
 
 
 def build_stt_consumer() -> RedisStreamConsumer:

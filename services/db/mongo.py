@@ -68,6 +68,36 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
             IndexModel([("status", ASCENDING), ("updatedAt", ASCENDING)]),
         ]
     )
+    await database["stagedTasks"].create_indexes(
+        [
+            IndexModel([("extractionRunId", ASCENDING)]),
+            IndexModel([("conversationId", ASCENDING), ("processingVersion", ASCENDING)]),
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("updatedAt", DESCENDING)]),
+            IndexModel([("fingerprint", ASCENDING)], sparse=True),
+        ]
+    )
+    await database["stagedNotes"].create_indexes(
+        [
+            IndexModel([("extractionRunId", ASCENDING)]),
+            IndexModel([("conversationId", ASCENDING), ("processingVersion", ASCENDING)]),
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("updatedAt", DESCENDING)]),
+            IndexModel([("fingerprint", ASCENDING)], sparse=True),
+        ]
+    )
+    await database["stagedDecisions"].create_indexes(
+        [
+            IndexModel([("extractionRunId", ASCENDING)]),
+            IndexModel([("conversationId", ASCENDING), ("processingVersion", ASCENDING)]),
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("updatedAt", DESCENDING)]),
+        ]
+    )
+    await database["stagedIssues"].create_indexes(
+        [
+            IndexModel([("extractionRunId", ASCENDING)]),
+            IndexModel([("conversationId", ASCENDING), ("processingVersion", ASCENDING)]),
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("updatedAt", DESCENDING)]),
+        ]
+    )
     await database.tasks.create_indexes(
         [
             IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("status", ASCENDING)]),

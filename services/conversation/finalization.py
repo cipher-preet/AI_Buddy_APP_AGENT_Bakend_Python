@@ -43,13 +43,13 @@ class ConversationFinalizationCoordinator:
                     EventEnvelope(
                         eventType="stt.requested",
                         correlationId=conversation_id,
-                        userId=chunk.userId,
-                        spaceId=chunk.spaceId,
+                        userId=str(chunk.userId),
+                        spaceId=str(chunk.spaceId),
                         conversationId=conversation_id,
                         payload={
-                            "conversationId": chunk.conversationId,
-                            "userId": chunk.userId,
-                            "spaceId": chunk.spaceId,
+                            "conversationId": str(chunk.conversationId),
+                            "userId": str(chunk.userId),
+                            "spaceId": str(chunk.spaceId),
                             "chunkId": chunk.chunkId,
                             "sequenceNumber": chunk.sequenceNumber,
                             "filePath": chunk.audioFilePath,
@@ -70,8 +70,8 @@ class ConversationFinalizationCoordinator:
                     EventEnvelope(
                         eventType="conversation.processing.requested",
                         correlationId=conversation_id,
-                        userId=conversation.userId,
-                        spaceId=conversation.spaceId,
+                        userId=str(conversation.userId),
+                        spaceId=str(conversation.spaceId),
                         conversationId=conversation_id,
                         payload={
                             "processingVersion": conversation.processingVersion,
@@ -92,8 +92,8 @@ class ConversationFinalizationCoordinator:
             EventEnvelope(
                 eventType="conversation.processing.requested",
                 correlationId=conversation_id,
-                userId=conversation.userId,
-                spaceId=conversation.spaceId,
+                userId=str(conversation.userId),
+                spaceId=str(conversation.spaceId),
                 conversationId=conversation_id,
                 payload={"processingVersion": conversation.processingVersion},
             ),

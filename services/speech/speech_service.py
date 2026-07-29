@@ -3,6 +3,7 @@ import uuid
 import aiofiles
 from fastapi import UploadFile
 
+from apps.api_gateway.config.setting import settings
 from services.conversation.models import AudioChunkMetadata, utc_now
 from services.conversation.repository import ConversationRepository
 from services.conversation.service import ConversationService
@@ -64,14 +65,15 @@ async def transcribe_audio_service(file: UploadFile, user_id: str, space_id: str
     await redis_client.hset(f"speech_job:{job_id}", mapping=job)
 
     await push_speech_job(job)
-    print(
-        "Transcript speech job queued:",
-        {
-            "job_id": job_id,
-            "user_id": user_id,
-            "space_id": space_id,
-        },
-    )
+    if settings.ENABLE_TRANSCRIPT_DEBUG_LOGS:
+        print(
+            "Transcript speech job queued:",
+            {
+                "job_id": job_id,
+                "user_id": user_id,
+                "space_id": space_id,
+            },
+        )
 
     return {
         "job_id": job_id,
