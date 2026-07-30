@@ -20,6 +20,27 @@ POST /api/v1/conversations/{conversationId}/stop
 GET  /api/v1/conversations/{conversationId}/status
 ```
 
+## Chat API
+
+```powershell
+POST /api/v1/chat/ask
+POST /api/v1/chat/sessions
+GET  /api/v1/chat/sessions?userId={userId}&spaceId={spaceId}&limit=20&cursor={nextCursor}
+GET  /api/v1/chat/sessions/{sessionId}?userId={userId}
+GET  /api/v1/chat?userId={userId}&spaceId={spaceId}&limit=20&cursor={nextCursor}
+GET  /api/v1/chat/{chatId}?userId={userId}
+```
+
+`/api/v1/chat/ask` stores messages in MongoDB, retrieves user-scoped Qdrant
+chunks with a child-parent expansion window, and returns answers in English even
+when the question or source chunks are Hindi, English, or mixed language. Chat
+windows are capped at 100 stored messages; if the active chat cannot accept the
+next user/assistant turn, it is archived and a fresh chat is created.
+Use `/api/v1/chat/sessions` to list chat sessions for a user without loading
+messages. Session listing is cursor-paginated by `updatedAt` descending and
+returns `nextCursor`, `hasMore`, and `limit`. Use `/api/v1/chat/{chatId}` only
+when the chat window needs messages.
+
 Raw transcript chunks are stored in MongoDB as the source of truth and sorted by
 `conversationId + sequenceNumber`. Qdrant is used only for semantic memory and
 retrieval, never to reconstruct a full conversation.
@@ -75,6 +96,8 @@ transcript_chunks
 extraction_runs
 tasks
 conversation_summaries
+chat_sessions
+chat_message_store
 space_memory
 ```
 

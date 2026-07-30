@@ -59,6 +59,22 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
             IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("createdAt", DESCENDING)]),
         ]
     )
+    await database.chat_sessions.create_indexes(
+        [
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("status", ASCENDING), ("updatedAt", DESCENDING)]),
+            IndexModel([("userId", ASCENDING), ("updatedAt", DESCENDING)]),
+        ]
+    )
+    chat_history_indexes = await database.chat_message_store.index_information()
+    session_index = chat_history_indexes.get("SessionId_1")
+    if session_index and session_index.get("unique"):
+        await database.chat_message_store.drop_index("SessionId_1")
+    await database.chat_message_store.create_indexes(
+        [
+            IndexModel([("SessionId", ASCENDING)]),
+            IndexModel([("SessionId", ASCENDING), ("createdAt", ASCENDING)]),
+        ]
+    )
     await database.space_memory.create_indexes(
         [IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING)], unique=True)]
     )
