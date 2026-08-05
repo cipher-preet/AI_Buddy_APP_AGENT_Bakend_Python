@@ -30,6 +30,7 @@ def task_fingerprint(space_id: str, task: ExtractedTask) -> str:
     return stable_hash(
         space_id,
         task.title,
+        task.body[:512],
         task.ownerText,
         task.dueDateResolved or task.dueDateText,
         evidence_range(task.evidence),

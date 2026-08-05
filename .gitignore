@@ -44,6 +44,8 @@ Thumbs.db
 uploads/
 media/
 storage/
+!services/storage/
+!services/storage/**
 
 # Cache
 .cache/
@@ -52,3 +54,7 @@ storage/
 docker-compose.override.yml
 
 resources/
+
+
+cloud-run-api.env
+cloud-run-worker.env

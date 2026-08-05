@@ -5,6 +5,8 @@ import redis.asyncio as redis
 from redis.exceptions import ConnectionError, RedisError, TimeoutError
 
 from apps.api_gateway.config.setting import settings
+from services.queue.factory import get_message_publisher, use_pubsub
+from services.queue.pubsub import topic_for_speech, topic_for_vector
 
 SPEECH_QUEUE = "speech_transcribe_queue"
 COMPLETED_SPEECH_QUEUE = "completed_speech_queue"
@@ -28,6 +30,13 @@ async def test_redis_connection():
 
 
 async def push_speech_job(job: dict):
+    if use_pubsub():
+        await get_message_publisher().publish(
+            topic_for_speech(),
+            job,
+            attributes={"event_type": "speech.transcription.requested"},
+        )
+        return
     await redis_client.lpush(SPEECH_QUEUE, json.dumps(job))
 
 
@@ -90,6 +99,13 @@ async def get_job_result(job_id: str):
 
 
 async def push_completed_speech_job(job_id: str):
+    if use_pubsub():
+        await get_message_publisher().publish(
+            topic_for_vector(),
+            {"job_id": job_id},
+            attributes={"event_type": "speech.transcription.completed", "job_id": job_id},
+        )
+        return
     await redis_client.lpush(COMPLETED_SPEECH_QUEUE, job_id)
 
 

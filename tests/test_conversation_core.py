@@ -28,6 +28,7 @@ from services.conversation.repository import ConversationRepository
 from services.conversation.service import ConversationService
 from services.conversation.transcript import assemble_transcript, detect_missing_sequences, segment_transcript
 from services.conversation.workflow import ConversationProcessingWorkflow
+from services.conversation.workflow_state import ConversationGraphState
 from services.llm.models import LLMMessage, StructuredLLMRequest
 from services.llm.openai_compatible import OpenAICompatibleProvider
 from services.queue.streams import EventEnvelope
@@ -455,6 +456,13 @@ def test_workflow_publishes_partial_when_coverage_has_critical_gap(monkeypatch):
     async def validate_coverage(router, transcript, outputs, context):
         return CoverageReport(score=0.5, criticalMissingCount=1)
 
+    async def review_extraction_quality(router, transcript, outputs, context):
+        return agents.ExtractionQualityReviewResponse(
+            decisions=[
+                agents.ExtractionQualityDecision(kind="task", index=0, keep=True, reason="Relevant task.")
+            ]
+        )
+
     async def summarize_conversation(router, conversation_id, user_id, space_id, transcript, outputs, processing_version):
         return ConversationSummaryDocument(
             conversationId=conversation_id,
@@ -471,6 +479,7 @@ def test_workflow_publishes_partial_when_coverage_has_critical_gap(monkeypatch):
         return previous
 
     monkeypatch.setattr("services.conversation.agents.extract_segment", extract_segment)
+    monkeypatch.setattr("services.conversation.agents.review_extraction_quality", review_extraction_quality)
     monkeypatch.setattr("services.conversation.agents.validate_coverage", validate_coverage)
     monkeypatch.setattr("services.conversation.agents.summarize_conversation", summarize_conversation)
     monkeypatch.setattr("services.conversation.agents.update_space_memory", update_space_memory)
@@ -481,6 +490,113 @@ def test_workflow_publishes_partial_when_coverage_has_critical_gap(monkeypatch):
     assert ConversationStatus.FAILED not in repository.transitions
     assert repository.run.status == ExtractionRunStatus.PUBLISHED
     assert repository.run.validationErrors[0]["code"] == "CRITICAL_COVERAGE_GAP"
+
+
+def test_orchestration_applies_llm_quality_review(monkeypatch):
+    workflow = ConversationProcessingWorkflow(object(), WorkflowRouter())
+    state = ConversationGraphState(
+        conversation_id="conv_1",
+        user_id="user_1",
+        space_id="space_1",
+        processing_version=1,
+        extraction_run_id="run_1",
+        conversation_status=ConversationStatus.PROCESSING,
+        raw_transcript=(
+            "[0] Rahul will test the payment callback tomorrow. "
+            "[1] By the way I need to renew my car insurance tomorrow. "
+            "[2] Payment callback retries need observability."
+        ),
+        normalized_transcript=(
+            "[0] Rahul will test the payment callback tomorrow. "
+            "[1] By the way I need to renew my car insurance tomorrow. "
+            "[2] Payment callback retries need observability."
+        ),
+        space_memory={"currentSummary": "Payment callback project and checkout retries are the active work."},
+        active_tasks=[],
+        relevant_previous_summaries=[],
+        segments=[],
+        section_results=[
+            SectionExtractionResult(
+                segmentId="segment_1",
+                tasks=[
+                    ExtractedTask(
+                        title="Test payment callback",
+                        body="",
+                        operation="CREATE",
+                        confidence=0.9,
+                        sourceConversationId="conv_1",
+                        evidence=[EvidenceSpan(sequenceStart=0, sequenceEnd=0, text="Rahul will test the payment callback tomorrow.")],
+                    ),
+                    ExtractedTask(
+                        title="Renew car insurance",
+                        body="Renew the car insurance.",
+                        operation="CREATE",
+                        confidence=0.9,
+                        sourceConversationId="conv_1",
+                        evidence=[EvidenceSpan(sequenceStart=1, sequenceEnd=1, text="By the way I need to renew my car insurance tomorrow.")],
+                    ),
+                ],
+                notes=[
+                    ExtractedNote(
+                        title="Payment retry observability",
+                        body="Payment callback retries need observability so the project team can inspect retry behavior.",
+                        confidence=0.9,
+                        sourceConversationId="conv_1",
+                        evidence=[EvidenceSpan(sequenceStart=2, sequenceEnd=2, text="Payment callback retries need observability.")],
+                    ),
+                    ExtractedNote(
+                        title="Car insurance",
+                        body="The speaker mentioned a car insurance renewal as an unrelated side topic.",
+                        confidence=0.9,
+                        sourceConversationId="conv_1",
+                        evidence=[EvidenceSpan(sequenceStart=1, sequenceEnd=1, text="By the way I need to renew my car insurance tomorrow.")],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    async def review_extraction_quality(router, transcript, outputs, context):
+        return agents.ExtractionQualityReviewResponse(
+            decisions=[
+                agents.ExtractionQualityDecision(
+                    kind="task",
+                    index=0,
+                    keep=True,
+                    reason="Relevant to the active payment callback project.",
+                    revisedBody="Rahul needs to test the payment callback as part of the active payment project. The conversation states this should happen tomorrow.",
+                ),
+                agents.ExtractionQualityDecision(
+                    kind="task",
+                    index=1,
+                    keep=False,
+                    reason="Unrelated tangent, not part of the active project context.",
+                ),
+                agents.ExtractionQualityDecision(
+                    kind="note",
+                    index=0,
+                    keep=True,
+                    reason="Relevant project context.",
+                ),
+                agents.ExtractionQualityDecision(
+                    kind="note",
+                    index=1,
+                    keep=False,
+                    reason="Unrelated tangent.",
+                ),
+            ]
+        )
+
+    monkeypatch.setattr(agents, "review_extraction_quality", review_extraction_quality)
+
+    workflow._merge(state)
+    asyncio.run(workflow._review_extracted_outputs(state, {"spaceMemory": state.space_memory}))
+
+    assert [task.title for task in state.merged_tasks] == ["Test payment callback"]
+    assert "active payment project" in state.merged_tasks[0].body
+    assert [note.title for note in state.merged_notes] == ["Payment retry observability"]
+    assert any("DROPPED_TASK_BY_LLM_REVIEW" in warning for warning in state.warnings)
+    assert any("DROPPED_NOTE_BY_LLM_REVIEW" in warning for warning in state.warnings)
 
 
 def test_extract_segment_tolerates_single_structured_section_failure(monkeypatch):

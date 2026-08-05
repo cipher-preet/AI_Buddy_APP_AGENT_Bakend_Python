@@ -1,7 +1,9 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
     APP_NAME: str = "Buddy Conversation Processing API"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = True
@@ -51,6 +53,33 @@ class Settings(BaseSettings):
     WORKER_RETRY_BASE_SECONDS: float = 1
     WORKER_RETRY_MAX_SECONDS: float = 300
 
+    QUEUE_PROVIDER: str = "redis"
+    GOOGLE_CLOUD_PROJECT: str = ""
+    PUBSUB_SPEECH_TOPIC: str = ""
+    PUBSUB_VECTOR_TOPIC: str = ""
+    PUBSUB_ORCHESTRATION_TOPIC: str = ""
+    PUBSUB_WORKER_AUDIENCE: str = ""
+    PUBSUB_VERIFY_PUSH_AUTH: bool = True
+    PUBSUB_MAX_DELIVERY_ATTEMPTS: int = 5
+    PUBSUB_PUBLISH_TIMEOUT_SECONDS: float = 10
+
+    STORAGE_PROVIDER: str = "local"
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+    ACCESS_KEY_ID: str = ""
+    SECREATE_KEY_ACCESS: str = ""
+    AWS_REGION: str = "ap-south-1"
+    S3_AUDIO_BUCKET: str = ""
+    S3_AUDIO_PREFIX: str = "buddy/audio"
+    S3_DELETE_AFTER_PROCESSING: bool = False
+    S3_UPLOAD_TIMEOUT_SECONDS: float = 60
+    S3_DOWNLOAD_TIMEOUT_SECONDS: float = 60
+    S3_MAX_RETRIES: int = 3
+    CLOUDFRONT_URL: str = ""
+    CLOUDFRONT_KEY_PAIR_ID: str = ""
+    CLOUDFRONT_PRIVATE_KEY: str = ""
+    CLOUDFRONT_SIGNED_URL_EXPIRES_SECONDS: int = 3600
+
     CONVERSATION_INACTIVITY_TIMEOUT_SECONDS: int = 900
     RAW_TRANSCRIPT_RETENTION_DAYS: int = 30
     TRANSCRIPT_SEGMENT_TARGET_TOKENS: int = 2500
@@ -77,8 +106,13 @@ class Settings(BaseSettings):
     ENABLE_REQUEST_LOGS: bool = False
     ENABLE_TRANSCRIPT_DEBUG_LOGS: bool = False
 
-    class Config:
-        env_file = ".env"
+    @property
+    def resolved_aws_access_key_id(self) -> str:
+        return self.AWS_ACCESS_KEY_ID or self.ACCESS_KEY_ID
+
+    @property
+    def resolved_aws_secret_access_key(self) -> str:
+        return self.AWS_SECRET_ACCESS_KEY or self.SECREATE_KEY_ACCESS
 
 
 settings = Settings()

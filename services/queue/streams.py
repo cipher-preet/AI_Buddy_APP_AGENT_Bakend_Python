@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field
 from redis.exceptions import ResponseError
 
 from apps.api_gateway.config.setting import settings
+from services.queue.factory import get_message_publisher, use_pubsub
+from services.queue.pubsub import topic_for_orchestration, topic_for_speech
 from services.queue.redis_queue import redis_client
 
 
@@ -31,7 +33,28 @@ class EventEnvelope(BaseModel):
 
 class RedisStreamProducer:
     async def publish(self, stream: str, event: EventEnvelope) -> str:
+        if use_pubsub():
+            await get_message_publisher().publish(
+                _topic_for_stream(stream),
+                event.model_dump(mode="json"),
+                attributes={
+                    "event_type": event.eventType,
+                    "user_id": event.userId,
+                    "space_id": event.spaceId,
+                    "request_id": event.correlationId,
+                    "source": stream,
+                },
+            )
+            return event.eventId
         return await redis_client.xadd(stream, {"event": event.model_dump_json()})
+
+
+def _topic_for_stream(stream: str) -> str:
+    if stream in {settings.REDIS_AUDIO_STREAM, settings.REDIS_STT_STREAM}:
+        return topic_for_speech()
+    if stream in {settings.REDIS_FINALIZATION_STREAM, settings.REDIS_PROCESSING_STREAM}:
+        return topic_for_orchestration()
+    raise ValueError(f"No Pub/Sub topic configured for Redis stream replacement: {stream}")
 
 
 class RedisStreamConsumer:

@@ -207,6 +207,7 @@ Operation = Literal["CREATE", "UPDATE", "COMPLETE", "CANCEL", "NO_ACTION", "NEED
 
 class ExtractedTask(BaseModel):
     title: str
+    body: str = ""
     operation: Operation
     existingTaskId: str | None = None
     ownerText: str | None = None

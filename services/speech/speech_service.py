@@ -1,5 +1,7 @@
 import os
 import uuid
+from pathlib import Path
+
 import aiofiles
 from fastapi import UploadFile
 
@@ -12,6 +14,11 @@ from services.queue.redis_queue import (
     get_job_result,
     push_speech_job,
     redis_client,
+)
+from services.storage.s3_audio_storage import (
+    build_audio_object_key,
+    get_s3_audio_storage,
+    use_s3_storage,
 )
 
 UPLOAD_DIR = "resources/audio_jobs"
@@ -32,48 +39,131 @@ async def transcribe_audio_service(file: UploadFile, user_id: str, space_id: str
         content = await file.read()
         await out_file.write(content)
 
-    active_session = await _get_or_create_listening_session(user_id, space_id)
-    conversation_id = active_session.get("conversation_id")
-    sequence_number = None
-    if conversation_id:
-        sequence_number = await _next_listening_sequence(user_id, space_id)
-        metadata = AudioChunkMetadata(
-            conversationId=conversation_id,
-            userId=user_id,
-            spaceId=space_id,
-            chunkId=job_id,
-            sequenceNumber=sequence_number,
-            filePath=file_path,
-            filename=filename,
-            contentType=file.content_type,
-        )
-        await ConversationRepository(get_database()).record_audio_chunk(metadata)
+    s3_ref = None
+    try:
+        local_audio = Path(file_path)
+        file_size = local_audio.stat().st_size if local_audio.exists() else 0
+        if file_size <= 0:
+            raise ValueError("Uploaded audio file is empty")
 
-    job = {
-        "job_id": job_id,
-        "user_id": user_id,
-        "space_id": space_id,
-        "file_path": file_path,
-        "filename": filename,
-        "content_type": file.content_type,
-        "status": "queued",
-    }
-    if conversation_id:
-        job["conversation_id"] = conversation_id
-        job["sequence_number"] = sequence_number
+        active_session = await _get_or_create_listening_session(user_id, space_id)
+        conversation_id = active_session.get("conversation_id")
+        sequence_number = None
+        if conversation_id:
+            sequence_number = await _next_listening_sequence(user_id, space_id)
+            metadata = AudioChunkMetadata(
+                conversationId=conversation_id,
+                userId=user_id,
+                spaceId=space_id,
+                chunkId=job_id,
+                sequenceNumber=sequence_number,
+                filePath=file_path,
+                filename=filename,
+                contentType=file.content_type,
+            )
+            await ConversationRepository(get_database()).record_audio_chunk(metadata)
 
-    await redis_client.hset(f"speech_job:{job_id}", mapping=job)
+        job = {
+            "job_id": job_id,
+            "user_id": user_id,
+            "space_id": space_id,
+            "filename": filename,
+            "content_type": file.content_type,
+            "file_size": file_size,
+            "status": "queued",
+        }
+        if conversation_id:
+            job["conversation_id"] = conversation_id
+            job["session_id"] = conversation_id
+            job["sequence_number"] = sequence_number
 
-    await push_speech_job(job)
-    if settings.ENABLE_TRANSCRIPT_DEBUG_LOGS:
-        print(
-            "Transcript speech job queued:",
-            {
-                "job_id": job_id,
-                "user_id": user_id,
-                "space_id": space_id,
-            },
-        )
+        if use_s3_storage():
+            object_key = build_audio_object_key(
+                user_id=user_id,
+                space_id=space_id,
+                session_id=conversation_id,
+                job_id=job_id,
+                filename=filename,
+            )
+            print(
+                "S3 audio upload started:",
+                {
+                    "job_id": job_id,
+                    "user_id": user_id,
+                    "space_id": space_id,
+                    "s3_bucket": settings.S3_AUDIO_BUCKET,
+                    "s3_object_key": object_key,
+                    "stage": "s3_upload_started",
+                },
+            )
+            s3_ref = await get_s3_audio_storage().upload_file(
+                local_path=local_audio,
+                object_key=object_key,
+                content_type=file.content_type,
+                metadata={
+                    "job_id": job_id,
+                    "user_id": user_id,
+                    "space_id": space_id,
+                    "temporary": "true",
+                },
+            )
+            job.update(
+                {
+                    "storage_provider": "s3",
+                    "s3_bucket": s3_ref.bucket,
+                    "s3_object_key": s3_ref.object_key,
+                    "s3_region": settings.AWS_REGION,
+                }
+            )
+            if s3_ref.etag:
+                job["s3_etag"] = s3_ref.etag
+            if s3_ref.version_id:
+                job["s3_version_id"] = s3_ref.version_id
+            print(
+                "S3 audio upload completed:",
+                {
+                    "job_id": job_id,
+                    "user_id": user_id,
+                    "space_id": space_id,
+                    "s3_bucket": s3_ref.bucket,
+                    "s3_object_key": s3_ref.object_key,
+                    "stage": "s3_upload_completed",
+                },
+            )
+        else:
+            job["file_path"] = file_path
+
+        await redis_client.hset(f"speech_job:{job_id}", mapping=job)
+
+        try:
+            await push_speech_job(job)
+        except Exception:
+            await redis_client.hset(
+                f"speech_job:{job_id}",
+                mapping={"status": "failed", "error": "Failed to publish speech job"},
+            )
+            if s3_ref:
+                try:
+                    await get_s3_audio_storage().delete_file(s3_ref.bucket, s3_ref.object_key)
+                except Exception as cleanup_error:
+                    print("S3 cleanup after publish failure failed:", str(cleanup_error))
+            raise
+
+        if settings.ENABLE_TRANSCRIPT_DEBUG_LOGS:
+            print(
+                "Transcript speech job queued:",
+                {
+                    "job_id": job_id,
+                    "user_id": user_id,
+                    "space_id": space_id,
+                },
+            )
+    finally:
+        if use_s3_storage():
+            try:
+                Path(file_path).unlink(missing_ok=True)
+            except Exception as cleanup_error:
+                print("API temporary audio cleanup failed:", str(cleanup_error))
 
     return {
         "job_id": job_id,

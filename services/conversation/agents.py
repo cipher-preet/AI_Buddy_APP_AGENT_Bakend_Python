@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -29,6 +29,18 @@ class TaskExtractionResponse(BaseModel):
 
 class NoteExtractionResponse(BaseModel):
     notes: list[ExtractedNote] = Field(default_factory=list)
+
+
+class ExtractionQualityDecision(BaseModel):
+    kind: Literal["task", "note"]
+    index: int = Field(ge=0)
+    keep: bool
+    reason: str
+    revisedBody: str | None = None
+
+
+class ExtractionQualityReviewResponse(BaseModel):
+    decisions: list[ExtractionQualityDecision] = Field(default_factory=list)
 
 
 class DecisionExtractionResponse(BaseModel):
@@ -133,6 +145,25 @@ async def validate_coverage(
         CoverageReport,
         json.dumps(context, default=str, ensure_ascii=True),
         f"CURRENT CONVERSATION:\n{transcript}\n\nPROPOSED OUTPUTS:\n{json.dumps(outputs, default=str, ensure_ascii=True)}",
+        LLMCapability.VALIDATION,
+    )
+
+
+async def review_extraction_quality(
+    router: LLMRouter,
+    transcript: str,
+    outputs: dict[str, Any],
+    context: dict[str, Any],
+) -> ExtractionQualityReviewResponse:
+    return await _structured(
+        router,
+        "extraction-quality-review-v1",
+        ExtractionQualityReviewResponse,
+        json.dumps(context, default=str, ensure_ascii=True),
+        (
+            f"CURRENT CONVERSATION:\n{transcript}\n\n"
+            f"EXTRACTED TASKS AND NOTES TO REVIEW:\n{json.dumps(outputs, default=str, ensure_ascii=True)}"
+        ),
         LLMCapability.VALIDATION,
     )
 

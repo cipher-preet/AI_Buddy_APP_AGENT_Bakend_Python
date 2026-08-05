@@ -90,6 +90,7 @@ class ConversationProcessingWorkflow:
             section_results = await self._parallel_section_extraction(state, context)
             state.section_results = section_results
             self._merge(state)
+            await self._review_extracted_outputs(state, context)
             self._deterministic_validate(state)
             run.processedSegmentCount = len(section_results)
             run.checkpoints["parallel_section_extraction"] = {"processedSegmentCount": len(section_results)}
@@ -185,6 +186,49 @@ class ConversationProcessingWorkflow:
             state.merged_blockers.extend(item for item in result.issues if item.kind in {"blocker", "risk"})
             state.merged_questions.extend(item for item in result.issues if item.kind in {"open_question", "missing_information"})
 
+    async def _review_extracted_outputs(self, state: ConversationGraphState, context: dict) -> None:
+        outputs = {
+            "tasks": [item.model_dump() for item in state.merged_tasks],
+            "notes": [item.model_dump() for item in state.merged_notes],
+        }
+        if not outputs["tasks"] and not outputs["notes"]:
+            return
+        try:
+            review = await agents.review_extraction_quality(
+                self.router,
+                state.normalized_transcript,
+                outputs,
+                context,
+            )
+        except Exception as error:
+            state.warnings.append(f"extraction-quality-review-v1 failed: {str(error)[:500]}")
+            return
+
+        task_decisions = {item.index: item for item in review.decisions if item.kind == "task"}
+        note_decisions = {item.index: item for item in review.decisions if item.kind == "note"}
+        kept_tasks = []
+        for index, task in enumerate(state.merged_tasks):
+            decision = task_decisions.get(index)
+            if decision and decision.revisedBody:
+                task.body = _clean_text(decision.revisedBody)
+                task.fingerprint = task_fingerprint(state.space_id, task)
+            if decision and not decision.keep:
+                state.warnings.append(f"DROPPED_TASK_BY_LLM_REVIEW: {task.title} ({decision.reason})")
+                continue
+            kept_tasks.append(task)
+        kept_notes = []
+        for index, note in enumerate(state.merged_notes):
+            decision = note_decisions.get(index)
+            if decision and decision.revisedBody:
+                note.body = _clean_text(decision.revisedBody)
+                note.fingerprint = note_fingerprint(state.space_id, note)
+            if decision and not decision.keep:
+                state.warnings.append(f"DROPPED_NOTE_BY_LLM_REVIEW: {note.title} ({decision.reason})")
+                continue
+            kept_notes.append(note)
+        state.merged_tasks = kept_tasks
+        state.merged_notes = kept_notes
+
     def _deterministic_validate(self, state: ConversationGraphState) -> None:
         transcript_signals = detect_rule_signals(state.normalized_transcript)
         if transcript_signals["actionSignals"] and not state.merged_tasks:
@@ -231,3 +275,7 @@ def _evidence_matches_transcript(evidence_text: str, raw_transcript: str, normal
 
 def _normalize_for_evidence_match(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def _clean_text(text: str | None) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()

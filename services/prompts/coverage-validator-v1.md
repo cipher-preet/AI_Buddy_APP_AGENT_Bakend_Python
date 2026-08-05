@@ -4,4 +4,5 @@ Label meaningful statements as covered, small_talk, duplicate, non_actionable, m
 Return missing items with exact sequence references.
 Fail critical gaps for explicit tasks, commitments, deadlines, task completions, confirmed decisions, blockers, and important open questions.
 Use BACKGROUND SPACE CONTEXT only to understand references.
+Do not fail coverage for unrelated tangents, examples, small talk, or side topics that should not become tasks or notes.
 Return only output matching the required schema.

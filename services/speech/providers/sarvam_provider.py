@@ -58,12 +58,10 @@ async def sarvam_transcribe_from_path(
     response.raise_for_status()
     result = response.json()
     transcript = str(result.get("transcript") or "").strip()
-    if transcript:
-        result["transcript"] = transcript
-        result["provider"] = "sarvam"
-        return result
-
-    raise ValueError("Sarvam speech transcription returned an empty transcript.")
+    result["transcript"] = transcript
+    result["provider"] = "sarvam"
+    result["is_empty_transcript"] = not bool(transcript)
+    return result
 
 
 async def _post_with_retries(url: str, headers: dict, data: dict, files: dict) -> httpx.Response:
