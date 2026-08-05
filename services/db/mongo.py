@@ -121,3 +121,10 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
             IndexModel([("fingerprint", ASCENDING)], unique=True, sparse=True),
         ]
     )
+    await database.notes.create_indexes(
+        [
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("updatedAt", DESCENDING)]),
+            IndexModel([("sourceConversationId", ASCENDING)]),
+            IndexModel([("fingerprint", ASCENDING)], unique=True, sparse=True),
+        ]
+    )

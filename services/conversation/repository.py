@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from hashlib import sha1
 from typing import Any
@@ -298,7 +299,8 @@ class ConversationRepository:
         summary: ConversationSummaryDocument,
         memory: SpaceMemoryDocument,
     ) -> dict[str, list[Any]]:
-        task_ids: list[Any] = []
+        task_ids = await self._publish_tasks(run)
+        note_ids = await self._publish_notes(run)
         summary.taskIds = task_ids
         summary_doc = summary.model_dump(by_alias=True)
         summary_doc["conversationId"] = to_mongo_id(summary.conversationId)
@@ -320,7 +322,70 @@ class ConversationRepository:
             {"$set": memory_doc},
             upsert=True,
         )
-        return {"taskIds": task_ids}
+        return {"taskIds": task_ids, "noteIds": note_ids}
+
+    async def _publish_tasks(self, run: ExtractionRunDocument) -> list[Any]:
+        task_ids: list[Any] = []
+        for task in run.stagedTasks:
+            doc = task.model_dump()
+            doc["conversationId"] = to_mongo_id(run.conversationId)
+            doc["sourceConversationId"] = to_mongo_id(task.sourceConversationId)
+            doc["userId"] = to_mongo_id(run.userId)
+            doc["spaceId"] = to_mongo_id(run.spaceId)
+            doc["updatedAt"] = utc_now()
+            doc.setdefault("createdAt", run.startedAt)
+            doc["status"] = task_status_for_operation(task.operation, task.needsConfirmation)
+            for evidence in doc.get("evidence", []):
+                if isinstance(evidence, dict):
+                    evidence.setdefault("_id", embedded_object_id(evidence))
+
+            existing_task_id = task.existingTaskId.strip() if task.existingTaskId else None
+            if existing_task_id:
+                result = await self.db.tasks.find_one_and_update(
+                    {"_id": to_mongo_id(existing_task_id), "userId": doc["userId"], "spaceId": doc["spaceId"]},
+                    {"$set": {key: value for key, value in doc.items() if key != "createdAt"}},
+                    return_document=ReturnDocument.AFTER,
+                )
+            else:
+                task_id = task_object_id(run.id, doc, len(task_ids))
+                doc["_id"] = task_id
+                filter_doc = {"fingerprint": task.fingerprint} if task.fingerprint else {"_id": task_id}
+                result = await self.db.tasks.find_one_and_update(
+                    filter_doc,
+                    {"$setOnInsert": doc},
+                    upsert=True,
+                    return_document=ReturnDocument.AFTER,
+                )
+            if result:
+                task_ids.append(result["_id"])
+        return task_ids
+
+    async def _publish_notes(self, run: ExtractionRunDocument) -> list[Any]:
+        note_ids: list[Any] = []
+        for note in run.stagedNotes:
+            doc = note.model_dump()
+            doc["conversationId"] = to_mongo_id(run.conversationId)
+            doc["sourceConversationId"] = to_mongo_id(note.sourceConversationId)
+            doc["userId"] = to_mongo_id(run.userId)
+            doc["spaceId"] = to_mongo_id(run.spaceId)
+            doc["updatedAt"] = utc_now()
+            doc.setdefault("createdAt", run.startedAt)
+            for evidence in doc.get("evidence", []):
+                if isinstance(evidence, dict):
+                    evidence.setdefault("_id", embedded_object_id(evidence))
+
+            note_id = note_object_id(run.id, doc, len(note_ids))
+            doc["_id"] = note_id
+            filter_doc = {"fingerprint": note.fingerprint} if note.fingerprint else {"_id": note_id}
+            result = await self.db.notes.find_one_and_update(
+                filter_doc,
+                {"$setOnInsert": doc},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            if result:
+                note_ids.append(result["_id"])
+        return note_ids
 
     async def schedule_transcript_expiry(self, conversation_id: str) -> None:
         expires_at = datetime.now(timezone.utc) + timedelta(days=settings.RAW_TRANSCRIPT_RETENTION_DAYS)
@@ -339,25 +404,166 @@ class ConversationRepository:
         )
 
     async def get_space_memory(self, user_id: str, space_id: str) -> SpaceMemoryDocument:
-        data = await self.db.space_memory.find_one({"userId": to_mongo_id(user_id), "spaceId": to_mongo_id(space_id)})
+        data = await self.db.space_memory.find_one(
+            {"userId": {"$in": mongo_id_candidates(user_id)}, "spaceId": {"$in": mongo_id_candidates(space_id)}}
+        )
         if data:
             return SpaceMemoryDocument.model_validate(data)
         return SpaceMemoryDocument(userId=to_mongo_id(user_id), spaceId=to_mongo_id(space_id))
 
+    async def list_user_spaces(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        user_keys = mongo_id_candidates(user_id)
+        spaces: dict[str, dict[str, Any]] = {}
+        discovered_space_ids: list[Any] = []
+        for collection_name in (
+            "space_memory",
+            "tasks",
+            "notes",
+            "conversation_summaries",
+            "conversations",
+            "chat_sessions",
+            "stagedTasks",
+            "stagedNotes",
+            "stagedDecisions",
+            "stagedIssues",
+        ):
+            try:
+                values = await self.db[collection_name].distinct("spaceId", {"userId": {"$in": user_keys}})
+            except Exception:
+                values = []
+            for value in values:
+                if value is None:
+                    continue
+                discovered_space_ids.extend(mongo_id_candidates(value))
+                key = str(value)
+                spaces.setdefault(
+                    key,
+                    {
+                        "spaceId": key,
+                        "label": key,
+                        "sources": [],
+                    },
+                )
+                spaces[key]["sources"].append(collection_name)
+
+        try:
+            space_queries: list[dict[str, Any]] = [_space_owner_query(user_keys)]
+            if discovered_space_ids:
+                space_queries.append(_space_identity_query(discovered_space_ids))
+            for collection_name in ("spaces", "space", "Spaces"):
+                cursor = self.db[collection_name].find({"$or": space_queries}).limit(limit)
+                async for item in cursor:
+                    space_id = item.get("_id") or item.get("spaceId") or item.get("space_id") or item.get("id")
+                    if space_id is None:
+                        continue
+                    key = str(space_id)
+                    label = _space_document_label(item) or key
+                    spaces.setdefault(key, {"spaceId": key, "label": str(label), "sources": []})
+                    spaces[key]["label"] = str(label)
+                    spaces[key]["sources"].append(collection_name)
+        except Exception:
+            pass
+
+        ordered = sorted(spaces.values(), key=lambda item: (item["label"].lower(), item["spaceId"]))
+        for item in ordered:
+            if item["label"] == item["spaceId"]:
+                item["label"] = _space_fallback_label(item["spaceId"])
+        return ordered[:limit]
+
     async def list_active_tasks(self, user_id: str, space_id: str) -> list[dict[str, Any]]:
         cursor = self.db.tasks.find(
             {
-                "userId": to_mongo_id(user_id),
-                "spaceId": to_mongo_id(space_id),
-                "status": {"$in": ["pending", "in_progress", "blocked"]},
+                "userId": {"$in": mongo_id_candidates(user_id)},
+                "spaceId": {"$in": mongo_id_candidates(space_id)},
+                "status": {"$in": ["pending", "in_progress", "blocked", "needs_confirmation"]},
             },
             {"audit": 0},
         ).limit(100)
         return [doc async for doc in cursor]
 
+    async def list_tasks(self, user_id: str, space_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        cursor = self.db.tasks.find(
+            {"userId": {"$in": mongo_id_candidates(user_id)}, "spaceId": {"$in": mongo_id_candidates(space_id)}},
+            {"audit": 0},
+        ).sort("updatedAt", -1).limit(limit)
+        return [doc async for doc in cursor]
+
+    async def get_user_profile(self, user_id: str) -> dict[str, Any] | None:
+        user_keys = mongo_id_candidates(user_id)
+        data = await self.db.users.find_one(
+            {"_id": {"$in": user_keys}},
+            {"name": 1, "email": 1, "phone": 1, "provider": 1, "onboarding": 1},
+        )
+        return data if data else None
+
+    async def get_space_stats(self, user_id: str, space_id: str) -> dict[str, int]:
+        query = {"userId": {"$in": mongo_id_candidates(user_id)}, "spaceId": {"$in": mongo_id_candidates(space_id)}}
+        (
+            notes_count,
+            tasks_count,
+            done_tasks_count,
+            staged_notes_count,
+            staged_tasks_count,
+            staged_done_tasks_count,
+        ) = await _gather_counts(
+            self.db.notes.count_documents(query),
+            self.db.tasks.count_documents(query),
+            self.db.tasks.count_documents({**query, "status": "completed"}),
+            self.db["stagedNotes"].count_documents(query),
+            self.db["stagedTasks"].count_documents(query),
+            self.db["stagedTasks"].count_documents({**query, "operation": {"$in": ["DONE", "COMPLETE"]}}),
+        )
+        visible_task_count = tasks_count or staged_tasks_count
+        visible_done_count = done_tasks_count if tasks_count else staged_done_tasks_count
+        completion = 0 if visible_task_count == 0 else round((visible_done_count / visible_task_count) * 100)
+        return {
+            "notesCount": notes_count,
+            "tasksCount": tasks_count,
+            "doneTasksCount": done_tasks_count,
+            "stagedNotesCount": staged_notes_count,
+            "stagedTasksCount": staged_tasks_count,
+            "stagedDoneTasksCount": staged_done_tasks_count,
+            "completionPercentage": completion,
+        }
+
+    async def list_recent_notes(self, user_id: str, space_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        cursor = self.db.notes.find(
+            {"userId": {"$in": mongo_id_candidates(user_id)}, "spaceId": {"$in": mongo_id_candidates(space_id)}},
+            {"evidence": 0},
+        ).sort("updatedAt", -1).limit(limit)
+        return [doc async for doc in cursor]
+
+    async def list_staged_tasks(self, user_id: str, space_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        cursor = self.db["stagedTasks"].find(
+            {"userId": {"$in": mongo_id_candidates(user_id)}, "spaceId": {"$in": mongo_id_candidates(space_id)}},
+            {"evidence": 0, "fingerprint": 0},
+        ).sort("updatedAt", -1).limit(limit)
+        return [doc async for doc in cursor]
+
+    async def list_staged_notes(self, user_id: str, space_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        cursor = self.db["stagedNotes"].find(
+            {"userId": {"$in": mongo_id_candidates(user_id)}, "spaceId": {"$in": mongo_id_candidates(space_id)}},
+            {"evidence": 0, "fingerprint": 0},
+        ).sort("updatedAt", -1).limit(limit)
+        return [doc async for doc in cursor]
+
+    async def list_staged_decisions(self, user_id: str, space_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        cursor = self.db["stagedDecisions"].find(
+            {"userId": {"$in": mongo_id_candidates(user_id)}, "spaceId": {"$in": mongo_id_candidates(space_id)}},
+            {"evidence": 0},
+        ).sort("updatedAt", -1).limit(limit)
+        return [doc async for doc in cursor]
+
+    async def list_staged_issues(self, user_id: str, space_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        cursor = self.db["stagedIssues"].find(
+            {"userId": {"$in": mongo_id_candidates(user_id)}, "spaceId": {"$in": mongo_id_candidates(space_id)}},
+            {"evidence": 0},
+        ).sort("updatedAt", -1).limit(limit)
+        return [doc async for doc in cursor]
+
     async def list_recent_summaries(self, user_id: str, space_id: str, limit: int = 5) -> list[dict[str, Any]]:
         cursor = self.db.conversation_summaries.find(
-            {"userId": to_mongo_id(user_id), "spaceId": to_mongo_id(space_id)},
+            {"userId": {"$in": mongo_id_candidates(user_id)}, "spaceId": {"$in": mongo_id_candidates(space_id)}},
             {"summary": 1, "topics": 1, "createdAt": 1},
         ).sort("createdAt", -1).limit(limit)
         return [doc async for doc in cursor]
@@ -447,6 +653,106 @@ def staged_object_id(collection_name: str, run_id: Any, item: dict[str, Any], in
     return ObjectId(sha1(stable_source.encode("utf-8")).hexdigest()[:24])
 
 
+def task_object_id(run_id: Any, item: dict[str, Any], index: int) -> ObjectId:
+    return _published_object_id("task", run_id, item, index)
+
+
+def note_object_id(run_id: Any, item: dict[str, Any], index: int) -> ObjectId:
+    return _published_object_id("note", run_id, item, index)
+
+
+def _published_object_id(kind: str, run_id: Any, item: dict[str, Any], index: int) -> ObjectId:
+    stable_source = "|".join(
+        [
+            str(run_id),
+            kind,
+            str(index),
+            str(item.get("fingerprint") or ""),
+            str(item.get("title") or ""),
+            str(item.get("body") or ""),
+        ]
+    )
+    return ObjectId(sha1(stable_source.encode("utf-8")).hexdigest()[:24])
+
+
+def task_status_for_operation(operation: str, needs_confirmation: bool = False) -> str:
+    if needs_confirmation or operation == "NEEDS_CONFIRMATION":
+        return "needs_confirmation"
+    if operation == "COMPLETE":
+        return "completed"
+    if operation == "CANCEL":
+        return "cancelled"
+    return "pending"
+
+
+def _space_owner_query(user_keys: list[Any]) -> dict[str, Any]:
+    return {
+        "$or": [
+            {"userId": {"$in": user_keys}},
+            {"user_id": {"$in": user_keys}},
+            {"ownerId": {"$in": user_keys}},
+            {"owner_id": {"$in": user_keys}},
+            {"createdBy": {"$in": user_keys}},
+            {"createdById": {"$in": user_keys}},
+            {"members.userId": {"$in": user_keys}},
+            {"members.user_id": {"$in": user_keys}},
+            {"users": {"$in": user_keys}},
+            {"userIds": {"$in": user_keys}},
+            {"user_ids": {"$in": user_keys}},
+        ]
+    }
+
+
+def _space_identity_query(space_ids: list[Any]) -> dict[str, Any]:
+    unique_ids = _unique_values(space_ids)
+    return {
+        "$or": [
+            {"_id": {"$in": unique_ids}},
+            {"spaceId": {"$in": unique_ids}},
+            {"space_id": {"$in": unique_ids}},
+            {"id": {"$in": unique_ids}},
+        ]
+    }
+
+
+def _space_document_label(item: dict[str, Any]) -> str | None:
+    for field in (
+        "spaceName",
+        "spacename",
+        "space_name",
+        "name",
+        "title",
+        "label",
+        "workspaceName",
+        "workspace_name",
+    ):
+        value = item.get(field)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _unique_values(values: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    unique: list[Any] = []
+    for value in values:
+        key = f"{type(value).__name__}:{value}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(value)
+    return unique
+
+
+def _space_fallback_label(space_id: Any) -> str:
+    text = str(space_id or "").strip()
+    if not text:
+        return "Unnamed workspace"
+    compact = "".join(char for char in text if char.isalnum())
+    suffix = compact[-6:] if len(compact) > 6 else compact
+    return f"Unnamed workspace ({suffix})" if suffix else "Unnamed workspace"
+
+
 def embedded_object_id(item: dict[str, Any]) -> ObjectId:
     stable_source = item.get("fingerprint") or "|".join(
         str(item.get(key, "")) for key in ("title", "sequenceStart", "sequenceEnd", "text")
@@ -461,3 +767,7 @@ def _id_query(value: Any) -> dict[str, Any]:
     if mongo_id == value:
         return {"_id": value}
     return {"_id": mongo_id}
+
+
+async def _gather_counts(*awaitables) -> list[int]:
+    return [int(value) for value in await asyncio.gather(*awaitables)]

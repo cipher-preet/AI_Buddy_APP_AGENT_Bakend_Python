@@ -29,6 +29,9 @@ from services.conversation.service import ConversationService
 from services.conversation.transcript import assemble_transcript, detect_missing_sequences, segment_transcript
 from services.conversation.workflow import ConversationProcessingWorkflow
 from services.conversation.workflow_state import ConversationGraphState
+from services.chat.planner import ChatQueryPlan
+from services.chat.service import ChatService, _merge_pending_space_action
+from services.chat.tools import ChatToolRunner
 from services.llm.models import LLMMessage, StructuredLLMRequest
 from services.llm.openai_compatible import OpenAICompatibleProvider
 from services.queue.streams import EventEnvelope
@@ -188,6 +191,35 @@ class FakeDb(dict):
         return super().__getitem__(name)
 
 
+class PublishCollection:
+    def __init__(self):
+        self.docs = []
+
+    async def find_one_and_update(self, query, update, upsert=False, return_document=None):
+        for doc in self.docs:
+            if all(doc.get(key) == value for key, value in query.items()):
+                if "$set" in update:
+                    doc.update(update["$set"])
+                return doc
+        if not upsert:
+            return None
+        doc = dict(update.get("$setOnInsert") or {})
+        self.docs.append(doc)
+        return doc
+
+    async def update_one(self, query, update, upsert=False):
+        self.docs.append({"query": query, "update": update, "upsert": upsert})
+
+
+class PublishDb(dict):
+    def __init__(self):
+        super().__init__()
+        self.tasks = PublishCollection()
+        self.notes = PublishCollection()
+        self.conversation_summaries = PublishCollection()
+        self.space_memory = PublishCollection()
+
+
 def test_save_extraction_run_writes_all_split_staged_collections():
     asyncio.run(_save_extraction_run_writes_all_split_staged_collections())
 
@@ -267,6 +299,385 @@ async def _save_extraction_run_clears_all_split_staged_collections_on_publish():
     for collection_name in ("stagedTasks", "stagedNotes", "stagedDecisions", "stagedIssues"):
         assert db[collection_name].deleted == [{"extractionRunId": run.id}]
         assert db[collection_name].inserted == []
+
+
+def test_publish_outputs_writes_final_tasks_and_notes():
+    asyncio.run(_publish_outputs_writes_final_tasks_and_notes())
+
+
+async def _publish_outputs_writes_final_tasks_and_notes():
+    db = PublishDb()
+    run = ExtractionRunDocument(
+        conversationId="507f1f77bcf86cd799439011",
+        userId="507f1f77bcf86cd799439012",
+        spaceId="507f1f77bcf86cd799439013",
+        processingVersion=1,
+        provider="test",
+        model="test-model",
+        stagedTasks=[
+            ExtractedTask(
+                title="Test payment callback",
+                body="Test the callback retry flow.",
+                operation="CREATE",
+                dueDateResolved="2026-08-05",
+                confidence=0.9,
+                sourceConversationId="507f1f77bcf86cd799439011",
+                fingerprint="task-fingerprint",
+                evidence=[EvidenceSpan(sequenceStart=0, sequenceEnd=0, text="Test callback today.")],
+            )
+        ],
+        stagedNotes=[
+            ExtractedNote(
+                title="Callback retry note",
+                body="The callback retry flow needs observability.",
+                confidence=0.9,
+                sourceConversationId="507f1f77bcf86cd799439011",
+                fingerprint="note-fingerprint",
+                evidence=[EvidenceSpan(sequenceStart=1, sequenceEnd=1, text="Retry observability.")],
+            )
+        ],
+    )
+    summary = ConversationSummaryDocument(
+        conversationId=run.conversationId,
+        userId=run.userId,
+        spaceId=run.spaceId,
+        summary="Payment callback testing was discussed.",
+        processingVersion=1,
+        modelProvider="test",
+        modelName="test-model",
+        promptVersion="test",
+    )
+    memory = SpaceMemoryDocument(userId=run.userId, spaceId=run.spaceId)
+
+    result = await ConversationRepository(db).publish_outputs(run, summary, memory)
+
+    assert result["taskIds"]
+    assert result["noteIds"]
+    assert db.tasks.docs[0]["title"] == "Test payment callback"
+    assert db.tasks.docs[0]["status"] == "pending"
+    assert db.notes.docs[0]["title"] == "Callback retry note"
+
+
+class ToolRepository:
+    async def get_space_memory(self, user_id, space_id):
+        return SpaceMemoryDocument(
+            userId=user_id,
+            spaceId=space_id,
+            currentSummary="Payment callback project is active.",
+            importantFacts=["Retries need observability."],
+            importantDecisions=["Use structured chat tools."],
+        )
+
+    async def list_recent_summaries(self, user_id, space_id, limit=8):
+        return [{"summary": "Discussed callback testing.", "topics": ["payments"], "createdAt": utc_now()}]
+
+    async def list_tasks(self, user_id, space_id, limit=100):
+        return [
+            {
+                "title": "Test payment callback",
+                "body": "Run the retry test.",
+                "status": "pending",
+                "dueDateResolved": utc_now().date().isoformat(),
+                "ownerText": "Rahul",
+            }
+        ]
+
+    async def list_recent_notes(self, user_id, space_id, limit=50):
+        return [{"title": "Retry observability", "body": "Retries need logs.", "updatedAt": utc_now()}]
+
+    async def list_user_spaces(self, user_id, limit=50):
+        return [{"spaceId": "space_1", "label": "Payments", "sources": ["tasks"]}]
+
+
+def test_chat_tools_include_structured_task_note_and_summary_context():
+    result = asyncio.run(
+        ChatToolRunner(ToolRepository()).run(
+            "summary my space and tell today unfinished tasks and notes",
+            "user_1",
+            "space_1",
+            ChatQueryPlan(
+                understoodRequest="Summarize space with today's tasks and notes.",
+                useStructuredTools=True,
+                useVectorSearch=False,
+                directToolAnswerAllowed=True,
+                toolFocus=["summaries", "space_memory", "tasks", "notes"],
+                temporalScope="today",
+            ),
+        )
+    )
+    context = str(result["context"])
+
+    assert "Tool: space_memory" in context
+    assert "Tool: tasks" in context
+    assert "due_today=1" in context
+    assert "Test payment callback" in context
+    assert "Tool: notes" in context
+    assert "Retry observability" in context
+    assert "You have 1 task(s) due today" in str(result["answer"])
+    assert result["direct"] is True
+
+
+def test_chat_tools_directly_answer_today_tasks():
+    result = asyncio.run(
+        ChatToolRunner(ToolRepository()).run(
+            "What are my today's tasks",
+            "user_1",
+            "space_1",
+            ChatQueryPlan(
+                understoodRequest="List today's tasks.",
+                useStructuredTools=True,
+                useVectorSearch=False,
+                directToolAnswerAllowed=True,
+                toolFocus=["tasks"],
+                temporalScope="today",
+            ),
+        )
+    )
+
+    assert "Structured tool context" not in str(result["answer"])
+    assert "You have 1 task(s) due today" in str(result["answer"])
+    assert "Test payment callback" in str(result["answer"])
+    assert result["direct"] is True
+
+
+def test_chat_tools_do_not_direct_answer_topic_specific_task_requests():
+    result = asyncio.run(
+        ChatToolRunner(ToolRepository()).run(
+            "Please give me all task details for payment callback",
+            "user_1",
+            "space_1",
+            ChatQueryPlan(
+                understoodRequest="Give task details for the payment callback topic.",
+                useStructuredTools=True,
+                useVectorSearch=True,
+                directToolAnswerAllowed=False,
+                toolFocus=["tasks"],
+                temporalScope="all",
+                searchQueries=["payment callback task details"],
+            ),
+        )
+    )
+
+    assert result["direct"] is False
+    assert "Test payment callback" in str(result["context"])
+    assert "I found 1 task(s)" in str(result["answer"])
+
+
+def test_chat_tools_list_spaces_when_plan_requests_options():
+    result = asyncio.run(
+        ChatToolRunner(ToolRepository()).run(
+            "Give me list of spaces",
+            "user_1",
+            None,
+            ChatQueryPlan(
+                understoodRequest="List available spaces.",
+                responseMode="list_options",
+                requiresSpace=False,
+                useStructuredTools=True,
+                useVectorSearch=False,
+                directToolAnswerAllowed=True,
+                optionKind="spaces",
+            ),
+        )
+    )
+
+    assert result["direct"] is True
+    assert "Available spaces" in str(result["answer"])
+    assert "Payments" in str(result["answer"])
+
+
+def test_chat_tools_ignore_non_english_planner_question_for_space_options():
+    result = asyncio.run(
+        ChatToolRunner(ToolRepository()).run(
+            "कल के लिए मेरे tasks plan करो",
+            "user_1",
+            None,
+            ChatQueryPlan(
+                understoodRequest="Plan tasks for tomorrow.",
+                responseMode="ask_clarifying_question",
+                requiresSpace=True,
+                optionKind="spaces",
+                missingInfoQuestion="कौन सा space उपयोग करना है?",
+            ),
+        )
+    )
+
+    assert "Which space should I use?" in str(result["answer"])
+    assert "कौन" not in str(result["answer"])
+
+
+def test_chat_tools_missing_info_answer_is_english_only():
+    result = asyncio.run(
+        ChatToolRunner(ToolRepository()).run(
+            "कल के लिए मेरे tasks plan करो",
+            "user_1",
+            None,
+            ChatQueryPlan(
+                understoodRequest="Plan tasks for tomorrow.",
+                responseMode="ask_clarifying_question",
+                requiresSpace=False,
+                optionKind="none",
+                missingInfoQuestion="कृपया और जानकारी दें",
+            ),
+        )
+    )
+
+    assert result["answer"] == "I need one more detail before I can answer. Please clarify what you mean."
+
+
+def test_chat_tools_allow_general_note_request_without_selected_space():
+    result = asyncio.run(
+        ChatToolRunner(ToolRepository()).run(
+            "Give me some notes for the space company",
+            "user_1",
+            None,
+            ChatQueryPlan(
+                understoodRequest="Give general notes about a space company.",
+                useStructuredTools=False,
+                useVectorSearch=False,
+                directToolAnswerAllowed=False,
+            ),
+        )
+    )
+
+    assert result["direct"] is False
+    assert result["answer"] is None
+    assert "Structured tools skipped by query plan." in str(result["context"])
+
+
+def test_chat_tools_do_not_require_space_for_general_answer_plan():
+    result = asyncio.run(
+        ChatToolRunner(ToolRepository()).run(
+            "Hi",
+            "user_1",
+            None,
+            ChatQueryPlan(
+                understoodRequest="Greet the user.",
+                responseMode="answer",
+                requiresSpace=False,
+                useStructuredTools=True,
+                useVectorSearch=False,
+                directToolAnswerAllowed=False,
+                optionKind="none",
+                toolFocus=[],
+            ),
+        )
+    )
+
+    assert result["direct"] is False
+    assert result["answer"] is None
+    assert "does not require workspace tools" in str(result["context"])
+
+
+def test_chat_preserves_pending_original_request_when_user_asks_to_list_spaces():
+    existing = {
+        "type": "select_option",
+        "optionKind": "spaces",
+        "originalQuestion": "Give me all notes",
+        "plan": {"responseMode": "ask_clarifying_question", "toolFocus": ["notes"]},
+        "options": [{"index": 1, "label": "Old", "value": "old_space"}],
+    }
+    current = {
+        "type": "select_option",
+        "optionKind": "spaces",
+        "originalQuestion": "Give me list of all spaces",
+        "plan": {"responseMode": "list_options", "optionKind": "spaces"},
+        "options": [{"index": 1, "label": "Payments", "value": "space_1"}],
+    }
+
+    merged = _merge_pending_space_action(existing, current)
+
+    assert merged["originalQuestion"] == "Give me all notes"
+    assert merged["plan"]["toolFocus"] == ["notes"]
+    assert merged["options"][0]["value"] == "space_1"
+
+
+def test_chat_pending_action_resolves_numbered_option_without_reasking():
+    pending = {
+        "type": "select_option",
+        "optionKind": "spaces",
+        "originalQuestion": "Plan my tasks for tomorrow",
+        "options": [
+            {"index": 1, "label": "Payments", "value": "space_1"},
+            {"index": 2, "label": "Sales", "value": "space_2"},
+        ],
+    }
+
+    selected_space, resumed_question = ChatService()._resolve_pending_action("1", None, pending)
+
+    assert selected_space == "space_1"
+    assert resumed_question == "Plan my tasks for tomorrow"
+
+
+def test_chat_pending_action_resolves_label_option_without_reasking():
+    pending = {
+        "type": "select_option",
+        "optionKind": "spaces",
+        "originalQuestion": "Summarize my day",
+        "options": [
+            {"index": 1, "label": "Payments", "value": "space_1"},
+        ],
+    }
+
+    selected_space, resumed_question = ChatService()._resolve_pending_action("payments", None, pending)
+
+    assert selected_space == "space_1"
+    assert resumed_question == "Summarize my day"
+
+
+def test_chat_resolves_inline_space_number_before_planning():
+    async def run():
+        service = ChatService(tool_runner=ChatToolRunner(ToolRepository()))
+        return await service._resolve_space_from_message_or_history("Give notes for space 1", "user_1", [])
+
+    selected_space, resumed_question = asyncio.run(run())
+
+    assert selected_space == "space_1"
+    assert resumed_question == "Give notes"
+
+
+def test_chat_resolves_number_reply_from_history_when_pending_action_missing():
+    class Human:
+        type = "human"
+        content = "Give notes for space 1"
+
+    async def run():
+        service = ChatService(tool_runner=ChatToolRunner(ToolRepository()))
+        return await service._resolve_space_from_message_or_history("1", "user_1", [Human()])
+
+    selected_space, resumed_question = asyncio.run(run())
+
+    assert selected_space == "space_1"
+    assert resumed_question == "Give notes"
+
+
+class StagedToolRepository(ToolRepository):
+    async def list_recent_notes(self, user_id, space_id, limit=50):
+        return []
+
+    async def list_staged_notes(self, user_id, space_id, limit=50):
+        return [{"title": "Demo note", "body": "This comes from stagedNotes.", "updatedAt": utc_now()}]
+
+
+def test_chat_tools_directly_answer_staged_notes_when_published_notes_are_empty():
+    result = asyncio.run(
+        ChatToolRunner(StagedToolRepository()).run(
+            "Give notes",
+            "user_1",
+            "space_1",
+            ChatQueryPlan(
+                understoodRequest="List notes.",
+                useStructuredTools=True,
+                useVectorSearch=False,
+                directToolAnswerAllowed=True,
+                toolFocus=["notes"],
+            ),
+        )
+    )
+
+    assert result["direct"] is True
+    assert "Demo note" in str(result["answer"])
+    assert "staged note" in str(result["answer"]).lower()
 
 
 class HangingWorkflow:

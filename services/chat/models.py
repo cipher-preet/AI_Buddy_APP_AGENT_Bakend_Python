@@ -21,6 +21,7 @@ class ChatSessionDocument(BaseModel):
     title: str | None = None
     status: str = "active"
     messageCount: int = 0
+    pendingAction: dict[str, Any] | None = None
     createdAt: datetime = Field(default_factory=utc_now)
     updatedAt: datetime = Field(default_factory=utc_now)
 

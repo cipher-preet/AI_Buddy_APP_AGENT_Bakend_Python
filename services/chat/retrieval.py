@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from typing import Any
 
@@ -32,7 +33,7 @@ class ChatRetriever:
             hits.extend(await _search_points(query_vector, search_filter, self.child_limit))
         children = [_context_from_hit(hit) for hit in hits]
         parents = await self._expand_parent_context(children, user_id, space_id)
-        merged = _dedupe_contexts([*parents, *children])
+        merged = _rank_contexts(_dedupe_contexts([*children, *parents]), queries)
         return merged[: self.child_limit * (self.parent_window * 2 + 1)]
 
     async def _expand_parent_context(
@@ -50,6 +51,11 @@ class ChatRetriever:
                     by_job[child.jobId].add(index)
 
         contexts: list[RetrievedContext] = []
+        child_scores = {
+            (child.jobId, child.chunkIndex): child.score
+            for child in children
+            if child.jobId is not None and child.chunkIndex is not None and child.score is not None
+        }
         for job_id, indexes in by_job.items():
             scroll_filter = _parent_filter(user_id, space_id, job_id, sorted(indexes))
             records, _ = await qdrant_client.scroll(
@@ -59,7 +65,18 @@ class ChatRetriever:
                 with_payload=True,
                 with_vectors=False,
             )
-            contexts.extend(_context_from_record(record) for record in records)
+            for record in records:
+                context = _context_from_record(record)
+                nearby_scores = [
+                    score
+                    for (score_job_id, score_index), score in child_scores.items()
+                    if score_job_id == context.jobId
+                    and context.chunkIndex is not None
+                    and abs(score_index - context.chunkIndex) <= self.parent_window
+                ]
+                if nearby_scores and context.score is None:
+                    context.score = max(nearby_scores) * 0.92
+                contexts.append(context)
         return sorted(contexts, key=lambda item: (item.jobId or "", item.chunkIndex or 0))
 
 
@@ -145,6 +162,37 @@ def _dedupe_contexts(contexts: list[RetrievedContext]) -> list[RetrievedContext]
         seen.add(key)
         unique.append(context)
     return unique
+
+
+def _rank_contexts(contexts: list[RetrievedContext], queries: list[str]) -> list[RetrievedContext]:
+    query_terms = _query_terms(queries)
+
+    def rank_key(context: RetrievedContext) -> tuple[float, int, str, int]:
+        vector_score = float(context.score or 0)
+        lexical_score = _lexical_overlap(context.text, query_terms)
+        # Prefer strong semantic matches, then exact term overlap, then local transcript order.
+        combined = vector_score + (0.04 * lexical_score)
+        return (combined, lexical_score, context.jobId or "", -(context.chunkIndex or 0))
+
+    return sorted(contexts, key=rank_key, reverse=True)
+
+
+def _query_terms(queries: list[str]) -> set[str]:
+    terms: set[str] = set()
+    for query in queries:
+        terms.update(_tokenize(query))
+    return {term for term in terms if len(term) > 2}
+
+
+def _lexical_overlap(text: str, query_terms: set[str]) -> int:
+    if not query_terms:
+        return 0
+    terms = set(_tokenize(text))
+    return len(query_terms & terms)
+
+
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"[\w]+", (text or "").lower(), flags=re.UNICODE)
 
 
 def _dedupe_queries(queries: list[str]) -> list[str]:

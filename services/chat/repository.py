@@ -42,24 +42,29 @@ class ChatRepository:
             session = await self.get_session(chat_id)
             if not session:
                 raise ValueError("Chat session not found")
-            if not same_mongo_id(session.userId, user_id) or not same_mongo_id(session.spaceId, space_id):
+            if not same_mongo_id(session.userId, user_id):
                 raise PermissionError("Chat session does not belong to this user or space")
+            if space_id is not None and not same_mongo_id(session.spaceId, space_id):
+                raise PermissionError("Chat session does not belong to this user or space")
+            session_space_id = space_id if space_id is not None else str(session.spaceId) if session.spaceId is not None else None
             if not is_native_object_id(session.id) or not is_native_object_id(session.userId):
                 await self.archive_session(session.id)
-                return await self.create_session(user_id, space_id)
+                return await self.create_session(user_id, session_space_id)
             if session.messageCount + 2 <= MAX_CHAT_MESSAGES:
                 return session
             await self.archive_session(session.id)
-            return await self.create_session(user_id, space_id)
+            return await self.create_session(user_id, session_space_id)
 
+        query = {
+            "userId": to_mongo_id(user_id),
+            "status": "active",
+            "_id": {"$type": "objectId"},
+            "messageCount": {"$lte": MAX_CHAT_MESSAGES - 2},
+        }
+        if space_id is not None:
+            query["spaceId"] = to_mongo_id(space_id)
         document = await self.db.chat_sessions.find_one(
-            {
-                "userId": to_mongo_id(user_id),
-                "spaceId": to_mongo_id(space_id),
-                "status": "active",
-                "_id": {"$type": "objectId"},
-                "messageCount": {"$lte": MAX_CHAT_MESSAGES - 2},
-            },
+            query,
             sort=[("updatedAt", -1)],
         )
         if document:
@@ -147,6 +152,24 @@ class ChatRepository:
         await self.db.chat_sessions.update_one(
             {**_id_query(chat_id), "title": None},
             {"$set": {"title": title[:80], "updatedAt": utc_now()}},
+        )
+
+    async def set_pending_action(self, chat_id: Any, pending_action: dict[str, Any]) -> None:
+        await self.db.chat_sessions.update_one(
+            _id_query(chat_id),
+            {"$set": {"pendingAction": pending_action, "updatedAt": utc_now()}},
+        )
+
+    async def clear_pending_action(self, chat_id: Any) -> None:
+        await self.db.chat_sessions.update_one(
+            _id_query(chat_id),
+            {"$unset": {"pendingAction": ""}, "$set": {"updatedAt": utc_now()}},
+        )
+
+    async def set_session_space(self, chat_id: Any, space_id: str) -> None:
+        await self.db.chat_sessions.update_one(
+            _id_query(chat_id),
+            {"$set": {"spaceId": to_mongo_id(space_id), "updatedAt": utc_now()}},
         )
 
 
