@@ -1,8 +1,7 @@
-import os
 from openai import AsyncOpenAI
 from apps.api_gateway.config.setting import settings
 
-client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+client = AsyncOpenAI(api_key=settings.secret_value(settings.OPENAI_API_KEY))
 
 EMBEDDING_MODEL = settings.EMBEDDING_MODEL
 

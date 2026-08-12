@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+from pathlib import Path
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from apps.api_gateway.config.setting import settings
@@ -9,10 +12,17 @@ from services.conversation.inactivity import ConversationInactivityScanner
 from services.conversation.repository import ConversationRepository
 from services.conversation.workflow import ConversationProcessingWorkflow
 from services.db.mongo import get_database
-from services.queue.streams import EventEnvelope, RedisStreamConsumer
+from services.queue.streams import EventEnvelope, NonRetryableQueueError, RedisStreamConsumer
 from services.queue.streams import RedisStreamProducer
 from services.queue.redis_queue import redis_client
+from services.storage.s3_audio_storage import (
+    get_s3_audio_storage,
+    safe_temp_audio_path,
+    temp_audio_root,
+    validate_conversation_audio_object_key,
+)
 from services.speech.providers.sarvam_provider import sarvam_transcribe_from_path
+from services.conversation.models import STTStatus
 
 
 async def handle_stt_event(event: EventEnvelope) -> None:
@@ -20,12 +30,66 @@ async def handle_stt_event(event: EventEnvelope) -> None:
     payload = event.payload
     conversation_id = payload["conversationId"]
     sequence_number = int(payload["sequenceNumber"])
+    existing = await repository.get_transcript_chunk(conversation_id, sequence_number)
+    if existing and existing.sttStatus == STTStatus.COMPLETED:
+        print(
+            "Duplicate STT event skipped:",
+            {
+                "eventId": event.eventId,
+                "correlationId": event.correlationId,
+                "conversationId": conversation_id,
+                "sequenceNumber": sequence_number,
+                "stage": "stt_duplicate_completed",
+            },
+        )
+        return
+
+    await repository.mark_transcript_chunk_processing(conversation_id, sequence_number)
+    local_path: Path | None = None
+    job_dir: Path | None = None
 
     try:
+        file_path = payload.get("filePath")
+        filename = payload.get("filename") or f"{payload.get('chunkId')}.audio"
+        content_type = payload.get("contentType") or "audio/wav"
+        if isinstance(file_path, str) and file_path.startswith("s3://"):
+            parsed = urlparse(file_path)
+            payload = {
+                **payload,
+                "storageProvider": "s3",
+                "bucket": parsed.netloc,
+                "objectKey": parsed.path.lstrip("/"),
+            }
+        if str(payload.get("storageProvider") or "").lower() == "s3" or payload.get("objectKey") or payload.get("s3ObjectKey"):
+            bucket = str(payload.get("bucket") or payload.get("s3Bucket") or "")
+            object_key = str(payload.get("objectKey") or payload.get("s3ObjectKey") or "")
+            validate_conversation_audio_object_key(
+                object_key=object_key,
+                user_id=event.userId,
+                space_id=event.spaceId,
+                conversation_id=conversation_id,
+            )
+            local_path = safe_temp_audio_path(
+                {
+                    "job_id": payload.get("jobId") or event.eventId,
+                    "filename": filename,
+                }
+            )
+            job_dir = local_path.parent
+            _cleanup_job_dir(job_dir)
+            downloaded = await get_s3_audio_storage().download_file(
+                bucket=bucket,
+                object_key=object_key,
+                destination=local_path,
+            )
+            file_path = str(downloaded)
+
+        if not file_path:
+            raise ValueError("STT event is missing audio file reference")
         result = await sarvam_transcribe_from_path(
-            file_path=payload["filePath"],
-            filename=payload.get("filename") or f"{payload.get('chunkId')}.audio",
-            content_type=payload.get("contentType") or "audio/wav",
+            file_path=file_path,
+            filename=filename,
+            content_type=content_type,
         )
         await repository.complete_transcript_chunk(
             conversation_id=conversation_id,
@@ -49,9 +113,19 @@ async def handle_stt_event(event: EventEnvelope) -> None:
                     payload={"expectedLastSequence": conversation.expectedLastSequence},
                 ),
             )
+    except ValueError as error:
+        await repository.fail_transcript_chunk(conversation_id, sequence_number, str(error))
+        await _publish_finalization_if_stopped(repository, conversation_id, event.eventId)
+        raise NonRetryableQueueError(str(error)) from error
     except Exception as error:
         await repository.fail_transcript_chunk(conversation_id, sequence_number, str(error))
         raise
+    finally:
+        if job_dir is not None:
+            try:
+                _cleanup_job_dir(job_dir)
+            except Exception as cleanup_error:
+                print("Conversation worker temporary audio cleanup failed:", str(cleanup_error))
 
 
 async def handle_audio_event(event: EventEnvelope) -> None:
@@ -67,6 +141,27 @@ async def handle_audio_event(event: EventEnvelope) -> None:
             payload=event.payload,
         ),
     )
+
+
+async def _publish_finalization_if_stopped(
+    repository: ConversationRepository,
+    conversation_id: str,
+    causation_id: str,
+) -> None:
+    conversation = await repository.get_conversation(conversation_id)
+    if conversation and conversation.expectedLastSequence is not None:
+        await RedisStreamProducer().publish(
+            settings.REDIS_FINALIZATION_STREAM,
+            EventEnvelope(
+                eventType="conversation.finalization.requested",
+                correlationId=conversation_id,
+                userId=str(conversation.userId),
+                spaceId=str(conversation.spaceId),
+                conversationId=conversation_id,
+                causationId=causation_id,
+                payload={"expectedLastSequence": conversation.expectedLastSequence},
+            ),
+        )
 
 
 async def handle_finalization_event(event: EventEnvelope) -> None:
@@ -96,6 +191,7 @@ def build_stt_consumer() -> RedisStreamConsumer:
         group=settings.REDIS_STT_GROUP,
         consumer_name=f"stt-{uuid4().hex[:8]}",
         handler=handle_stt_event,
+        concurrency=settings.STT_WORKER_CONCURRENCY or min(settings.WORKER_CONCURRENCY, settings.SARVAM_MAX_CONCURRENCY),
     )
 
 
@@ -105,6 +201,7 @@ def build_audio_consumer() -> RedisStreamConsumer:
         group=settings.REDIS_AUDIO_GROUP,
         consumer_name=f"audio-{uuid4().hex[:8]}",
         handler=handle_audio_event,
+        concurrency=settings.AUDIO_WORKER_CONCURRENCY or settings.WORKER_CONCURRENCY,
     )
 
 
@@ -114,6 +211,7 @@ def build_finalization_consumer() -> RedisStreamConsumer:
         group=settings.REDIS_FINALIZATION_GROUP,
         consumer_name=f"finalization-{uuid4().hex[:8]}",
         handler=handle_finalization_event,
+        concurrency=settings.FINALIZATION_WORKER_CONCURRENCY or settings.WORKER_CONCURRENCY,
     )
 
 
@@ -123,7 +221,7 @@ def build_processing_consumer() -> RedisStreamConsumer:
         group=settings.REDIS_PROCESSING_GROUP,
         consumer_name=f"processing-{uuid4().hex[:8]}",
         handler=handle_processing_event,
-        concurrency=1,
+        concurrency=settings.PROCESSING_WORKER_CONCURRENCY,
     )
 
 
@@ -156,3 +254,14 @@ async def run_retry_relay() -> None:
                 await producer.publish(target_stream, EventEnvelope.model_validate_json(raw_event))
             await redis_client.xdel(settings.REDIS_RETRY_STREAM, message_id)
         await asyncio.sleep(1)
+
+
+def _cleanup_job_dir(job_dir: Path) -> None:
+    root = temp_audio_root()
+    resolved = job_dir.resolve()
+    if resolved == root:
+        raise ValueError(f"Refusing to clean temporary audio root: {root}")
+    if root not in resolved.parents:
+        raise ValueError(f"Refusing to clean path outside temporary audio root: {root}")
+    if resolved.exists():
+        shutil.rmtree(resolved)

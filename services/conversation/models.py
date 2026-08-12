@@ -44,6 +44,7 @@ VALID_TRANSITIONS: dict[ConversationStatus, set[ConversationStatus]] = {
     },
     ConversationStatus.WAITING_FOR_TRANSCRIPTS: {
         ConversationStatus.READY_FOR_PROCESSING,
+        ConversationStatus.PROCESSING,
         ConversationStatus.PARTIAL,
         ConversationStatus.RETRY_PENDING,
         ConversationStatus.FAILED,
@@ -154,9 +155,14 @@ class AudioChunkMetadata(BaseModel):
     sequenceNumber: int = Field(ge=0)
     capturedAt: datetime | None = None
     durationMs: int | None = Field(default=None, ge=0)
-    filePath: str
+    filePath: str | None = None
     filename: str
     contentType: str | None = None
+    storageProvider: Literal["local", "s3"] = "local"
+    s3Bucket: str | None = None
+    s3ObjectKey: str | None = None
+    sizeBytes: int | None = Field(default=None, ge=0)
+    jobId: str | None = None
     createdAt: datetime = Field(default_factory=utc_now)
 
 

@@ -321,7 +321,7 @@ class ChatService:
             state["usage"] = {}
             return state
 
-        provider, model = get_llm_router().route(LLMCapability.HIGH_ACCURACY_REASONING)
+        provider, model = get_llm_router().route(LLMCapability.CHAT_ANSWER)
         response = await provider.generate(
             LLMRequest(
                 model=model,

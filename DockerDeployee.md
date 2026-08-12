@@ -1,153 +1,59 @@
 # Buddy AI Orchestration Deployment Guide
 
-## Step 1: Open Google Cloud SDK Shell
+The public API runs on Google Cloud Run. Background processing runs on AWS with the Queue API, private Redis Streams, and Python workers.
+
+## Cloud Run API
+
+Build and deploy from this repository:
 
 ```bat
 cd /d D:\AI_Personal_Buddy\AI_Orchestration
-```
-
-```bat
 deploy.bat
 ```
 
-## Step 2: Build Docker image
+The script:
 
-Use a new version every deployment.
+1. Builds the shared Docker image.
+2. Pushes it to Artifact Registry.
+3. Deploys only `apps.api_gateway.main:app` to Cloud Run.
 
-Example:
+Cloud Run uses `cloud-run-api.env`. Set production secrets through a secure runtime mechanism before deployment.
 
-```bash
-docker build -t buddy-ai-orchestration:v3 .
-```
+## AWS Worker Stack
 
-Don't use
-
-```
---no-cache
-```
-
-unless you changed dependencies.
-
-## Step 3: Tag the image
+On the AWS host, create `.env.aws` from `.env.example`, then run:
 
 ```bash
-docker tag buddy-ai-orchestration:v3 asia-south1-docker.pkg.dev/python-microservice-hub/buddy-backend-repo/buddy-ai-orchestration:v3
+docker compose -f docker-compose.aws.yml --env-file .env.aws build
+docker compose -f docker-compose.aws.yml --env-file .env.aws up -d
 ```
 
-## Step 4: Push to Artifact Registry
+The AWS stack contains:
+
+- `reverse-proxy`
+- `queue-api`
+- `redis`
+- `buddy-worker`
+
+Redis is private to the Docker network and must not expose port `6379` publicly.
+
+## Verify
+
+Cloud Run API:
+
+```bat
+gcloud run services describe buddy-ai-api --region asia-south1 --format="value(status.url)"
+gcloud run services logs read buddy-ai-api --region asia-south1 --freshness 10m --limit 100
+```
+
+AWS Queue API:
 
 ```bash
-docker push asia-south1-docker.pkg.dev/python-microservice-hub/buddy-backend-repo/buddy-ai-orchestration:v3
+curl https://queue-api.example.com/health/live
+curl https://queue-api.example.com/health/ready
+docker compose -f docker-compose.aws.yml --env-file .env.aws ps
 ```
 
-Wait until every layer says:
+## Important
 
-```
-Pushed
-```
-
-## Deploy API
-
-```bat
-gcloud run deploy buddy-ai-api ^
-  --image asia-south1-docker.pkg.dev/python-microservice-hub/buddy-backend-repo/buddy-ai-orchestration:v3 ^
-  --region asia-south1 ^
-  --service-account buddy-api-sa@python-microservice-hub.iam.gserviceaccount.com ^
-  --env-vars-file=cloud-run-api.env ^
-  --allow-unauthenticated ^
-  --port 8080 ^
-  --memory 1Gi ^
-  --cpu 1 ^
-  --timeout 300 ^
-  --min-instances 0 ^
-  --max-instances 5
-```
-
-## Deploy Worker
-
-```bat
-gcloud run deploy buddy-ai-worker ^
-  --image asia-south1-docker.pkg.dev/python-microservice-hub/buddy-backend-repo/buddy-ai-orchestration:v3 ^
-  --region asia-south1 ^
-  --env-vars-file=cloud-run-worker.env ^
-  --no-allow-unauthenticated ^
-  --command uvicorn ^
-  --args apps.api_gateway.workers.http_app:app,--host,0.0.0.0,--port,8080 ^
-  --port 8080 ^
-  --memory 2Gi ^
-  --cpu 2 ^
-  --timeout 600 ^
-  --concurrency 4 ^
-  --min-instances 0 ^
-  --max-instances 10
-```
-
-## API Logs
-
-```bat
-gcloud run services logs read buddy-ai-api ^
-  --region asia-south1 ^
-  --freshness 10m ^
-  --limit 100
-```
-
-## Worker Logs
-
-```bat
-gcloud run services logs read buddy-ai-worker ^
-  --region asia-south1 ^
-  --freshness 10m ^
-  --limit 100
-```
-
-## Live API Logs
-
-```bat
-gcloud beta run services logs tail buddy-ai-api ^
-  --region asia-south1
-```
-
-## Live Worker Logs
-
-```bat
-gcloud beta run services logs tail buddy-ai-worker ^
-  --region asia-south1
-```
-
-## Verify deployed image
-
-```bat
-gcloud run services describe buddy-ai-api ^
-  --region asia-south1 ^
-  --format="value(spec.template.spec.containers[0].image)"
-```
-
-Worker:
-
-```bat
-gcloud run services describe buddy-ai-worker ^
-  --region asia-south1 ^
-  --format="value(spec.template.spec.containers[0].image)"
-```
-
-## Verify Pub/Sub subscriptions
-
-```bat
-gcloud pubsub subscriptions list ^
-  --format="table(name,topic,pushConfig.pushEndpoint)"
-```
-
-## Publish a manual speech test
-
-```bash
-gcloud pubsub topics publish buddy-speech-jobs ^
-  --message="{\"job_id\":\"test001\"}"
-```
-
-## API URL
-
-https://buddy-ai-api-710178903619.asia-south1.run.app
-
-## Worker URL
-
-https://buddy-ai-worker-710178903619.asia-south1.run.app
+The old Cloud Run worker deployment is removed from the local deployment script. Workers should be run on AWS so audio downloads, Sarvam calls, Redis Streams, MongoDB updates, and Qdrant writes happen outside Cloud Run.

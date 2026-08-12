@@ -8,13 +8,17 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from redis.exceptions import ResponseError
 
 from apps.api_gateway.config.setting import settings
-from services.queue.factory import get_message_publisher, use_pubsub
-from services.queue.pubsub import topic_for_orchestration, topic_for_speech
+from services.queue.factory import use_queue_api
+from services.queue.http_queue import QueueApiPublisher
 from services.queue.redis_queue import redis_client
+
+
+class NonRetryableQueueError(RuntimeError):
+    pass
 
 
 class EventEnvelope(BaseModel):
@@ -30,31 +34,31 @@ class EventEnvelope(BaseModel):
     attempt: int = 0
     createdAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+    @field_validator(
+        "eventId",
+        "eventType",
+        "correlationId",
+        "causationId",
+        "userId",
+        "spaceId",
+        "conversationId",
+        mode="before",
+    )
+    @classmethod
+    def stringify_identifiers(cls, value):
+        if value is None:
+            return value
+        return str(value)
+
 
 class RedisStreamProducer:
     async def publish(self, stream: str, event: EventEnvelope) -> str:
-        if use_pubsub():
-            await get_message_publisher().publish(
-                _topic_for_stream(stream),
-                event.model_dump(mode="json"),
-                attributes={
-                    "event_type": event.eventType,
-                    "user_id": event.userId,
-                    "space_id": event.spaceId,
-                    "request_id": event.correlationId,
-                    "source": stream,
-                },
-            )
+        if use_queue_api():
+            payload = event.model_dump(mode="json")
+            payload["targetStream"] = stream
+            await QueueApiPublisher().publish(payload)
             return event.eventId
         return await redis_client.xadd(stream, {"event": event.model_dump_json()})
-
-
-def _topic_for_stream(stream: str) -> str:
-    if stream in {settings.REDIS_AUDIO_STREAM, settings.REDIS_STT_STREAM}:
-        return topic_for_speech()
-    if stream in {settings.REDIS_FINALIZATION_STREAM, settings.REDIS_PROCESSING_STREAM}:
-        return topic_for_orchestration()
-    raise ValueError(f"No Pub/Sub topic configured for Redis stream replacement: {stream}")
 
 
 class RedisStreamConsumer:
@@ -79,6 +83,10 @@ class RedisStreamConsumer:
     async def ensure_group(self) -> None:
         try:
             await redis_client.xgroup_create(self.stream, self.group, id="0", mkstream=True)
+            print(
+                "Redis stream consumer group created:",
+                {"stream": self.stream, "group": self.group},
+            )
         except ResponseError as error:
             if "BUSYGROUP" not in str(error):
                 raise
@@ -88,6 +96,15 @@ class RedisStreamConsumer:
 
     async def run_forever(self) -> None:
         await self.ensure_group()
+        print(
+            "Redis stream consumer started:",
+            {
+                "stream": self.stream,
+                "group": self.group,
+                "consumer": self.consumer_name,
+                "concurrency": self.concurrency,
+            },
+        )
         while not self._shutdown.is_set():
             await self.claim_stale()
             try:
@@ -146,6 +163,16 @@ class RedisStreamConsumer:
         try:
             event = EventEnvelope.model_validate_json(fields["event"])
         except Exception:
+            print(
+                "Redis stream message sent to dead letter:",
+                {
+                    "stream": self.stream,
+                    "group": self.group,
+                    "message_id": message_id,
+                    "error": str(error),
+                    "reason": "invalid_event_payload",
+                },
+            )
             await redis_client.xadd(
                 settings.REDIS_DEAD_LETTER_STREAM,
                 {"event": json.dumps({"raw": fields, "error": str(error)})},
@@ -153,7 +180,21 @@ class RedisStreamConsumer:
             await redis_client.xack(self.stream, self.group, message_id)
             return
 
-        if event.attempt >= self.max_retries:
+        if isinstance(error, NonRetryableQueueError) or event.attempt >= self.max_retries:
+            print(
+                "Redis stream event sent to dead letter:",
+                {
+                    "stream": self.stream,
+                    "group": self.group,
+                    "message_id": message_id,
+                    "eventId": event.eventId,
+                    "eventType": event.eventType,
+                    "correlationId": event.correlationId,
+                    "attempt": event.attempt,
+                    "error": str(error),
+                    "retryable": not isinstance(error, NonRetryableQueueError),
+                },
+            )
             await redis_client.xadd(
                 settings.REDIS_DEAD_LETTER_STREAM,
                 {
@@ -166,6 +207,19 @@ class RedisStreamConsumer:
             return
 
         retry = event.model_copy(update={"attempt": event.attempt + 1})
+        print(
+            "Redis stream event scheduled for retry:",
+            {
+                "stream": self.stream,
+                "group": self.group,
+                "message_id": message_id,
+                "eventId": event.eventId,
+                "eventType": event.eventType,
+                "correlationId": event.correlationId,
+                "nextAttempt": retry.attempt,
+                "error": str(error),
+            },
+        )
         await redis_client.xadd(
             settings.REDIS_RETRY_STREAM,
             {

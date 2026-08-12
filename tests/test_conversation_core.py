@@ -1,10 +1,11 @@
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel
 
 from services.conversation.fingerprints import task_fingerprint
 from services.conversation import agents
+from services.conversation.finalization import ConversationFinalizationCoordinator
 from services.conversation.models import (
     ConversationDocument,
     ConversationSummaryDocument,
@@ -20,6 +21,7 @@ from services.conversation.models import (
     SectionExtractionResult,
     Segment,
     SpaceMemoryDocument,
+    STTStatus,
     TranscriptChunkDocument,
     assert_valid_transition,
     utc_now,
@@ -31,6 +33,7 @@ from services.conversation.workflow import ConversationProcessingWorkflow
 from services.conversation.workflow_state import ConversationGraphState
 from services.chat.planner import ChatQueryPlan
 from services.chat.service import ChatService, _merge_pending_space_action
+from services.chat import tools as chat_tools
 from services.chat.tools import ChatToolRunner
 from services.llm.models import LLMMessage, StructuredLLMRequest
 from services.llm.openai_compatible import OpenAICompatibleProvider
@@ -49,6 +52,77 @@ def test_invalid_state_transition_rejected():
 
 def test_sequence_gap_detection():
     assert detect_missing_sequences([0, 2, 4], 4) == [1, 3]
+
+
+def test_finalization_requeues_pending_s3_transcripts():
+    class Repository:
+        def __init__(self):
+            self.transitions = []
+
+        async def get_conversation(self, conversation_id):
+            return ConversationDocument(
+                _id=conversation_id,
+                userId="user-1",
+                spaceId="space-1",
+                status=ConversationStatus.STOP_REQUESTED,
+                expectedLastSequence=1,
+                receivedAudioChunkCount=2,
+            )
+
+        async def list_transcript_chunks(self, conversation_id):
+            return [
+                TranscriptChunkDocument(
+                    conversationId=conversation_id,
+                    userId="user-1",
+                    spaceId="space-1",
+                    chunkId="chunk-0",
+                    sequenceNumber=0,
+                    audioFilePath="s3://bucket/buddy/audio/chunk-0.webm",
+                    sttStatus=STTStatus.PENDING,
+                ),
+                TranscriptChunkDocument(
+                    conversationId=conversation_id,
+                    userId="user-1",
+                    spaceId="space-1",
+                    chunkId="chunk-1",
+                    sequenceNumber=1,
+                    audioFilePath="s3://bucket/buddy/audio/chunk-1.webm",
+                    sttStatus=STTStatus.PENDING,
+                ),
+            ]
+
+        async def get_audio_chunk(self, conversation_id, sequence_number):
+            return {
+                "filename": f"chunk-{sequence_number}.webm",
+                "contentType": "audio/webm",
+                "storageProvider": "s3",
+                "s3Bucket": "bucket",
+                "s3ObjectKey": f"buddy/audio/chunk-{sequence_number}.webm",
+            }
+
+        async def transition(self, conversation_id, target, updates=None):
+            self.transitions.append((conversation_id, target, updates or {}))
+
+    class Producer:
+        def __init__(self):
+            self.events = []
+
+        async def publish(self, stream, event):
+            self.events.append((stream, event))
+
+    async def run():
+        producer = Producer()
+        repository = Repository()
+        await ConversationFinalizationCoordinator(repository, producer).finalize("conv-1")
+        return repository, producer
+
+    repository, producer = asyncio.run(run())
+
+    assert len(producer.events) == 2
+    assert all(event.eventType == "stt.requested" for _, event in producer.events)
+    assert producer.events[0][1].payload["storageProvider"] == "s3"
+    assert producer.events[0][1].payload["contentType"] == "audio/webm"
+    assert repository.transitions[0][1] == ConversationStatus.WAITING_FOR_TRANSCRIPTS
 
 
 def test_transcript_ordering_and_overlap_normalization():
@@ -358,6 +432,25 @@ async def _publish_outputs_writes_final_tasks_and_notes():
     assert db.notes.docs[0]["title"] == "Callback retry note"
 
 
+CONTROLLED_CHAT_NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
+
+
+class FrozenChatDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        if tz is not None:
+            return CONTROLLED_CHAT_NOW.astimezone(tz)
+        return CONTROLLED_CHAT_NOW.replace(tzinfo=None)
+
+
+def controlled_chat_date(offset_days: int = 0) -> str:
+    return (CONTROLLED_CHAT_NOW + timedelta(days=offset_days)).date().isoformat()
+
+
+def freeze_chat_tool_clock(monkeypatch) -> None:
+    monkeypatch.setattr(chat_tools, "datetime", FrozenChatDateTime)
+
+
 class ToolRepository:
     async def get_space_memory(self, user_id, space_id):
         return SpaceMemoryDocument(
@@ -377,7 +470,7 @@ class ToolRepository:
                 "title": "Test payment callback",
                 "body": "Run the retry test.",
                 "status": "pending",
-                "dueDateResolved": utc_now().date().isoformat(),
+                "dueDateResolved": controlled_chat_date(),
                 "ownerText": "Rahul",
             }
         ]
@@ -389,7 +482,9 @@ class ToolRepository:
         return [{"spaceId": "space_1", "label": "Payments", "sources": ["tasks"]}]
 
 
-def test_chat_tools_include_structured_task_note_and_summary_context():
+def test_chat_tools_include_structured_task_note_and_summary_context(monkeypatch):
+    freeze_chat_tool_clock(monkeypatch)
+
     result = asyncio.run(
         ChatToolRunner(ToolRepository()).run(
             "summary my space and tell today unfinished tasks and notes",
@@ -417,7 +512,9 @@ def test_chat_tools_include_structured_task_note_and_summary_context():
     assert result["direct"] is True
 
 
-def test_chat_tools_directly_answer_today_tasks():
+def test_chat_tools_directly_answer_today_tasks(monkeypatch):
+    freeze_chat_tool_clock(monkeypatch)
+
     result = asyncio.run(
         ChatToolRunner(ToolRepository()).run(
             "What are my today's tasks",
@@ -438,6 +535,63 @@ def test_chat_tools_directly_answer_today_tasks():
     assert "You have 1 task(s) due today" in str(result["answer"])
     assert "Test payment callback" in str(result["answer"])
     assert result["direct"] is True
+
+
+class MixedDueDateToolRepository(ToolRepository):
+    async def list_tasks(self, user_id, space_id, limit=100):
+        return [
+            {
+                "title": "Due today payment callback",
+                "body": "Run the retry test today.",
+                "status": "pending",
+                "dueDateResolved": controlled_chat_date(),
+                "ownerText": "Rahul",
+            },
+            {
+                "title": "Overdue payment callback",
+                "body": "This is unfinished from yesterday.",
+                "status": "pending",
+                "dueDateResolved": controlled_chat_date(-1),
+                "ownerText": "Rahul",
+            },
+            {
+                "title": "Future payment callback",
+                "body": "This is not due yet.",
+                "status": "pending",
+                "dueDateResolved": controlled_chat_date(1),
+                "ownerText": "Rahul",
+            },
+        ]
+
+
+def test_chat_tools_keep_overdue_unfinished_out_of_due_today(monkeypatch):
+    freeze_chat_tool_clock(monkeypatch)
+
+    result = asyncio.run(
+        ChatToolRunner(MixedDueDateToolRepository()).run(
+            "What are my today's tasks",
+            "user_1",
+            "space_1",
+            ChatQueryPlan(
+                understoodRequest="List today's tasks.",
+                useStructuredTools=True,
+                useVectorSearch=False,
+                directToolAnswerAllowed=True,
+                toolFocus=["tasks"],
+                temporalScope="today",
+            ),
+        )
+    )
+    context = str(result["context"])
+    answer = str(result["answer"])
+
+    assert "due_today=1" in context
+    assert "Due today payment callback" in answer
+    assert "Overdue payment callback" in context
+    assert f"due={controlled_chat_date(-1)}" in context
+    assert "Overdue payment callback" not in answer
+    assert "Future payment callback" in context
+    assert "Future payment callback" not in answer
 
 
 def test_chat_tools_do_not_direct_answer_topic_specific_task_requests():

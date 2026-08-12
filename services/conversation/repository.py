@@ -145,6 +145,39 @@ class ConversationRepository:
                 },
             )
 
+    async def get_transcript_chunk(self, conversation_id: str, sequence_number: int) -> TranscriptChunkDocument | None:
+        data = await self.db.transcript_chunks.find_one(
+            {
+                "conversationId": to_mongo_id(conversation_id),
+                "sequenceNumber": sequence_number,
+            }
+        )
+        return TranscriptChunkDocument.model_validate(data) if data else None
+
+    async def get_audio_chunk(self, conversation_id: str, sequence_number: int) -> dict[str, Any] | None:
+        return await self.db.audio_chunks.find_one(
+            {
+                "conversationId": to_mongo_id(conversation_id),
+                "sequenceNumber": sequence_number,
+            }
+        )
+
+    async def mark_transcript_chunk_processing(self, conversation_id: str, sequence_number: int) -> bool:
+        result = await self.db.transcript_chunks.update_one(
+            {
+                "conversationId": to_mongo_id(conversation_id),
+                "sequenceNumber": sequence_number,
+                "sttStatus": {"$ne": STTStatus.COMPLETED.value},
+            },
+            {
+                "$set": {
+                    "sttStatus": STTStatus.PROCESSING.value,
+                    "updatedAt": utc_now(),
+                }
+            },
+        )
+        return bool(result.modified_count)
+
     async def fail_transcript_chunk(self, conversation_id: str, sequence_number: int, error: str) -> None:
         now = utc_now()
         result = await self.db.transcript_chunks.update_one(
@@ -573,6 +606,17 @@ class ConversationRepository:
             {
                 "status": ConversationStatus.RECORDING.value,
                 "lastActivityAt": {"$lte": before},
+                "receivedAudioChunkCount": {"$gt": 0},
+            }
+        ).limit(limit)
+        return [ConversationDocument.model_validate(doc) async for doc in cursor]
+
+    async def find_stale_unfinalized_conversations(self, before: datetime, limit: int = 100) -> list[ConversationDocument]:
+        cursor = self.db.conversations.find(
+            {
+                "status": {"$in": [ConversationStatus.STOP_REQUESTED.value, ConversationStatus.WAITING_FOR_TRANSCRIPTS.value]},
+                "expectedLastSequence": {"$ne": None},
+                "updatedAt": {"$lte": before},
                 "receivedAudioChunkCount": {"$gt": 0},
             }
         ).limit(limit)

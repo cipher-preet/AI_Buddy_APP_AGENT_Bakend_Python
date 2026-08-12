@@ -47,4 +47,23 @@ class ConversationInactivityScanner:
                 ),
             )
             finalized += 1
+        stale_cutoff = utc_now() - timedelta(seconds=max(30, settings.REDIS_CLAIM_IDLE_MS // 1000))
+        stale_conversations = await self.repository.find_stale_unfinalized_conversations(stale_cutoff)
+        for conversation in stale_conversations:
+            conversation_id = str(conversation.id)
+            await self.producer.publish(
+                settings.REDIS_FINALIZATION_STREAM,
+                EventEnvelope(
+                    eventType="conversation.finalization.requested",
+                    correlationId=conversation_id,
+                    userId=str(conversation.userId),
+                    spaceId=str(conversation.spaceId),
+                    conversationId=conversation_id,
+                    payload={
+                        "expectedLastSequence": conversation.expectedLastSequence,
+                        "source": "stale-finalization-recovery",
+                    },
+                ),
+            )
+            finalized += 1
         return finalized

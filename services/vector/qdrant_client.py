@@ -4,7 +4,7 @@ from apps.api_gateway.config.setting import settings
 from qdrant_client.models import Distance, PayloadSchemaType, VectorParams
 
 QDRANT_URL = settings.QDRANT_URL
-QDRANT_API_KEY = settings.QDRANT_API_KEY
+QDRANT_API_KEY = settings.secret_value(settings.QDRANT_API_KEY)
 QDRANT_COLLECTION = settings.QDRANT_COLLECTION
 VECTOR_SIZE = settings.VECTOR_SIZE
 

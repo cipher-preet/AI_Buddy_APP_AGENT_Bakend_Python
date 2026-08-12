@@ -5,10 +5,13 @@ from pydantic import BaseModel, Field
 
 from apps.api_gateway.controllers.conversation_controller import (
     conversation_status_controller,
+    complete_audio_upload_controller,
+    create_audio_upload_url_controller,
     ingest_audio_controller,
     start_conversation_controller,
     stop_conversation_controller,
 )
+from services.storage.s3_audio_storage import PermanentS3StorageError
 
 
 router = APIRouter()
@@ -24,6 +27,28 @@ class StopConversationRequest(BaseModel):
     spaceId: str
     lastSequenceNumber: int = Field(ge=0)
     stoppedAtClient: datetime | None = None
+
+
+class AudioUploadUrlRequest(BaseModel):
+    userId: str
+    spaceId: str
+    sequenceNumber: int = Field(ge=0)
+    contentType: str
+    extension: str
+    expectedSizeBytes: int = Field(gt=0)
+    chunkId: str | None = None
+
+
+class AudioUploadCompleteRequest(BaseModel):
+    userId: str
+    spaceId: str
+    chunkId: str
+    sequenceNumber: int = Field(ge=0)
+    objectKey: str
+    contentType: str
+    sizeBytes: int = Field(gt=0)
+    capturedAt: datetime | None = None
+    durationMs: int | None = Field(default=None, ge=0)
 
 
 @router.post("/start")
@@ -56,6 +81,40 @@ async def ingest_audio(
     )
 
 
+@router.post("/{conversation_id}/audio/upload-url")
+async def create_audio_upload_url(conversation_id: str, request: AudioUploadUrlRequest):
+    return await _call(
+        create_audio_upload_url_controller(
+            conversation_id=conversation_id,
+            user_id=request.userId,
+            space_id=request.spaceId,
+            sequence_number=request.sequenceNumber,
+            content_type=request.contentType,
+            extension=request.extension,
+            expected_size_bytes=request.expectedSizeBytes,
+            chunk_id=request.chunkId,
+        )
+    )
+
+
+@router.post("/{conversation_id}/audio/complete")
+async def complete_audio_upload(conversation_id: str, request: AudioUploadCompleteRequest):
+    return await _call(
+        complete_audio_upload_controller(
+            conversation_id=conversation_id,
+            user_id=request.userId,
+            space_id=request.spaceId,
+            chunk_id=request.chunkId,
+            sequence_number=request.sequenceNumber,
+            object_key=request.objectKey,
+            content_type=request.contentType,
+            size_bytes=request.sizeBytes,
+            captured_at=request.capturedAt,
+            duration_ms=request.durationMs,
+        )
+    )
+
+
 @router.post("/{conversation_id}/stop")
 async def stop_conversation(conversation_id: str, request: StopConversationRequest):
     return await _call(
@@ -80,4 +139,6 @@ async def _call(awaitable):
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error
     except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except PermanentS3StorageError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

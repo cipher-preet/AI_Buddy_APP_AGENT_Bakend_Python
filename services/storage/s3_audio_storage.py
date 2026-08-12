@@ -30,12 +30,13 @@ class S3ObjectReference:
     etag: str | None = None
     version_id: str | None = None
     size_bytes: int | None = None
+    content_type: str | None = None
     cloudfront_url: str | None = None
 
 
 class S3AudioStorage:
     def __init__(self) -> None:
-        self.bucket = settings.S3_AUDIO_BUCKET.strip()
+        self.bucket = (settings.S3_AUDIO_BUCKET or settings.S3_BUCKET).strip()
         self.region = settings.AWS_REGION.strip() or "ap-south-1"
         self.prefix = settings.S3_AUDIO_PREFIX.strip().strip("/") or "buddy/audio"
         self._client: Any | None = None
@@ -104,6 +105,53 @@ class S3AudioStorage:
             asyncio.to_thread(_upload),
             timeout=settings.S3_UPLOAD_TIMEOUT_SECONDS + 1,
         )
+
+    async def create_presigned_upload_url(
+        self,
+        *,
+        object_key: str,
+        content_type: str,
+        expires_in_seconds: int | None = None,
+    ) -> str:
+        object_key = validate_object_key(object_key)
+        content_type = normalize_content_type(content_type)
+        expires = expires_in_seconds or settings.S3_PRESIGNED_URL_TTL_SECONDS
+
+        def _presign() -> str:
+            try:
+                return self.client.generate_presigned_url(
+                    "put_object",
+                    Params={
+                        "Bucket": self.bucket,
+                        "Key": object_key,
+                        "ContentType": content_type,
+                    },
+                    ExpiresIn=expires,
+                )
+            except Exception as error:
+                raise classify_s3_error(error) from error
+
+        return await asyncio.to_thread(_presign)
+
+    async def head_object(self, bucket: str, object_key: str) -> S3ObjectReference:
+        bucket = bucket.strip()
+        object_key = validate_object_key(object_key)
+
+        def _head() -> S3ObjectReference:
+            try:
+                head = self.client.head_object(Bucket=bucket, Key=object_key)
+                return S3ObjectReference(
+                    bucket=bucket,
+                    object_key=object_key,
+                    etag=(head.get("ETag") or "").strip('"') or None,
+                    version_id=head.get("VersionId"),
+                    size_bytes=head.get("ContentLength"),
+                    content_type=head.get("ContentType"),
+                )
+            except Exception as error:
+                raise classify_s3_error(error) from error
+
+        return await asyncio.to_thread(_head)
 
     async def download_file(
         self,
@@ -182,6 +230,55 @@ def build_audio_object_key(
     return "/".join(part.strip("/") for part in parts if part)
 
 
+def build_conversation_audio_object_key(
+    *,
+    user_id: str,
+    space_id: str,
+    conversation_id: str,
+    sequence_number: int,
+    chunk_id: str,
+    extension: str,
+) -> str:
+    safe_extension = sanitize_extension(extension)
+    parts = [
+        get_s3_audio_storage().prefix,
+        sanitize_key_part(user_id),
+        sanitize_key_part(space_id),
+        sanitize_key_part(conversation_id),
+        f"{int(sequence_number):08d}-{sanitize_key_part(chunk_id)}.{safe_extension}",
+    ]
+    return "/".join(part.strip("/") for part in parts if part)
+
+
+def expected_conversation_audio_prefix(*, user_id: str, space_id: str, conversation_id: str) -> str:
+    return "/".join(
+        [
+            get_s3_audio_storage().prefix,
+            sanitize_key_part(user_id),
+            sanitize_key_part(space_id),
+            sanitize_key_part(conversation_id),
+        ]
+    ) + "/"
+
+
+def validate_conversation_audio_object_key(
+    *,
+    object_key: str,
+    user_id: str,
+    space_id: str,
+    conversation_id: str,
+) -> str:
+    key = validate_object_key(object_key)
+    expected_prefix = expected_conversation_audio_prefix(
+        user_id=user_id,
+        space_id=space_id,
+        conversation_id=conversation_id,
+    )
+    if not key.startswith(expected_prefix):
+        raise PermanentS3StorageError("S3 object key is outside the conversation audio scope")
+    return key
+
+
 def sanitize_filename(filename: str | None) -> str:
     name = Path(filename or "audio").name.strip()
     if not name or name in {".", ".."}:
@@ -196,6 +293,33 @@ def sanitize_key_part(value: str | None) -> str:
     return cleaned or "unknown"
 
 
+def sanitize_extension(extension: str | None) -> str:
+    value = str(extension or "").strip().lower().lstrip(".")
+    value = re.sub(r"[^a-z0-9]+", "", value)
+    if not value or len(value) > 16:
+        raise PermanentS3StorageError("Invalid audio file extension")
+    return value
+
+
+def normalize_content_type(content_type: str | None) -> str:
+    value = str(content_type or "").split(";", 1)[0].strip().lower()
+    if not value:
+        raise PermanentS3StorageError("Audio content type is required")
+    return value
+
+
+def validate_allowed_audio_upload(*, content_type: str, extension: str, expected_size_bytes: int) -> tuple[str, str]:
+    normalized_type = normalize_content_type(content_type)
+    normalized_extension = sanitize_extension(extension)
+    if normalized_type not in settings.allowed_audio_content_types:
+        raise PermanentS3StorageError("Unsupported audio content type")
+    if expected_size_bytes <= 0:
+        raise PermanentS3StorageError("Audio size must be greater than zero")
+    if expected_size_bytes > settings.S3_MAX_AUDIO_SIZE_BYTES:
+        raise PermanentS3StorageError("Audio size exceeds configured limit")
+    return normalized_type, normalized_extension
+
+
 def validate_object_key(object_key: str) -> str:
     key = str(object_key or "").strip().replace("\\", "/").lstrip("/")
     if not key or ".." in key.split("/"):
@@ -206,13 +330,17 @@ def validate_object_key(object_key: str) -> str:
 def safe_temp_audio_path(job: dict) -> Path:
     job_id = sanitize_key_part(str(job.get("job_id") or "unknown"))
     filename = sanitize_filename(str(job.get("filename") or f"{job_id}.audio"))
-    return Path("/tmp/buddy") / job_id / filename
+    return temp_audio_root() / job_id / filename
+
+
+def temp_audio_root() -> Path:
+    return Path(settings.WORKER_TEMP_AUDIO_ROOT).expanduser().resolve()
 
 
 def generate_cloudfront_signed_url(object_key: str | None, expires_in_seconds: int | None = None) -> str | None:
     base_url = settings.CLOUDFRONT_URL.strip().rstrip("/")
     key_pair_id = settings.CLOUDFRONT_KEY_PAIR_ID.strip()
-    private_key = settings.CLOUDFRONT_PRIVATE_KEY.replace("\\n", "\n").strip()
+    private_key = settings.secret_value(settings.CLOUDFRONT_PRIVATE_KEY).replace("\\n", "\n").strip()
     if not base_url or not object_key:
         return None
 

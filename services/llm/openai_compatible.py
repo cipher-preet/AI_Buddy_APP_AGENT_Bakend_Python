@@ -29,6 +29,7 @@ class OpenAICompatibleProvider:
         max_tokens_limit: int | None = None,
     ):
         self.name = name
+        self.configured = True
         self.default_model = default_model
         self.max_retries = max_retries
         self.max_tokens_limit = max_tokens_limit
@@ -51,6 +52,7 @@ class OpenAICompatibleProvider:
             "temperature": request.temperature,
         }
         payload.update(request.metadata.get("extra_body") or {})
+        payload = _without_none_values(payload)
         max_tokens = self._bounded_max_tokens(request.max_tokens)
         if max_tokens:
             payload["max_tokens"] = max_tokens
@@ -126,9 +128,10 @@ class OpenAICompatibleProvider:
         structured_request.metadata["extra_body"].update(
             {
                 "response_format": response_format,
-                "reasoning_effort": None,
             }
         )
+        if self.name == "sarvam":
+            structured_request.metadata["extra_body"]["reasoning_effort"] = None
         structured_request.messages.append(
             type(request.messages[0])(
                 role="system",
@@ -212,3 +215,11 @@ def _retry_delay(attempt: int, retry_after: str | None) -> float:
         except ValueError:
             pass
     return min(60, (2**attempt) + random.uniform(0, 0.5))
+
+
+def _without_none_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _without_none_values(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [_without_none_values(item) for item in value]
+    return value

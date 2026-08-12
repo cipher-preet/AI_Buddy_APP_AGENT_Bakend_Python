@@ -19,6 +19,7 @@ from services.storage.s3_audio_storage import (
     TemporaryS3StorageError,
     get_s3_audio_storage,
     safe_temp_audio_path,
+    temp_audio_root,
     use_s3_storage,
 )
 
@@ -173,7 +174,7 @@ def _normalize_speech_job(job: dict) -> dict:
                 normalized[canonical] = value
                 break
     if not str(normalized.get("job_id") or "").strip():
-        raise ValueError("Speech Pub/Sub payload is missing job_id")
+        raise ValueError("Speech job payload is missing job_id")
     for field in ("job_id", "user_id", "space_id", "request_id", "file_path", "content_type", "storage_provider", "s3_bucket", "s3_object_key", "filename"):
         if normalized.get(field) is not None:
             normalized[field] = str(normalized[field]).strip()
@@ -195,12 +196,14 @@ def _validate_s3_job(job: dict) -> None:
 
 
 def _cleanup_job_dir(job_dir: Path) -> None:
-    root = Path("/tmp/buddy").resolve()
+    root = temp_audio_root()
     resolved = job_dir.resolve()
-    if root != resolved and root not in resolved.parents:
-        raise ValueError("Refusing to clean path outside /tmp/buddy")
-    if job_dir.exists():
-        shutil.rmtree(job_dir)
+    if resolved == root:
+        raise ValueError(f"Refusing to clean temporary audio root: {root}")
+    if root not in resolved.parents:
+        raise ValueError(f"Refusing to clean path outside temporary audio root: {root}")
+    if resolved.exists():
+        shutil.rmtree(resolved)
 
 
 def settings_delete_after_processing() -> bool:

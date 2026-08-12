@@ -6,15 +6,18 @@ import aiofiles
 from fastapi import UploadFile
 
 from apps.api_gateway.config.setting import settings
-from services.conversation.models import AudioChunkMetadata, utc_now
-from services.conversation.repository import ConversationRepository
+from services.conversation.models import AudioChunkMetadata, ConversationStatus, utc_now
+from services.conversation.repository import ConversationRepository, mongo_id_candidates, to_mongo_id
 from services.conversation.service import ConversationService
 from services.db.mongo import get_database
+from services.queue.factory import use_queue_api
+from services.queue.http_queue import QueueApiPublisher
 from services.queue.redis_queue import (
     get_job_result,
     push_speech_job,
     redis_client,
 )
+from services.queue.streams import EventEnvelope
 from services.storage.s3_audio_storage import (
     build_audio_object_key,
     get_s3_audio_storage,
@@ -50,18 +53,7 @@ async def transcribe_audio_service(file: UploadFile, user_id: str, space_id: str
         conversation_id = active_session.get("conversation_id")
         sequence_number = None
         if conversation_id:
-            sequence_number = await _next_listening_sequence(user_id, space_id)
-            metadata = AudioChunkMetadata(
-                conversationId=conversation_id,
-                userId=user_id,
-                spaceId=space_id,
-                chunkId=job_id,
-                sequenceNumber=sequence_number,
-                filePath=file_path,
-                filename=filename,
-                contentType=file.content_type,
-            )
-            await ConversationRepository(get_database()).record_audio_chunk(metadata)
+            sequence_number = await _next_listening_sequence(user_id, space_id, conversation_id)
 
         job = {
             "job_id": job_id,
@@ -133,15 +125,53 @@ async def transcribe_audio_service(file: UploadFile, user_id: str, space_id: str
         else:
             job["file_path"] = file_path
 
-        await redis_client.hset(f"speech_job:{job_id}", mapping=job)
+        if conversation_id and sequence_number is not None:
+            metadata_kwargs = {
+                "conversationId": conversation_id,
+                "userId": user_id,
+                "spaceId": space_id,
+                "chunkId": job_id,
+                "sequenceNumber": sequence_number,
+                "filePath": file_path,
+                "filename": filename,
+                "contentType": file.content_type,
+                "jobId": job_id,
+            }
+            if job.get("storage_provider") == "s3":
+                metadata_kwargs.update(
+                    {
+                        "filePath": f"s3://{job['s3_bucket']}/{job['s3_object_key']}",
+                        "storageProvider": "s3",
+                        "s3Bucket": job["s3_bucket"],
+                        "s3ObjectKey": job["s3_object_key"],
+                        "sizeBytes": file_size,
+                    }
+                )
+            await ConversationRepository(get_database()).record_audio_chunk(
+                AudioChunkMetadata(**metadata_kwargs)
+            )
 
         try:
-            await push_speech_job(job)
+            if use_queue_api():
+                await QueueApiPublisher().publish(
+                    EventEnvelope(
+                        eventType="speech.transcribe.requested",
+                        correlationId=conversation_id or job_id,
+                        userId=user_id,
+                        spaceId=space_id,
+                        conversationId=conversation_id or job_id,
+                        payload=job,
+                    ).model_dump(mode="json")
+                )
+            else:
+                await redis_client.hset(f"speech_job:{job_id}", mapping=job)
+                await push_speech_job(job)
         except Exception:
-            await redis_client.hset(
-                f"speech_job:{job_id}",
-                mapping={"status": "failed", "error": "Failed to publish speech job"},
-            )
+            if not use_queue_api():
+                await redis_client.hset(
+                    f"speech_job:{job_id}",
+                    mapping={"status": "failed", "error": "Failed to publish speech job"},
+                )
             if s3_ref:
                 try:
                     await get_s3_audio_storage().delete_file(s3_ref.bucket, s3_ref.object_key)
@@ -210,6 +240,29 @@ def _listening_session_key(user_id: str, space_id: str) -> str:
 
 
 async def start_listening_session_service(user_id: str, space_id: str):
+    if use_queue_api():
+        existing = await _find_active_conversation(user_id, space_id)
+        if existing:
+            return {
+                "success": True,
+                "message": "Listening session already started.",
+                "data": _mongo_listening_session(existing, user_id, space_id),
+            }
+
+        conversation = await ConversationService().start(user_id, space_id)
+        return {
+            "success": True,
+            "message": "Listening session started.",
+            "data": {
+                "user_id": user_id,
+                "space_id": space_id,
+                "conversation_id": conversation["conversationId"],
+                "status": "listening",
+                "started_at": utc_now().isoformat(),
+                "last_sequence_number": "-1",
+            },
+        }
+
     existing = await redis_client.hgetall(_listening_session_key(user_id, space_id))
     if existing.get("status") == "listening" and existing.get("conversation_id"):
         return {
@@ -255,6 +308,41 @@ async def end_listening_session_service(
             "success": True,
             "message": "Conversation stop accepted; processing will continue asynchronously.",
             "data": data,
+        }
+
+    if use_queue_api():
+        existing = await _find_active_conversation(user_id, space_id)
+        if existing:
+            active_conversation_id = str(existing["_id"])
+            inferred_last_sequence = int(existing.get("receivedAudioChunkCount") or 0) - 1
+            data = await ConversationService().stop(
+                conversation_id=active_conversation_id,
+                user_id=user_id,
+                space_id=space_id,
+                last_sequence_number=last_sequence_number if last_sequence_number is not None else max(0, inferred_last_sequence),
+                stopped_at_client=stopped_at_client,
+            )
+        else:
+            active_conversation_id = None
+            data = {
+                "user_id": user_id,
+                "space_id": space_id,
+                "accepted": True,
+            }
+
+        stopped_at = utc_now().isoformat()
+        return {
+            "success": True,
+            "message": "Listening session ended.",
+            "data": {
+                "user_id": user_id,
+                "space_id": space_id,
+                "status": "stopped",
+                "stopped_at": stopped_at,
+                "had_active_session": bool(existing),
+                "conversation_id": active_conversation_id,
+                "conversation": data,
+            },
         }
 
     key = _listening_session_key(user_id, space_id)
@@ -304,6 +392,14 @@ async def end_listening_session_service(
 
 
 async def _get_or_create_listening_session(user_id: str, space_id: str) -> dict:
+    if use_queue_api():
+        existing = await _find_active_conversation(user_id, space_id)
+        if existing:
+            return _mongo_listening_session(existing, user_id, space_id)
+
+        result = await start_listening_session_service(user_id, space_id)
+        return result["data"]
+
     key = _listening_session_key(user_id, space_id)
     existing = await redis_client.hgetall(key)
     if existing.get("status") == "listening" and existing.get("conversation_id"):
@@ -313,6 +409,38 @@ async def _get_or_create_listening_session(user_id: str, space_id: str) -> dict:
     return result["data"]
 
 
-async def _next_listening_sequence(user_id: str, space_id: str) -> int:
+async def _next_listening_sequence(user_id: str, space_id: str, conversation_id: str | None = None) -> int:
+    if use_queue_api():
+        existing = await _find_active_conversation(user_id, space_id, conversation_id)
+        if not existing:
+            return 0
+        return int(existing.get("receivedAudioChunkCount") or 0)
+
     key = _listening_session_key(user_id, space_id)
     return int(await redis_client.hincrby(key, "last_sequence_number", 1))
+
+
+async def _find_active_conversation(user_id: str, space_id: str, conversation_id: str | None = None) -> dict | None:
+    query = {
+        "userId": {"$in": mongo_id_candidates(user_id)},
+        "spaceId": {"$in": mongo_id_candidates(space_id)},
+        "status": {"$in": [ConversationStatus.RECORDING.value, ConversationStatus.STOP_REQUESTED.value]},
+    }
+    if conversation_id:
+        query["_id"] = to_mongo_id(conversation_id)
+    return await get_database().conversations.find_one(query, sort=[("updatedAt", -1), ("_id", -1)])
+
+
+def _mongo_listening_session(conversation: dict, user_id: str, space_id: str) -> dict:
+    last_sequence_number = int(conversation.get("receivedAudioChunkCount") or 0) - 1
+    started_at = conversation.get("startedAt", utc_now())
+    if hasattr(started_at, "isoformat"):
+        started_at = started_at.isoformat()
+    return {
+        "user_id": user_id,
+        "space_id": space_id,
+        "conversation_id": str(conversation["_id"]),
+        "status": "listening",
+        "started_at": str(started_at),
+        "last_sequence_number": str(last_sequence_number),
+    }

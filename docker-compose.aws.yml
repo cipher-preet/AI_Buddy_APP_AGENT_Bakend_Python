@@ -1,0 +1,88 @@
+services:
+  reverse-proxy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    env_file:
+      - .env.aws
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/aws/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      queue-api:
+        condition: service_healthy
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  queue-api:
+    build: .
+    restart: unless-stopped
+    command: ["uvicorn", "apps.api_gateway.queue_api:app", "--host", "0.0.0.0", "--port", "8080"]
+    env_file:
+      - .env.aws
+    environment:
+      SERVICE_ROLE: queue_api
+      QUEUE_PROVIDER: redis
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+    expose:
+      - "8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=3)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+
+  buddy-worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "apps.api_gateway.workers.main"]
+    env_file:
+      - .env.aws
+    environment:
+      SERVICE_ROLE: worker
+      QUEUE_PROVIDER: redis
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-1}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    env_file:
+      - .env.aws
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD}"]
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+
+volumes:
+  redis_data:
+  caddy_data:
+  caddy_config:

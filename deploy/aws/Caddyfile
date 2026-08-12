@@ -1,0 +1,21 @@
+{
+	email {$CADDY_ACME_EMAIL}
+}
+
+{$QUEUE_API_DOMAIN} {
+	encode gzip
+
+	@events path /internal/events
+	handle @events {
+		request_body {
+			max_size {$QUEUE_API_MAX_BODY_BYTES}
+		}
+		reverse_proxy queue-api:8080
+	}
+
+	handle /health/* {
+		reverse_proxy queue-api:8080
+	}
+
+	respond 404
+}

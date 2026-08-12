@@ -32,6 +32,56 @@ async def ingest_audio_controller(
     return {"success": True, "data": data}
 
 
+async def create_audio_upload_url_controller(
+    conversation_id: str,
+    user_id: str,
+    space_id: str,
+    sequence_number: int,
+    content_type: str,
+    extension: str,
+    expected_size_bytes: int,
+    chunk_id: str | None = None,
+):
+    data = await ConversationService().create_audio_upload_url(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        space_id=space_id,
+        sequence_number=sequence_number,
+        content_type=content_type,
+        extension=extension,
+        expected_size_bytes=expected_size_bytes,
+        chunk_id=chunk_id,
+    )
+    return {"success": True, "data": data}
+
+
+async def complete_audio_upload_controller(
+    conversation_id: str,
+    user_id: str,
+    space_id: str,
+    chunk_id: str,
+    sequence_number: int,
+    object_key: str,
+    content_type: str,
+    size_bytes: int,
+    captured_at: datetime | None = None,
+    duration_ms: int | None = None,
+):
+    data = await ConversationService().complete_audio_upload(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        space_id=space_id,
+        chunk_id=chunk_id,
+        sequence_number=sequence_number,
+        object_key=object_key,
+        content_type=content_type,
+        size_bytes=size_bytes,
+        captured_at=captured_at,
+        duration_ms=duration_ms,
+    )
+    return {"success": True, "data": data}
+
+
 async def stop_conversation_controller(
     conversation_id: str,
     user_id: str,
