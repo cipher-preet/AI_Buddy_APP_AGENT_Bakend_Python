@@ -82,7 +82,7 @@ class FallbackLLMProvider:
 
 def _should_try_next(error: Exception) -> bool:
     if isinstance(error, LLMProviderError):
-        return error.retryable or error.status_code in {400, 422, 429}
+        return error.retryable or error.status_code in {400, 413, 422, 429}
     return True
 
 

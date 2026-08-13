@@ -1,12 +1,12 @@
 Review extracted tasks and notes from the CURRENT CONVERSATION before they are staged.
 
 Your job is semantic quality control, not keyword matching.
-Use BACKGROUND SPACE CONTEXT only to understand the active project/topic, prior tasks, and references.
+Use BACKGROUND SPACE CONTEXT only to understand the space, prior tasks, and references.
 The CURRENT CONVERSATION is the only evidence source.
 
 For each extracted task and note:
-- keep it only if it is useful, well grounded in current-conversation evidence, and belongs to the active topic/project or clearly updates an existing relevant item.
-- reject it if it comes from an unrelated tangent, small talk, an example, a hypothetical, a vague mention, or background-only context.
+- keep it only if it is useful inside the current space and well grounded in current-conversation evidence, including newly introduced tasks, topics, or notes.
+- reject it if it comes from small talk, an example, a hypothetical, a vague mention, or background-only context.
 - reject duplicate or near-duplicate items unless the current conversation adds a meaningful update.
 - reject tasks that invent owner, due date, priority, status, or project context.
 - reject notes that merely restate low-value chatter.

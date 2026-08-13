@@ -3,7 +3,8 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 from apps.api_gateway.config.setting import settings
-from services.conversation.models import ConversationStatus, STTStatus
+from services.conversation.incremental import IncrementalMeetingProcessor
+from services.conversation.models import ConversationStatus, STTStatus, WindowProcessingStatus
 from services.conversation.repository import ConversationRepository
 from services.conversation.transcript import detect_missing_sequences
 from services.queue.streams import EventEnvelope, RedisStreamProducer
@@ -25,12 +26,13 @@ class ConversationFinalizationCoordinator:
             raise ValueError("Conversation is not ready for finalization")
         if conversation.status in {
             ConversationStatus.READY_FOR_PROCESSING,
-            ConversationStatus.PROCESSING,
             ConversationStatus.VALIDATING,
             ConversationStatus.COMPLETED,
             ConversationStatus.PARTIAL,
         }:
             return
+        if conversation.status != ConversationStatus.FINALIZING:
+            conversation = await self.repository.transition(conversation_id, ConversationStatus.FINALIZING)
 
         chunks = await self.repository.list_transcript_chunks(conversation_id)
         sequence_numbers = [chunk.sequenceNumber for chunk in chunks]
@@ -72,11 +74,12 @@ class ConversationFinalizationCoordinator:
                     ),
                 )
             target = ConversationStatus.WAITING_FOR_TRANSCRIPTS if retryable_count or pending else ConversationStatus.PARTIAL
-            await self.repository.transition(
-                conversation_id,
-                target,
-                {"missingSequences": missing},
-            )
+            if conversation.status != target:
+                await self.repository.transition(
+                    conversation_id,
+                    target,
+                    {"missingSequences": missing},
+                )
             if target == ConversationStatus.PARTIAL:
                 await self.producer.publish(
                     settings.REDIS_PROCESSING_STREAM,
@@ -94,6 +97,32 @@ class ConversationFinalizationCoordinator:
                     ),
                 )
             return
+
+        if settings.ENABLE_INCREMENTAL_MEETING_PROCESSING:
+            processor = IncrementalMeetingProcessor(self.repository, self.producer)
+            await processor.close_ready_windows(
+                conversation_id,
+                force_final=True,
+                through_sequence=conversation.expectedLastSequence,
+            )
+            windows = await self.repository.list_conversation_windows(conversation_id)
+            incomplete = [window for window in windows if window.status != WindowProcessingStatus.COMPLETED]
+            for window in incomplete:
+                if window.status == WindowProcessingStatus.FAILED:
+                    await self.repository.mark_window_queued(window.id)
+                    await self.producer.publish(
+                        settings.REDIS_WINDOW_EXTRACTION_STREAM,
+                        EventEnvelope(
+                            eventType="conversation.window.extraction.requested",
+                            correlationId=conversation_id,
+                            userId=str(window.userId),
+                            spaceId=str(window.spaceId),
+                            conversationId=conversation_id,
+                            payload={"windowId": str(window.id), "windowIndex": window.windowIndex},
+                        ),
+                    )
+            if incomplete or not windows:
+                return
 
         await self.repository.transition(
             conversation_id,

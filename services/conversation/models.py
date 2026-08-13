@@ -20,6 +20,7 @@ class ConversationStatus(str, Enum):
     RECORDING = "RECORDING"
     STOP_REQUESTED = "STOP_REQUESTED"
     WAITING_FOR_TRANSCRIPTS = "WAITING_FOR_TRANSCRIPTS"
+    FINALIZING = "FINALIZING"
     READY_FOR_PROCESSING = "READY_FOR_PROCESSING"
     PROCESSING = "PROCESSING"
     VALIDATING = "VALIDATING"
@@ -37,12 +38,14 @@ VALID_TRANSITIONS: dict[ConversationStatus, set[ConversationStatus]] = {
     },
     ConversationStatus.STOP_REQUESTED: {
         ConversationStatus.WAITING_FOR_TRANSCRIPTS,
+        ConversationStatus.FINALIZING,
         ConversationStatus.READY_FOR_PROCESSING,
         ConversationStatus.PARTIAL,
         ConversationStatus.RETRY_PENDING,
         ConversationStatus.FAILED,
     },
     ConversationStatus.WAITING_FOR_TRANSCRIPTS: {
+        ConversationStatus.FINALIZING,
         ConversationStatus.READY_FOR_PROCESSING,
         ConversationStatus.PROCESSING,
         ConversationStatus.PARTIAL,
@@ -56,7 +59,16 @@ VALID_TRANSITIONS: dict[ConversationStatus, set[ConversationStatus]] = {
     },
     ConversationStatus.PROCESSING: {
         ConversationStatus.VALIDATING,
+        ConversationStatus.FINALIZING,
         ConversationStatus.RETRY_PENDING,
+        ConversationStatus.FAILED,
+    },
+    ConversationStatus.FINALIZING: {
+        ConversationStatus.WAITING_FOR_TRANSCRIPTS,
+        ConversationStatus.READY_FOR_PROCESSING,
+        ConversationStatus.PROCESSING,
+        ConversationStatus.PARTIAL,
+        ConversationStatus.COMPLETED,
         ConversationStatus.FAILED,
     },
     ConversationStatus.VALIDATING: {
@@ -101,6 +113,13 @@ class TranscriptProcessingStatus(str, Enum):
     PROCESSED = "processed"
     ARCHIVED = "archived"
     EXPIRED = "expired"
+
+
+class WindowProcessingStatus(str, Enum):
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
 
 
 class ExtractionRunStatus(str, Enum):
@@ -186,6 +205,9 @@ class TranscriptChunkDocument(BaseModel):
     sttAttempts: int = 0
     lastError: str | None = None
     archiveRef: str | None = None
+    processingWindowId: Any | None = None
+    processedAt: datetime | None = None
+    publishedAt: datetime | None = None
     createdAt: datetime = Field(default_factory=utc_now)
     updatedAt: datetime = Field(default_factory=utc_now)
     expiresAt: datetime | None = None
@@ -283,6 +305,48 @@ class CoverageReport(BaseModel):
     score: float = Field(ge=0, le=1)
     criticalMissingCount: int = 0
     items: list[CoverageItem] = Field(default_factory=list)
+
+
+class WindowExtractionResult(BaseModel):
+    summary: str = ""
+    topics: list[str] = Field(default_factory=list)
+    importantFacts: list[str] = Field(default_factory=list)
+    tasks: list[ExtractedTask] = Field(default_factory=list)
+    notes: list[ExtractedNote] = Field(default_factory=list)
+    decisions: list[ExtractedDecision] = Field(default_factory=list)
+    issues: list[ExtractedIssue] = Field(default_factory=list)
+    openQuestions: list[str] = Field(default_factory=list)
+
+
+class ConversationWindowDocument(BaseModel):
+    id: Any = Field(default_factory=new_id, alias="_id")
+    conversationId: Any
+    userId: Any
+    spaceId: Any
+    processingVersion: int = 1
+    windowIndex: int = Field(ge=0)
+    sequenceStart: int = Field(ge=0)
+    sequenceEnd: int = Field(ge=0)
+    text: str
+    tokenCount: int = Field(ge=0)
+    durationMs: int | None = None
+    overlapSequenceStart: int | None = None
+    isFinalPartial: bool = False
+    status: WindowProcessingStatus = WindowProcessingStatus.PENDING
+    result: WindowExtractionResult | None = None
+    provider: str | None = None
+    model: str | None = None
+    tokenUsage: dict[str, int] = Field(default_factory=dict)
+    attemptCount: int = 0
+    lastError: str | None = None
+    queuedAt: datetime | None = None
+    startedAt: datetime | None = None
+    completedAt: datetime | None = None
+    createdAt: datetime = Field(default_factory=utc_now)
+    updatedAt: datetime = Field(default_factory=utc_now)
+
+    class Config:
+        populate_by_name = True
 
 
 class ExtractionRunDocument(BaseModel):

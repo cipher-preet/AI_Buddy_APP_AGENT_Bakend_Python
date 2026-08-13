@@ -7,10 +7,11 @@ from apps.api_gateway.config.setting import settings
 from services.conversation import agents
 from services.conversation.context import load_space_context
 from services.conversation.fingerprints import note_fingerprint, task_fingerprint
-from services.conversation.models import ConversationStatus, ExtractionRunStatus
+from services.conversation.incremental import compact_window_payload
+from services.conversation.models import ConversationStatus, ConversationSummaryDocument, ExtractionRunStatus, WindowProcessingStatus
 from services.conversation.repository import ConversationRepository
 from services.conversation.safety import detect_rule_signals
-from services.conversation.transcript import assemble_transcript, segment_transcript
+from services.conversation.transcript import assemble_transcript, estimate_tokens, segment_transcript
 from services.conversation.workflow_state import ConversationGraphState
 from services.llm.router import LLMCapability, LLMRouter, get_llm_router
 
@@ -53,6 +54,15 @@ class ConversationProcessingWorkflow:
                 ConversationStatus.PROCESSING,
                 {"activeExtractionRunId": run.id},
             )
+
+            if settings.ENABLE_INCREMENTAL_MEETING_PROCESSING:
+                windows = await self.repository.list_conversation_windows(conversation_id)
+                if windows:
+                    if all(window.status == WindowProcessingStatus.COMPLETED for window in windows):
+                        await self._run_incremental_finalization(conversation, run, windows, context=None)
+                        return
+                    await self.repository.transition(conversation_id, ConversationStatus.FINALIZING)
+                    return
 
             chunks = await self.repository.list_transcript_chunks(conversation_id)
             assembled = assemble_transcript(chunks)
@@ -101,12 +111,7 @@ class ConversationProcessingWorkflow:
                 "issueCount": len(state.merged_questions) + len(state.merged_blockers),
             }
             await self.repository.save_extraction_run(run)
-            outputs = {
-                "tasks": [item.model_dump() for item in state.merged_tasks],
-                "notes": [item.model_dump() for item in state.merged_notes],
-                "decisions": [item.model_dump() for item in state.merged_decisions],
-                "issues": [item.model_dump() for item in state.merged_questions + state.merged_blockers],
-            }
+            outputs = self._outputs(state)
             state.coverage_report = await agents.validate_coverage(
                 self.router,
                 state.normalized_transcript,
@@ -114,12 +119,21 @@ class ConversationProcessingWorkflow:
                 context,
             )
             if state.coverage_report.criticalMissingCount:
-                state.validation_errors.append(
-                    {
-                        "code": "CRITICAL_COVERAGE_GAP",
-                        "coverage": state.coverage_report.model_dump(),
-                    }
+                await self._repair_coverage_gaps(state, context, outputs)
+                outputs = self._outputs(state)
+                state.coverage_report = await agents.validate_coverage(
+                    self.router,
+                    state.normalized_transcript,
+                    outputs,
+                    context,
                 )
+                if state.coverage_report.criticalMissingCount:
+                    state.validation_errors.append(
+                        {
+                            "code": "CRITICAL_COVERAGE_GAP",
+                            "coverage": state.coverage_report.model_dump(),
+                        }
+                    )
             run.coverageScore = state.coverage_report.score if state.coverage_report else None
             run.validationErrors = state.validation_errors
             run.warningCount = len(state.warnings)
@@ -167,6 +181,63 @@ class ConversationProcessingWorkflow:
 
         return await asyncio.gather(*(run_segment(segment) for segment in state.segments))
 
+    async def _run_incremental_finalization(self, conversation, run, windows, context: dict | None = None) -> None:
+        started = utc_ms()
+        context = context or await load_space_context(self.repository, conversation.userId, conversation.spaceId)
+        ordered_windows = sorted(windows, key=lambda window: (window.sequenceStart, window.windowIndex))
+        compacted = [_dedupe_window_payload(compact_window_payload(window)) for window in ordered_windows]
+        final_payload = _fit_payload_to_token_limit(compacted, settings.FINAL_MODEL_INPUT_TOKEN_LIMIT)
+        result, provider, model = await agents.finalize_from_window_results(
+            self.router,
+            str(conversation.id),
+            str(conversation.userId),
+            str(conversation.spaceId),
+            final_payload,
+            context,
+            conversation.processingVersion,
+        )
+        run.provider = provider
+        run.model = model
+        run.processedSegmentCount = len(ordered_windows)
+        run.segmentCount = len(ordered_windows)
+        run.stagedTasks = result.tasks
+        run.stagedNotes = result.notes
+        run.stagedDecisions = result.decisions
+        run.stagedIssues = result.issues
+        run.coverageScore = None
+        run.validationErrors = []
+        run.warningCount = 0
+        run.checkpoints["incremental_window_finalization"] = {
+            "windowCount": len(ordered_windows),
+            "inputTokenEstimate": estimate_tokens(str(final_payload)),
+            "durationMs": utc_ms() - started,
+        }
+        await self.repository.save_extraction_run(run)
+        await self.repository.transition(str(conversation.id), ConversationStatus.VALIDATING)
+        summary = ConversationSummaryDocument(
+            conversationId=conversation.id,
+            userId=conversation.userId,
+            spaceId=conversation.spaceId,
+            summary=result.summary,
+            topics=result.topics,
+            importantFacts=result.importantFacts,
+            decisions=[decision.title for decision in result.decisions],
+            openQuestions=result.openQuestions,
+            blockers=[issue.title for issue in result.issues if issue.kind in {"blocker", "risk"}],
+            processingVersion=conversation.processingVersion,
+            modelProvider=provider,
+            modelName=model,
+            promptVersion="meeting-finalizer-v1",
+        )
+        previous_memory = await self.repository.get_space_memory(conversation.userId, conversation.spaceId)
+        memory = await agents.update_space_memory(self.router, previous_memory, summary)
+        await self.repository.publish_outputs(run, summary, memory)
+        await self.repository.mark_transcripts_published(str(conversation.id))
+        await self.repository.schedule_transcript_expiry(str(conversation.id))
+        run.status = ExtractionRunStatus.PUBLISHED
+        await self.repository.save_extraction_run(run)
+        await self.repository.transition(str(conversation.id), ConversationStatus.COMPLETED)
+
     def _merge(self, state: ConversationGraphState) -> None:
         seen_tasks: set[str] = set()
         seen_notes: set[str] = set()
@@ -185,6 +256,58 @@ class ConversationProcessingWorkflow:
             state.merged_decisions.extend(result.decisions)
             state.merged_blockers.extend(item for item in result.issues if item.kind in {"blocker", "risk"})
             state.merged_questions.extend(item for item in result.issues if item.kind in {"open_question", "missing_information"})
+
+    async def _repair_coverage_gaps(
+        self,
+        state: ConversationGraphState,
+        context: dict,
+        outputs: dict,
+    ) -> None:
+        missing_items = [
+            item.model_dump()
+            for item in (state.coverage_report.items if state.coverage_report else [])
+            if item.label in {"missing", "uncertain"}
+        ]
+        if not missing_items:
+            return
+        state.repair_round += 1
+        try:
+            repair = await agents.repair_missing_items(
+                self.router,
+                state.normalized_transcript,
+                missing_items,
+                outputs,
+                context,
+                state.conversation_id,
+                state.space_id,
+            )
+        except Exception as error:
+            state.warnings.append(f"missing-item-repair-v1 failed: {str(error)[:500]}")
+            return
+
+        seen_tasks = {task.fingerprint or task_fingerprint(state.space_id, task) for task in state.merged_tasks}
+        for task in repair.tasks:
+            task.fingerprint = task.fingerprint or task_fingerprint(state.space_id, task)
+            if task.fingerprint in seen_tasks:
+                continue
+            seen_tasks.add(task.fingerprint)
+            state.merged_tasks.append(task)
+
+        seen_notes = {note.fingerprint or note_fingerprint(state.space_id, note) for note in state.merged_notes}
+        for note in repair.notes:
+            note.fingerprint = note.fingerprint or note_fingerprint(state.space_id, note)
+            if note.fingerprint in seen_notes:
+                continue
+            seen_notes.add(note.fingerprint)
+            state.merged_notes.append(note)
+
+    def _outputs(self, state: ConversationGraphState) -> dict:
+        return {
+            "tasks": [item.model_dump() for item in state.merged_tasks],
+            "notes": [item.model_dump() for item in state.merged_notes],
+            "decisions": [item.model_dump() for item in state.merged_decisions],
+            "issues": [item.model_dump() for item in state.merged_questions + state.merged_blockers],
+        }
 
     async def _review_extracted_outputs(self, state: ConversationGraphState, context: dict) -> None:
         outputs = {
@@ -279,3 +402,74 @@ def _normalize_for_evidence_match(text: str) -> str:
 
 def _clean_text(text: str | None) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _dedupe_window_payload(payload: dict) -> dict:
+    for key in ("tasks", "notes", "decisions", "issues"):
+        seen: set[str] = set()
+        unique = []
+        for item in payload.get(key, []):
+            identity = "|".join(str(item.get(field, "")) for field in ("title", "body", "operation", "status", "kind"))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            unique.append(item)
+        payload[key] = unique
+    for key in ("topics", "importantFacts", "openQuestions"):
+        seen_values: set[str] = set()
+        values = []
+        for value in payload.get(key, []):
+            normalized = _clean_text(str(value)).casefold()
+            if not normalized or normalized in seen_values:
+                continue
+            seen_values.add(normalized)
+            values.append(value)
+        payload[key] = values
+    return payload
+
+
+def _fit_payload_to_token_limit(windows: list[dict], token_limit: int) -> list[dict]:
+    if estimate_tokens(str(windows)) <= token_limit:
+        return windows
+    compacted: list[dict] = []
+    for window in windows:
+        compacted.append(
+            {
+                "windowIndex": window.get("windowIndex"),
+                "sequenceStart": window.get("sequenceStart"),
+                "sequenceEnd": window.get("sequenceEnd"),
+                "summary": window.get("summary", ""),
+                "topics": window.get("topics", []),
+                "importantFacts": window.get("importantFacts", []),
+                "tasks": _compact_items(window.get("tasks", [])),
+                "notes": _compact_items(window.get("notes", [])),
+                "decisions": _compact_items(window.get("decisions", [])),
+                "issues": _compact_items(window.get("issues", [])),
+                "openQuestions": window.get("openQuestions", []),
+            }
+        )
+    return compacted
+
+
+def _compact_items(items: list[dict]) -> list[dict]:
+    return [
+        {
+            "title": item.get("title"),
+            "body": item.get("body"),
+            "operation": item.get("operation"),
+            "status": item.get("status"),
+            "kind": item.get("kind"),
+            "dueDateText": item.get("dueDateText"),
+            "dueDateResolved": item.get("dueDateResolved"),
+            "ownerText": item.get("ownerText"),
+            "needsConfirmation": item.get("needsConfirmation"),
+            "evidence": item.get("evidence", []),
+        }
+        for item in items
+    ]
+
+
+def utc_ms() -> int:
+    import time
+
+    return int(time.time() * 1000)

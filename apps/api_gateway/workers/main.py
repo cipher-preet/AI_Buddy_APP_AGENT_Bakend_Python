@@ -8,6 +8,8 @@ from apps.api_gateway.workers.conversation_workers import (
     build_audio_consumer,
     build_processing_consumer,
     build_stt_consumer,
+    build_transcript_ready_consumer,
+    build_window_extraction_consumer,
     run_inactivity_scanner,
     run_retry_relay,
 )
@@ -22,9 +24,13 @@ async def main():
     audio_consumer = build_audio_consumer()
     finalization_consumer = build_finalization_consumer()
     processing_consumer = build_processing_consumer()
+    transcript_ready_consumer = build_transcript_ready_consumer()
+    window_extraction_consumer = build_window_extraction_consumer()
     stream_consumers = [
         audio_consumer,
         stt_consumer,
+        transcript_ready_consumer,
+        window_extraction_consumer,
         finalization_consumer,
         processing_consumer,
     ]

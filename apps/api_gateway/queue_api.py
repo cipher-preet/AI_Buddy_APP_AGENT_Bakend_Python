@@ -20,6 +20,8 @@ ALLOWED_EVENT_TYPES = {
     "audio.ingested",
     "speech.transcribe.requested",
     "stt.requested",
+    "conversation.transcript.ready",
+    "conversation.window.extraction.requested",
     "conversation.finalization.requested",
     "conversation.processing.requested",
     "job.retry.requested",
@@ -132,6 +134,8 @@ def _stream_for_event(payload: dict[str, Any], event: EventEnvelope) -> str:
         allowed_streams = {
             settings.REDIS_AUDIO_STREAM,
             settings.REDIS_STT_STREAM,
+            settings.REDIS_TRANSCRIPT_READY_STREAM,
+            settings.REDIS_WINDOW_EXTRACTION_STREAM,
             settings.REDIS_FINALIZATION_STREAM,
             settings.REDIS_PROCESSING_STREAM,
             settings.REDIS_RETRY_STREAM,
@@ -143,6 +147,10 @@ def _stream_for_event(payload: dict[str, Any], event: EventEnvelope) -> str:
         return settings.REDIS_AUDIO_STREAM
     if event.eventType == "stt.requested":
         return settings.REDIS_STT_STREAM
+    if event.eventType == "conversation.transcript.ready":
+        return settings.REDIS_TRANSCRIPT_READY_STREAM
+    if event.eventType == "conversation.window.extraction.requested":
+        return settings.REDIS_WINDOW_EXTRACTION_STREAM
     if event.eventType == "conversation.finalization.requested":
         return settings.REDIS_FINALIZATION_STREAM
     if event.eventType == "conversation.processing.requested":

@@ -9,6 +9,7 @@ from uuid import uuid4
 from apps.api_gateway.config.setting import settings
 from services.conversation.finalization import ConversationFinalizationCoordinator
 from services.conversation.inactivity import ConversationInactivityScanner
+from services.conversation.incremental import IncrementalMeetingProcessor
 from services.conversation.repository import ConversationRepository
 from services.conversation.workflow import ConversationProcessingWorkflow
 from services.db.mongo import get_database
@@ -99,6 +100,21 @@ async def handle_stt_event(event: EventEnvelope) -> None:
             request_id=result.get("request_id"),
             provider="sarvam",
         )
+        await RedisStreamProducer().publish(
+            settings.REDIS_TRANSCRIPT_READY_STREAM,
+            EventEnvelope(
+                eventType="conversation.transcript.ready",
+                correlationId=conversation_id,
+                userId=event.userId,
+                spaceId=event.spaceId,
+                conversationId=conversation_id,
+                causationId=event.eventId,
+                payload={
+                    "conversationId": conversation_id,
+                    "sequenceNumber": sequence_number,
+                },
+            ),
+        )
         conversation = await repository.get_conversation(conversation_id)
         if conversation and conversation.expectedLastSequence is not None:
             await RedisStreamProducer().publish(
@@ -169,6 +185,20 @@ async def handle_finalization_event(event: EventEnvelope) -> None:
     await ConversationFinalizationCoordinator(repository).finalize(event.conversationId)
 
 
+async def handle_transcript_ready_event(event: EventEnvelope) -> None:
+    repository = ConversationRepository(get_database())
+    await IncrementalMeetingProcessor(repository).close_ready_windows(event.conversationId)
+
+
+async def handle_window_extraction_event(event: EventEnvelope) -> None:
+    repository = ConversationRepository(get_database())
+    window_id = event.payload.get("windowId")
+    if not window_id:
+        raise ValueError("Window extraction event missing windowId")
+    await IncrementalMeetingProcessor(repository).extract_window(str(window_id))
+    await _publish_finalization_if_stopped(repository, event.conversationId, event.eventId)
+
+
 async def handle_processing_event(event: EventEnvelope) -> None:
     repository = ConversationRepository(get_database())
     try:
@@ -215,6 +245,26 @@ def build_finalization_consumer() -> RedisStreamConsumer:
     )
 
 
+def build_transcript_ready_consumer() -> RedisStreamConsumer:
+    return RedisStreamConsumer(
+        stream=settings.REDIS_TRANSCRIPT_READY_STREAM,
+        group=settings.REDIS_TRANSCRIPT_GROUP,
+        consumer_name=f"transcript-{uuid4().hex[:8]}",
+        handler=handle_transcript_ready_event,
+        concurrency=settings.TRANSCRIPT_WINDOW_WORKER_CONCURRENCY or settings.WORKER_CONCURRENCY,
+    )
+
+
+def build_window_extraction_consumer() -> RedisStreamConsumer:
+    return RedisStreamConsumer(
+        stream=settings.REDIS_WINDOW_EXTRACTION_STREAM,
+        group=settings.REDIS_WINDOW_EXTRACTION_GROUP,
+        consumer_name=f"window-extraction-{uuid4().hex[:8]}",
+        handler=handle_window_extraction_event,
+        concurrency=settings.WINDOW_EXTRACTION_WORKER_CONCURRENCY or settings.MAX_ACTIVE_LLM_CALLS_PER_CONVERSATION,
+    )
+
+
 def build_processing_consumer() -> RedisStreamConsumer:
     return RedisStreamConsumer(
         stream=settings.REDIS_PROCESSING_STREAM,
@@ -251,7 +301,14 @@ async def run_retry_relay() -> None:
             target_stream = fields.get("targetStream")
             raw_event = fields.get("event")
             if target_stream and raw_event:
-                await producer.publish(target_stream, EventEnvelope.model_validate_json(raw_event))
+                event = EventEnvelope.model_validate_json(raw_event)
+                retry_event = event.model_copy(
+                    update={
+                        "eventId": str(uuid4()),
+                        "causationId": event.eventId,
+                    }
+                )
+                await producer.publish(target_stream, retry_event)
             await redis_client.xdel(settings.REDIS_RETRY_STREAM, message_id)
         await asyncio.sleep(1)
 

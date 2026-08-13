@@ -12,6 +12,7 @@ from pymongo import ReturnDocument
 from apps.api_gateway.config.setting import settings
 from services.conversation.models import (
     AudioChunkMetadata,
+    ConversationWindowDocument,
     ConversationDocument,
     ConversationStatus,
     ConversationSummaryDocument,
@@ -21,6 +22,8 @@ from services.conversation.models import (
     STTStatus,
     TranscriptChunkDocument,
     TranscriptProcessingStatus,
+    WindowExtractionResult,
+    WindowProcessingStatus,
     assert_valid_transition,
     utc_now,
 )
@@ -200,6 +203,148 @@ class ConversationRepository:
     async def list_transcript_chunks(self, conversation_id: str) -> list[TranscriptChunkDocument]:
         cursor = self.db.transcript_chunks.find({"conversationId": to_mongo_id(conversation_id)}).sort("sequenceNumber", 1)
         return [TranscriptChunkDocument.model_validate(doc) async for doc in cursor]
+
+    async def list_completed_unwindowed_transcript_chunks(
+        self,
+        conversation_id: str,
+        through_sequence: int | None = None,
+    ) -> list[TranscriptChunkDocument]:
+        query: dict[str, Any] = {
+            "conversationId": to_mongo_id(conversation_id),
+            "sttStatus": STTStatus.COMPLETED.value,
+            "processingStatus": TranscriptProcessingStatus.UNPROCESSED.value,
+        }
+        if through_sequence is not None:
+            query["sequenceNumber"] = {"$lte": through_sequence}
+        cursor = self.db.transcript_chunks.find(query).sort("sequenceNumber", 1)
+        return [TranscriptChunkDocument.model_validate(doc) async for doc in cursor]
+
+    async def next_window_index(self, conversation_id: str) -> int:
+        doc = await self.db.conversation_windows.find_one(
+            {"conversationId": to_mongo_id(conversation_id)},
+            sort=[("windowIndex", -1)],
+            projection={"windowIndex": 1},
+        )
+        return int(doc["windowIndex"]) + 1 if doc else 0
+
+    async def create_conversation_window(
+        self,
+        window: ConversationWindowDocument,
+        sequence_numbers: list[int],
+    ) -> ConversationWindowDocument:
+        now = utc_now()
+        doc = window.model_dump(by_alias=True)
+        doc["conversationId"] = to_mongo_id(window.conversationId)
+        doc["userId"] = to_mongo_id(window.userId)
+        doc["spaceId"] = to_mongo_id(window.spaceId)
+        doc["createdAt"] = window.createdAt
+        doc["updatedAt"] = now
+        result = await self.db.conversation_windows.find_one_and_update(
+            {
+                "conversationId": doc["conversationId"],
+                "processingVersion": window.processingVersion,
+                "sequenceStart": window.sequenceStart,
+                "sequenceEnd": window.sequenceEnd,
+            },
+            {"$setOnInsert": doc},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        saved = ConversationWindowDocument.model_validate(result)
+        if sequence_numbers:
+            await self.db.transcript_chunks.update_many(
+                {
+                    "conversationId": doc["conversationId"],
+                    "sequenceNumber": {"$in": sequence_numbers},
+                    "processingStatus": TranscriptProcessingStatus.UNPROCESSED.value,
+                },
+                {
+                    "$set": {
+                        "processingStatus": TranscriptProcessingStatus.PROCESSED.value,
+                        "processingWindowId": saved.id,
+                        "processedAt": now,
+                        "updatedAt": now,
+                    }
+                },
+            )
+        return saved
+
+    async def get_conversation_window(self, window_id: Any) -> ConversationWindowDocument | None:
+        data = await self.db.conversation_windows.find_one({"_id": to_mongo_id(window_id)})
+        return ConversationWindowDocument.model_validate(data) if data else None
+
+    async def list_conversation_windows(self, conversation_id: str) -> list[ConversationWindowDocument]:
+        cursor = self.db.conversation_windows.find({"conversationId": to_mongo_id(conversation_id)}).sort("sequenceStart", 1)
+        return [ConversationWindowDocument.model_validate(doc) async for doc in cursor]
+
+    async def mark_window_processing(self, window_id: Any) -> ConversationWindowDocument | None:
+        data = await self.db.conversation_windows.find_one_and_update(
+            {
+                "_id": to_mongo_id(window_id),
+                "status": {"$in": [WindowProcessingStatus.PENDING.value, WindowProcessingStatus.FAILED.value]},
+            },
+            {
+                "$set": {
+                    "status": WindowProcessingStatus.PROCESSING.value,
+                    "startedAt": utc_now(),
+                    "updatedAt": utc_now(),
+                    "lastError": None,
+                },
+                "$inc": {"attemptCount": 1},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        return ConversationWindowDocument.model_validate(data) if data else None
+
+    async def complete_window(
+        self,
+        window_id: Any,
+        result: WindowExtractionResult,
+        provider: str,
+        model: str,
+        token_usage: dict[str, int] | None = None,
+    ) -> None:
+        await self.db.conversation_windows.update_one(
+            {"_id": to_mongo_id(window_id)},
+            {
+                "$set": {
+                    "status": WindowProcessingStatus.COMPLETED.value,
+                    "result": result.model_dump(),
+                    "provider": provider,
+                    "model": model,
+                    "tokenUsage": token_usage or {},
+                    "completedAt": utc_now(),
+                    "updatedAt": utc_now(),
+                }
+            },
+        )
+
+    async def fail_window(self, window_id: Any, error: Exception | str) -> None:
+        await self.db.conversation_windows.update_one(
+            {"_id": to_mongo_id(window_id)},
+            {
+                "$set": {
+                    "status": WindowProcessingStatus.FAILED.value,
+                    "lastError": str(error)[:1000],
+                    "updatedAt": utc_now(),
+                }
+            },
+        )
+
+    async def mark_window_queued(self, window_id: Any) -> None:
+        await self.db.conversation_windows.update_one(
+            {"_id": to_mongo_id(window_id)},
+            {"$set": {"queuedAt": utc_now(), "updatedAt": utc_now()}},
+        )
+
+    async def mark_transcripts_published(self, conversation_id: str) -> None:
+        await self.db.transcript_chunks.update_many(
+            {
+                "conversationId": to_mongo_id(conversation_id),
+                "sttStatus": STTStatus.COMPLETED.value,
+            },
+            {"$set": {"publishedAt": utc_now(), "updatedAt": utc_now()}},
+        )
 
     async def create_extraction_run(
         self,

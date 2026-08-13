@@ -84,6 +84,21 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
             IndexModel([("status", ASCENDING), ("updatedAt", ASCENDING)]),
         ]
     )
+    await database.conversation_windows.create_indexes(
+        [
+            IndexModel(
+                [
+                    ("conversationId", ASCENDING),
+                    ("processingVersion", ASCENDING),
+                    ("sequenceStart", ASCENDING),
+                    ("sequenceEnd", ASCENDING),
+                ],
+                unique=True,
+            ),
+            IndexModel([("conversationId", ASCENDING), ("windowIndex", ASCENDING)]),
+            IndexModel([("status", ASCENDING), ("updatedAt", ASCENDING)]),
+        ]
+    )
     await database["stagedTasks"].create_indexes(
         [
             IndexModel([("extractionRunId", ASCENDING)]),

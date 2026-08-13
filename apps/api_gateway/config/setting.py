@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     REDIS_AUDIO_STREAM: str = "buddy:audio:ingestion"
     REDIS_STT_STREAM: str = "buddy:stt:jobs"
     REDIS_TRANSCRIPT_READY_STREAM: str = "buddy:transcript:ready"
+    REDIS_WINDOW_EXTRACTION_STREAM: str = "buddy:conversation:window-extraction"
     REDIS_FINALIZATION_STREAM: str = "buddy:conversation:finalization"
     REDIS_PROCESSING_STREAM: str = "buddy:conversation:processing"
     REDIS_RETRY_STREAM: str = "buddy:conversation:retry"
@@ -67,6 +68,7 @@ class Settings(BaseSettings):
     REDIS_AUDIO_GROUP: str = "audio-workers"
     REDIS_STT_GROUP: str = "stt-workers"
     REDIS_TRANSCRIPT_GROUP: str = "transcript-workers"
+    REDIS_WINDOW_EXTRACTION_GROUP: str = "window-extraction-workers"
     REDIS_FINALIZATION_GROUP: str = "finalization-workers"
     REDIS_PROCESSING_GROUP: str = "conversation-processing-workers"
 
@@ -77,6 +79,8 @@ class Settings(BaseSettings):
     AUDIO_WORKER_CONCURRENCY: int | None = Field(default=None, ge=1, le=64)
     STT_WORKER_CONCURRENCY: int | None = Field(default=None, ge=1, le=64)
     FINALIZATION_WORKER_CONCURRENCY: int | None = Field(default=None, ge=1, le=64)
+    TRANSCRIPT_WINDOW_WORKER_CONCURRENCY: int | None = Field(default=None, ge=1, le=64)
+    WINDOW_EXTRACTION_WORKER_CONCURRENCY: int | None = Field(default=None, ge=1, le=64)
     PROCESSING_WORKER_CONCURRENCY: int = Field(default=1, ge=1, le=8)
     WORKER_MAX_RETRIES: int = Field(default=5, ge=0, le=100)
     WORKER_GRACEFUL_SHUTDOWN_SECONDS: int = Field(default=30, ge=1, le=600)
@@ -121,6 +125,12 @@ class Settings(BaseSettings):
     MAX_TRANSCRIPT_TOKENS: int = 120000
     MAX_TRANSCRIPT_SEGMENTS: int = 80
     MAX_REPAIR_ROUNDS: int = 2
+    ENABLE_INCREMENTAL_MEETING_PROCESSING: bool = True
+    INCREMENTAL_WINDOW_TARGET_TOKENS: int = Field(default=2200, ge=200, le=20000)
+    INCREMENTAL_WINDOW_OVERLAP_TOKENS: int = Field(default=180, ge=0, le=5000)
+    INCREMENTAL_WINDOW_MAX_DURATION_MS: int = Field(default=5 * 60 * 1000, ge=1000, le=60 * 60 * 1000)
+    FINAL_MODEL_INPUT_TOKEN_LIMIT: int = Field(default=24000, ge=1000, le=200000)
+    FINAL_COMPRESSION_GROUP_TOKENS: int = Field(default=8000, ge=1000, le=50000)
 
     LLM_DEFAULT_PROVIDER: str = "sarvam"
     LLM_SECONDARY_PROVIDER: str = "openai"

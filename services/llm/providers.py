@@ -63,6 +63,7 @@ def build_groq_provider() -> OpenAICompatibleProvider | NotConfiguredProvider:
         timeout_seconds=settings.LLM_TIMEOUT_SECONDS,
         max_retries=settings.SARVAM_MAX_RETRIES,
         max_concurrency=settings.LLM_MAX_CONCURRENCY,
+        max_tokens_limit=max(256, min(settings.LLM_STRUCTURED_MAX_TOKENS, settings.GROQ_MAX_TPM // 2)),
     )
 
 
