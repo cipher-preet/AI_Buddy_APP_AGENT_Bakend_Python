@@ -505,6 +505,8 @@ class ConversationRepository:
     async def _publish_tasks(self, run: ExtractionRunDocument) -> list[Any]:
         task_ids: list[Any] = []
         for task in run.stagedTasks:
+            if task.operation == "NO_ACTION":
+                continue
             doc = task.model_dump()
             doc["conversationId"] = to_mongo_id(run.conversationId)
             doc["sourceConversationId"] = to_mongo_id(task.sourceConversationId)

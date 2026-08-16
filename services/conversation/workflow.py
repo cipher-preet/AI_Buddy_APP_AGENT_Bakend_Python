@@ -244,6 +244,8 @@ class ConversationProcessingWorkflow:
         for result in state.section_results:
             state.warnings.extend(result.warnings)
             for task in result.tasks:
+                if task.operation == "NO_ACTION":
+                    continue
                 task.fingerprint = task.fingerprint or task_fingerprint(state.space_id, task)
                 if task.fingerprint not in seen_tasks:
                     seen_tasks.add(task.fingerprint)
@@ -287,6 +289,8 @@ class ConversationProcessingWorkflow:
 
         seen_tasks = {task.fingerprint or task_fingerprint(state.space_id, task) for task in state.merged_tasks}
         for task in repair.tasks:
+            if task.operation == "NO_ACTION":
+                continue
             task.fingerprint = task.fingerprint or task_fingerprint(state.space_id, task)
             if task.fingerprint in seen_tasks:
                 continue
@@ -456,12 +460,18 @@ def _compact_items(items: list[dict]) -> list[dict]:
         {
             "title": item.get("title"),
             "body": item.get("body"),
+            "confidence": item.get("confidence"),
+            "sourceConversationId": item.get("sourceConversationId"),
+            "fingerprint": item.get("fingerprint"),
             "operation": item.get("operation"),
             "status": item.get("status"),
             "kind": item.get("kind"),
+            "existingTaskId": item.get("existingTaskId"),
             "dueDateText": item.get("dueDateText"),
             "dueDateResolved": item.get("dueDateResolved"),
+            "dueDateStatus": item.get("dueDateStatus"),
             "ownerText": item.get("ownerText"),
+            "ownerUserId": item.get("ownerUserId"),
             "needsConfirmation": item.get("needsConfirmation"),
             "evidence": item.get("evidence", []),
         }

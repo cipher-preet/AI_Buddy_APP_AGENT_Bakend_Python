@@ -227,6 +227,31 @@ async def extract_window(
         f"WINDOW {window.windowIndex} [{window.sequenceStart}-{window.sequenceEnd}]:\n{window.text}",
     )
     result = _window_result_from_llm(response, str(window.conversationId), str(window.spaceId))
+    if _needs_window_recovery(result, window.text):
+        try:
+            recovery_response = await _structured_with_provider(
+                provider,
+                model,
+                "memory-recovery-v1",
+                WindowExtractionLLMResponse,
+                json.dumps(context, default=str, ensure_ascii=True),
+                (
+                    f"WINDOW {window.windowIndex} [{window.sequenceStart}-{window.sequenceEnd}]:\n{window.text}\n\n"
+                    "PREVIOUS EXTRACTION THAT MAY HAVE MISSED MEMORY ITEMS:\n"
+                    f"{json.dumps(result.model_dump(), default=str, ensure_ascii=True)}"
+                ),
+            )
+            recovered = _window_result_from_llm(recovery_response, str(window.conversationId), str(window.spaceId))
+            result = _merge_window_extraction_results(result, recovered)
+        except Exception as error:
+            print(
+                "Window memory recovery skipped after failure:",
+                {
+                    "conversationId": str(window.conversationId),
+                    "windowIndex": window.windowIndex,
+                    "error": str(error)[:500],
+                },
+            )
     return result, provider.name, model
 
 
@@ -253,6 +278,8 @@ async def repair_missing_items(
     )
     repaired_tasks: list[ExtractedTask] = []
     for task in response.tasks:
+        if task.operation == "NO_ACTION":
+            continue
         repaired_task = ExtractedTask(
             **task.model_dump(exclude={"fingerprint"}),
             sourceConversationId=conversation_id,
@@ -346,7 +373,34 @@ async def finalize_from_window_results(
         json.dumps(context, default=str, ensure_ascii=True),
         json.dumps({"conversationId": conversation_id, "windows": window_payload}, default=str, ensure_ascii=True),
     )
-    return _window_result_from_llm(result, conversation_id, space_id), provider.name, model
+    finalized = _window_result_from_llm(result, conversation_id, space_id)
+    if _needs_final_memory_recovery(finalized, window_payload):
+        try:
+            recovery_response = await _structured_with_provider(
+                provider,
+                model,
+                "final-memory-recovery-v1",
+                WindowExtractionLLMResponse,
+                json.dumps(context, default=str, ensure_ascii=True),
+                (
+                    "FINALIZATION INPUT WINDOWS:\n"
+                    f"{json.dumps({'conversationId': conversation_id, 'windows': window_payload}, default=str, ensure_ascii=True)}\n\n"
+                    "PREVIOUS FINALIZATION THAT MAY HAVE MISSED STORED MEMORY OBJECTS:\n"
+                    f"{json.dumps(finalized.model_dump(), default=str, ensure_ascii=True)}"
+                ),
+            )
+            recovered = _window_result_from_llm(recovery_response, conversation_id, space_id)
+            finalized = _merge_window_extraction_results(finalized, recovered)
+        except Exception as error:
+            print(
+                "Final memory recovery skipped after failure:",
+                {
+                    "conversationId": conversation_id,
+                    "error": str(error)[:500],
+                },
+            )
+    finalized = _preserve_window_candidates_when_final_empty(finalized, window_payload, conversation_id, space_id)
+    return finalized, provider.name, model
 
 
 async def update_space_memory(
@@ -377,6 +431,8 @@ async def update_space_memory(
 def _window_result_from_llm(response: WindowExtractionLLMResponse, conversation_id: str, space_id: str) -> WindowExtractionResult:
     tasks: list[ExtractedTask] = []
     for task in response.tasks:
+        if task.operation == "NO_ACTION":
+            continue
         extracted = ExtractedTask(
             **task.model_dump(exclude={"fingerprint"}),
             sourceConversationId=conversation_id,
@@ -408,6 +464,207 @@ def _window_result_from_llm(response: WindowExtractionLLMResponse, conversation_
         issues=[ExtractedIssue(**issue.model_dump(), sourceConversationId=conversation_id) for issue in response.issues],
         openQuestions=response.openQuestions,
     )
+
+
+def _needs_window_recovery(result: WindowExtractionResult, window_text: str) -> bool:
+    if _rough_token_count(window_text) < 40:
+        return False
+    if not (result.tasks or result.notes or result.decisions or result.issues):
+        return True
+    if not result.notes and _result_has_note_source(result):
+        return True
+    return False
+
+
+def _needs_final_memory_recovery(finalized: WindowExtractionResult, window_payload: list[dict[str, Any]]) -> bool:
+    if not finalized.notes and _window_payload_has_note_source(window_payload):
+        return True
+    if finalized.tasks or finalized.notes or finalized.decisions or finalized.issues:
+        return False
+    return _window_payload_has_memory_source(window_payload)
+
+
+def _result_has_note_source(result: WindowExtractionResult) -> bool:
+    return bool(
+        result.importantFacts
+        or result.topics
+        or result.openQuestions
+        or _rough_token_count(result.summary) >= 20
+    )
+
+
+def _window_payload_has_note_source(window_payload: list[dict[str, Any]]) -> bool:
+    for window in window_payload:
+        if window.get("notes") or window.get("importantFacts"):
+            return True
+        if _rough_token_count(str(window.get("summary") or "")) >= 30:
+            return True
+    return False
+
+
+def _window_payload_has_memory_source(window_payload: list[dict[str, Any]]) -> bool:
+    for window in window_payload:
+        if window.get("tasks") or window.get("notes") or window.get("decisions") or window.get("issues"):
+            return True
+        if window.get("importantFacts") or window.get("openQuestions"):
+            return True
+        if _rough_token_count(str(window.get("summary") or "")) >= 30:
+            return True
+    return False
+
+
+def _merge_window_extraction_results(primary: WindowExtractionResult, recovery: WindowExtractionResult) -> WindowExtractionResult:
+    primary.summary = primary.summary or recovery.summary
+    primary.topics = _dedupe_values([*primary.topics, *recovery.topics])
+    primary.importantFacts = _dedupe_values([*primary.importantFacts, *recovery.importantFacts])
+    primary.openQuestions = _dedupe_values([*primary.openQuestions, *recovery.openQuestions])
+    primary.tasks = _dedupe_items([*primary.tasks, *recovery.tasks])
+    primary.notes = _dedupe_items([*primary.notes, *recovery.notes])
+    primary.decisions = _dedupe_items([*primary.decisions, *recovery.decisions])
+    primary.issues = _dedupe_items([*primary.issues, *recovery.issues])
+    return primary
+
+
+def _preserve_window_candidates_when_final_empty(
+    finalized: WindowExtractionResult,
+    window_payload: list[dict[str, Any]],
+    conversation_id: str,
+    space_id: str,
+) -> WindowExtractionResult:
+    if finalized.tasks and finalized.notes:
+        return finalized
+
+    carried = _extract_window_candidates(window_payload, conversation_id, space_id)
+    if not finalized.tasks and carried.tasks:
+        finalized.tasks = _dedupe_items(carried.tasks)
+    if not finalized.notes and carried.notes:
+        finalized.notes = _dedupe_items(carried.notes)
+    if not finalized.decisions and carried.decisions:
+        finalized.decisions = _dedupe_items(carried.decisions)
+    if not finalized.issues and carried.issues:
+        finalized.issues = _dedupe_items(carried.issues)
+    return finalized
+
+
+def _extract_window_candidates(
+    window_payload: list[dict[str, Any]],
+    conversation_id: str,
+    space_id: str,
+) -> WindowExtractionResult:
+    carried = WindowExtractionResult()
+    for window in window_payload:
+        for raw_task in window.get("tasks", []) or []:
+            task = _safe_task_from_payload(raw_task, conversation_id, space_id)
+            if task:
+                carried.tasks.append(task)
+        for raw_note in window.get("notes", []) or []:
+            note = _safe_note_from_payload(raw_note, conversation_id, space_id)
+            if note:
+                carried.notes.append(note)
+        for raw_decision in window.get("decisions", []) or []:
+            decision = _safe_decision_from_payload(raw_decision, conversation_id)
+            if decision:
+                carried.decisions.append(decision)
+        for raw_issue in window.get("issues", []) or []:
+            issue = _safe_issue_from_payload(raw_issue, conversation_id)
+            if issue:
+                carried.issues.append(issue)
+    return carried
+
+
+def _safe_task_from_payload(raw: dict[str, Any], conversation_id: str, space_id: str) -> ExtractedTask | None:
+    if not isinstance(raw, dict) or not raw.get("title") or not raw.get("evidence"):
+        return None
+    data = dict(raw)
+    if data.get("operation") == "NO_ACTION":
+        return None
+    data.setdefault("body", "")
+    data.setdefault("operation", "NEEDS_CONFIRMATION")
+    data.setdefault("confidence", 0.5)
+    data.setdefault("needsConfirmation", data.get("operation") == "NEEDS_CONFIRMATION")
+    data.setdefault("sourceConversationId", conversation_id)
+    try:
+        task = ExtractedTask.model_validate(data)
+    except Exception:
+        return None
+    task.fingerprint = task.fingerprint or task_fingerprint(space_id, task)
+    return task
+
+
+def _safe_note_from_payload(raw: dict[str, Any], conversation_id: str, space_id: str) -> ExtractedNote | None:
+    if not isinstance(raw, dict) or not raw.get("title") or not raw.get("body") or not raw.get("evidence"):
+        return None
+    data = dict(raw)
+    data.setdefault("confidence", 0.5)
+    data.setdefault("sourceConversationId", conversation_id)
+    try:
+        note = ExtractedNote.model_validate(data)
+    except Exception:
+        return None
+    note.fingerprint = note.fingerprint or note_fingerprint(space_id, note)
+    return note
+
+
+def _safe_decision_from_payload(raw: dict[str, Any], conversation_id: str) -> ExtractedDecision | None:
+    if not isinstance(raw, dict) or not raw.get("title") or not raw.get("evidence"):
+        return None
+    data = dict(raw)
+    data.setdefault("status", "unresolved_discussion")
+    data.setdefault("confidence", 0.5)
+    data.setdefault("sourceConversationId", conversation_id)
+    try:
+        return ExtractedDecision.model_validate(data)
+    except Exception:
+        return None
+
+
+def _safe_issue_from_payload(raw: dict[str, Any], conversation_id: str) -> ExtractedIssue | None:
+    if not isinstance(raw, dict) or not raw.get("title") or not raw.get("evidence"):
+        return None
+    data = dict(raw)
+    data.setdefault("kind", "open_question")
+    data.setdefault("confidence", 0.5)
+    data.setdefault("sourceConversationId", conversation_id)
+    try:
+        return ExtractedIssue.model_validate(data)
+    except Exception:
+        return None
+
+
+def _dedupe_values(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        normalized = " ".join(str(value or "").split()).casefold()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(value)
+    return unique
+
+
+def _dedupe_items(items: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    unique: list[Any] = []
+    for item in items:
+        fingerprint = getattr(item, "fingerprint", None)
+        evidence = getattr(item, "evidence", [])
+        evidence_key = "|".join(f"{span.sequenceStart}:{span.sequenceEnd}" for span in evidence)
+        identity = fingerprint or "|".join(
+            [
+                str(getattr(item, "title", "")),
+                str(getattr(item, "body", ""))[:300],
+                str(getattr(item, "operation", "")),
+                str(getattr(item, "status", "")),
+                str(getattr(item, "kind", "")),
+                evidence_key,
+            ]
+        ).casefold()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(item)
+    return unique
 
 
 def _trim_payload_for_provider(window_payload: list[dict[str, Any]], provider_name: str) -> list[dict[str, Any]]:
@@ -449,12 +706,18 @@ def _compact_extracted_item(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "title": item.get("title"),
         "body": str(item.get("body") or "")[:500],
+        "confidence": item.get("confidence"),
+        "sourceConversationId": item.get("sourceConversationId"),
+        "fingerprint": item.get("fingerprint"),
         "operation": item.get("operation"),
         "status": item.get("status"),
         "kind": item.get("kind"),
+        "existingTaskId": item.get("existingTaskId"),
         "ownerText": item.get("ownerText"),
+        "ownerUserId": item.get("ownerUserId"),
         "dueDateText": item.get("dueDateText"),
         "dueDateResolved": item.get("dueDateResolved"),
+        "dueDateStatus": item.get("dueDateStatus"),
         "needsConfirmation": item.get("needsConfirmation"),
         "evidence": item.get("evidence", []),
     }
