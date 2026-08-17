@@ -5,6 +5,7 @@ from pathlib import Path
 
 import httpx
 from apps.api_gateway.config.setting import settings
+from services.speech.errors import STTProviderAuthError
 
 
 _client: httpx.AsyncClient | None = None
@@ -48,6 +49,12 @@ async def sarvam_transcribe_from_path(
     filename: str,
     content_type: str,
 ):
+    if not settings.STT_ALLOW_SARVAM_FALLBACK:
+        raise STTProviderAuthError(
+            "Sarvam speech-to-text fallback is disabled by STT_ALLOW_SARVAM_FALLBACK=false",
+            provider="sarvam",
+        )
+
     url = f"{_sarvam_speech_base_url()}/speech-to-text"
     path = Path(file_path)
     if not path.exists() or path.stat().st_size <= 0:
@@ -90,6 +97,7 @@ async def sarvam_transcribe_from_path(
     transcript = str(result.get("transcript") or "").strip()
     result["transcript"] = transcript
     result["provider"] = "sarvam"
+    result["model"] = "saaras:v3"
     result["is_empty_transcript"] = not bool(transcript)
     return result
 

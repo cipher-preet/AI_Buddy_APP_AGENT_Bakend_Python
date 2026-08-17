@@ -11,9 +11,7 @@ from services.queue.redis_queue import (
     save_job_result,
 )
 
-from services.speech.providers.sarvam_provider import (
-    sarvam_transcribe_from_path,
-)
+from services.speech.transcription_router import transcribe_from_path_with_fallback
 from services.storage.s3_audio_storage import (
     PermanentS3StorageError,
     TemporaryS3StorageError,
@@ -49,10 +47,30 @@ async def _process_local_speech_job(job: dict) -> None:
 
         await mark_job_processing(job_id)
 
-        result = await sarvam_transcribe_from_path(
+        print(
+            "Speech job STT routing:",
+            {
+                "job_id": job_id,
+                "user_id": job.get("user_id"),
+                "space_id": job.get("space_id"),
+                "conversation_id": job.get("conversation_id"),
+                "filename": job.get("filename"),
+            },
+        )
+        result = await transcribe_from_path_with_fallback(
             file_path=job["file_path"],
             filename=job["filename"],
             content_type=job["content_type"],
+        )
+        print(
+            "Speech job STT provider selected:",
+            {
+                "job_id": job_id,
+                "provider": result.get("provider"),
+                "model": result.get("model"),
+                "language_code": result.get("language_code"),
+                "is_empty_transcript": result.get("is_empty_transcript"),
+            },
         )
 
         await save_job_result(job_id, result)

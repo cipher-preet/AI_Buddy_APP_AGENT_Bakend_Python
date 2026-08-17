@@ -218,14 +218,27 @@ async def extract_window(
     context: dict[str, Any],
 ) -> tuple[WindowExtractionResult, str, str]:
     provider, model = router.route(LLMCapability.HIGH_ACCURACY_REASONING)
-    response = await _structured_with_provider(
-        provider,
-        model,
-        "window-extractor-v1",
-        WindowExtractionLLMResponse,
-        json.dumps(context, default=str, ensure_ascii=True),
-        f"WINDOW {window.windowIndex} [{window.sequenceStart}-{window.sequenceEnd}]:\n{window.text}",
-    )
+    try:
+        response = await _structured_with_provider(
+            provider,
+            model,
+            "window-extractor-v1",
+            WindowExtractionLLMResponse,
+            json.dumps(context, default=str, ensure_ascii=True),
+            f"WINDOW {window.windowIndex} [{window.sequenceStart}-{window.sequenceEnd}]:\n{window.text}",
+        )
+    except Exception as error:
+        print(
+            "Window extraction using minimal fallback after structured LLM failure:",
+            {
+                "conversationId": str(window.conversationId),
+                "windowIndex": window.windowIndex,
+                "provider": getattr(provider, "name", "unknown"),
+                "model": model,
+                "error": str(error)[:500],
+            },
+        )
+        response = _minimal_window_response(window.text)
     result = _window_result_from_llm(response, str(window.conversationId), str(window.spaceId))
     if _needs_window_recovery(result, window.text):
         try:
@@ -365,14 +378,26 @@ async def finalize_from_window_results(
 ) -> tuple[WindowExtractionResult, str, str]:
     provider, model = router.route(LLMCapability.HIGH_ACCURACY_REASONING)
     window_payload = _trim_payload_for_provider(window_payload, provider.name)
-    result = await _structured_with_provider(
-        provider,
-        model,
-        "meeting-finalizer-v1",
-        WindowExtractionLLMResponse,
-        json.dumps(context, default=str, ensure_ascii=True),
-        json.dumps({"conversationId": conversation_id, "windows": window_payload}, default=str, ensure_ascii=True),
-    )
+    try:
+        result = await _structured_with_provider(
+            provider,
+            model,
+            "meeting-finalizer-v1",
+            WindowExtractionLLMResponse,
+            json.dumps(context, default=str, ensure_ascii=True),
+            json.dumps({"conversationId": conversation_id, "windows": window_payload}, default=str, ensure_ascii=True),
+        )
+    except Exception as error:
+        print(
+            "Finalization using minimal fallback after structured LLM failure:",
+            {
+                "conversationId": conversation_id,
+                "provider": getattr(provider, "name", "unknown"),
+                "model": model,
+                "error": str(error)[:500],
+            },
+        )
+        result = _minimal_final_response(window_payload)
     finalized = _window_result_from_llm(result, conversation_id, space_id)
     if _needs_final_memory_recovery(finalized, window_payload):
         try:
@@ -731,6 +756,51 @@ def _provider_input_token_limit(provider_name: str) -> int:
 
 def _rough_token_count(text: str) -> int:
     return max(1, len(text) // 4)
+
+
+def _minimal_window_response(window_text: str) -> WindowExtractionLLMResponse:
+    summary = " ".join(str(window_text or "").split())
+    if len(summary) > 500:
+        summary = f"{summary[:497].rstrip()}..."
+    return WindowExtractionLLMResponse(summary=summary)
+
+
+def _minimal_final_response(window_payload: list[dict[str, Any]]) -> WindowExtractionLLMResponse:
+    summaries = [
+        str(window.get("summary") or "").strip()
+        for window in window_payload
+        if str(window.get("summary") or "").strip()
+    ]
+    summary = " ".join(summaries) or "Conversation processed from transcript windows."
+    if len(summary) > 800:
+        summary = f"{summary[:797].rstrip()}..."
+    return WindowExtractionLLMResponse(
+        summary=summary,
+        topics=_dedupe_values(
+            [
+                str(topic)
+                for window in window_payload
+                for topic in (window.get("topics") or [])
+                if str(topic).strip()
+            ]
+        )[:20],
+        importantFacts=_dedupe_values(
+            [
+                str(fact)
+                for window in window_payload
+                for fact in (window.get("importantFacts") or [])
+                if str(fact).strip()
+            ]
+        )[:30],
+        openQuestions=_dedupe_values(
+            [
+                str(question)
+                for window in window_payload
+                for question in (window.get("openQuestions") or [])
+                if str(question).strip()
+            ]
+        )[:20],
+    )
 
 
 async def _structured(

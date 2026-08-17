@@ -22,7 +22,7 @@ from services.storage.s3_audio_storage import (
     temp_audio_root,
     validate_conversation_audio_object_key,
 )
-from services.speech.providers.sarvam_provider import sarvam_transcribe_from_path
+from services.speech.transcription_router import transcribe_from_path_with_fallback
 from services.conversation.models import STTStatus
 
 
@@ -87,10 +87,32 @@ async def handle_stt_event(event: EventEnvelope) -> None:
 
         if not file_path:
             raise ValueError("STT event is missing audio file reference")
-        result = await sarvam_transcribe_from_path(
+        print(
+            "Conversation chunk STT routing:",
+            {
+                "eventId": event.eventId,
+                "conversationId": conversation_id,
+                "sequenceNumber": sequence_number,
+                "filename": filename,
+                "contentType": content_type,
+            },
+        )
+        result = await transcribe_from_path_with_fallback(
             file_path=file_path,
             filename=filename,
             content_type=content_type,
+        )
+        print(
+            "Conversation chunk STT provider selected:",
+            {
+                "eventId": event.eventId,
+                "conversationId": conversation_id,
+                "sequenceNumber": sequence_number,
+                "provider": result.get("provider"),
+                "model": result.get("model"),
+                "languageCode": result.get("language_code"),
+                "isEmptyTranscript": result.get("is_empty_transcript"),
+            },
         )
         await repository.complete_transcript_chunk(
             conversation_id=conversation_id,
@@ -98,7 +120,7 @@ async def handle_stt_event(event: EventEnvelope) -> None:
             raw_text=result["transcript"],
             language_code=result.get("language_code"),
             request_id=result.get("request_id"),
-            provider="sarvam",
+            provider=result.get("provider") or "unknown",
         )
         await RedisStreamProducer().publish(
             settings.REDIS_TRANSCRIPT_READY_STREAM,

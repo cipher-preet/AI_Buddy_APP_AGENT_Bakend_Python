@@ -12,6 +12,8 @@ from apps.api_gateway.workers import conversation_workers, speech_worker, vector
 from apps.api_gateway import queue_api
 from services.conversation.models import STTStatus, TranscriptChunkDocument
 from services.queue.streams import EventEnvelope
+from services.speech import transcription_router
+from services.speech.errors import STTPermanentAudioError, STTProviderBillingError
 from services.speech.providers import sarvam_provider
 from services.storage.s3_audio_storage import (
     PermanentS3StorageError,
@@ -32,7 +34,7 @@ def test_duplicate_speech_job_does_not_call_processor(monkeypatch):
         raise AssertionError("duplicate completed jobs must not be transcribed again")
 
     monkeypatch.setattr(speech_worker, "get_job_result", completed)
-    monkeypatch.setattr(speech_worker, "sarvam_transcribe_from_path", fail_transcribe)
+    monkeypatch.setattr(speech_worker, "transcribe_from_path_with_fallback", fail_transcribe)
 
     asyncio.run(speech_worker.process_speech_job({"job_id": "job-1"}))
 
@@ -215,7 +217,7 @@ def test_s3_speech_job_downloads_and_injects_file_path(monkeypatch, tmp_path):
     monkeypatch.setattr(speech_worker, "mark_job_processing", noop)
     monkeypatch.setattr(speech_worker, "save_job_result", noop)
     monkeypatch.setattr(speech_worker, "push_completed_speech_job", noop)
-    monkeypatch.setattr(speech_worker, "sarvam_transcribe_from_path", transcribe)
+    monkeypatch.setattr(speech_worker, "transcribe_from_path_with_fallback", transcribe)
     monkeypatch.setattr(speech_worker, "get_s3_audio_storage", lambda: Storage())
 
     asyncio.run(
@@ -236,6 +238,7 @@ def test_s3_speech_job_downloads_and_injects_file_path(monkeypatch, tmp_path):
 
 
 def test_sarvam_empty_transcript_is_successful_empty_result(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "STT_ALLOW_SARVAM_FALLBACK", True)
     audio_path = tmp_path / "audio.wav"
     audio_path.write_bytes(b"audio")
 
@@ -262,6 +265,7 @@ def test_sarvam_empty_transcript_is_successful_empty_result(monkeypatch, tmp_pat
 
 
 def test_sarvam_upload_normalizes_browser_content_type(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "STT_ALLOW_SARVAM_FALLBACK", True)
     audio_path = tmp_path / "audio"
     audio_path.write_bytes(b"audio")
     uploaded = {}
@@ -295,6 +299,7 @@ def test_sarvam_upload_normalizes_browser_content_type(monkeypatch, tmp_path):
 
 
 def test_sarvam_invalid_audio_error_is_permanent(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "STT_ALLOW_SARVAM_FALLBACK", True)
     audio_path = tmp_path / "audio.wav"
     audio_path.write_bytes(b"not really audio")
 
@@ -327,6 +332,7 @@ def test_sarvam_invalid_audio_error_is_permanent(monkeypatch, tmp_path):
 
 
 def test_sarvam_audio_duration_limit_error_is_permanent(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "STT_ALLOW_SARVAM_FALLBACK", True)
     audio_path = tmp_path / "audio.wav"
     audio_path.write_bytes(b"long audio")
 
@@ -359,6 +365,124 @@ def test_sarvam_audio_duration_limit_error_is_permanent(monkeypatch, tmp_path):
         assert "Audio duration exceeds" in str(error)
     else:
         raise AssertionError("Sarvam duration limit errors must be treated as permanent")
+
+
+def test_stt_router_uses_deepgram_first(monkeypatch, tmp_path):
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"audio")
+    calls = []
+
+    async def deepgram(file_path, filename, content_type):
+        calls.append("deepgram")
+        return {
+            "transcript": "namaste",
+            "provider": "deepgram",
+            "model": "nova-3",
+            "language_code": "hi",
+        }
+
+    async def sarvam(file_path, filename, content_type):
+        calls.append("sarvam")
+        return {"transcript": "should not run", "provider": "sarvam"}
+
+    monkeypatch.setattr(settings, "STT_PROVIDER_ORDER", "deepgram,sarvam")
+    monkeypatch.setattr(settings, "STT_ALLOW_SARVAM_FALLBACK", True)
+    monkeypatch.setitem(transcription_router._PROVIDERS, "deepgram", deepgram)
+    monkeypatch.setitem(transcription_router._PROVIDERS, "sarvam", sarvam)
+
+    result = asyncio.run(
+        transcription_router.transcribe_from_path_with_fallback(
+            file_path=str(audio_path),
+            filename="audio.wav",
+            content_type="audio/wav",
+        )
+    )
+
+    assert calls == ["deepgram"]
+    assert result["provider"] == "deepgram"
+    assert result["transcript"] == "namaste"
+    assert result["is_empty_transcript"] is False
+
+
+def test_stt_router_falls_back_from_deepgram_billing_to_sarvam(monkeypatch, tmp_path):
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"audio")
+    calls = []
+
+    async def deepgram(file_path, filename, content_type):
+        calls.append("deepgram")
+        raise STTProviderBillingError("Deepgram billing quota exceeded", provider="deepgram")
+
+    async def sarvam(file_path, filename, content_type):
+        calls.append("sarvam")
+        return {
+            "transcript": "mera kaam ho gaya",
+            "provider": "sarvam",
+            "model": "saaras:v3",
+        }
+
+    monkeypatch.setattr(settings, "STT_PROVIDER_ORDER", "deepgram,sarvam")
+    monkeypatch.setattr(settings, "STT_ALLOW_SARVAM_FALLBACK", True)
+    monkeypatch.setitem(transcription_router._PROVIDERS, "deepgram", deepgram)
+    monkeypatch.setitem(transcription_router._PROVIDERS, "sarvam", sarvam)
+
+    result = asyncio.run(
+        transcription_router.transcribe_from_path_with_fallback(
+            file_path=str(audio_path),
+            filename="audio.wav",
+            content_type="audio/wav",
+        )
+    )
+
+    assert calls == ["deepgram", "sarvam"]
+    assert result["provider"] == "sarvam"
+    assert result["fallback_attempts"][0]["provider"] == "deepgram"
+    assert result["fallback_attempts"][0]["status"] == "fallback"
+
+
+def test_stt_router_does_not_fallback_for_permanent_audio_errors(monkeypatch, tmp_path):
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"bad audio")
+    calls = []
+
+    async def deepgram(file_path, filename, content_type):
+        calls.append("deepgram")
+        raise STTPermanentAudioError("Invalid audio format", provider="deepgram")
+
+    async def sarvam(file_path, filename, content_type):
+        calls.append("sarvam")
+        return {"transcript": "should not run", "provider": "sarvam"}
+
+    monkeypatch.setattr(settings, "STT_PROVIDER_ORDER", "deepgram,sarvam")
+    monkeypatch.setattr(settings, "STT_ALLOW_SARVAM_FALLBACK", True)
+    monkeypatch.setitem(transcription_router._PROVIDERS, "deepgram", deepgram)
+    monkeypatch.setitem(transcription_router._PROVIDERS, "sarvam", sarvam)
+
+    try:
+        asyncio.run(
+            transcription_router.transcribe_from_path_with_fallback(
+                file_path=str(audio_path),
+                filename="audio.wav",
+                content_type="audio/wav",
+            )
+        )
+    except ValueError as error:
+        assert "Invalid audio format" in str(error)
+    else:
+        raise AssertionError("Permanent audio errors must not fallback to another provider")
+
+    assert calls == ["deepgram"]
+
+
+def test_stt_provider_order_filters_sarvam_unless_explicitly_enabled(monkeypatch):
+    monkeypatch.setattr(settings, "STT_PROVIDER_ORDER", "deepgram,sarvam")
+    monkeypatch.setattr(settings, "STT_ALLOW_SARVAM_FALLBACK", False)
+
+    assert settings.stt_provider_order_list == ["deepgram"]
+
+    monkeypatch.setattr(settings, "STT_ALLOW_SARVAM_FALLBACK", True)
+
+    assert settings.stt_provider_order_list == ["deepgram", "sarvam"]
 
 
 def test_empty_completed_speech_job_skips_vector_and_cleans_up(monkeypatch):
@@ -700,7 +824,7 @@ def test_duplicate_stt_event_does_not_call_sarvam(monkeypatch):
 
     monkeypatch.setattr(conversation_workers, "ConversationRepository", lambda db: Repository())
     monkeypatch.setattr(conversation_workers, "get_database", lambda: object())
-    monkeypatch.setattr(conversation_workers, "sarvam_transcribe_from_path", fail_transcribe)
+    monkeypatch.setattr(conversation_workers, "transcribe_from_path_with_fallback", fail_transcribe)
 
     event = EventEnvelope(
         eventType="stt.requested",

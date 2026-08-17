@@ -58,6 +58,7 @@ async def process_completed_speech_job(job_id: str) -> None:
     transcript = str(result.get("transcript") or "").strip()
     language_code = result.get("language_code")
     request_id = result.get("request_id")
+    provider = str(result.get("provider") or "unknown").strip() or "unknown"
 
     user_id = str(job.get("user_id") or "").strip()
     space_id = str(job.get("space_id") or "").strip()
@@ -76,7 +77,7 @@ async def process_completed_speech_job(job_id: str) -> None:
             raw_text=str(transcript or ""),
             language_code=language_code,
             request_id=request_id,
-            provider="sarvam",
+            provider=provider,
         )
         conversation = await repository.get_conversation(conversation_id)
         if conversation and conversation.expectedLastSequence is not None:
@@ -102,6 +103,7 @@ async def process_completed_speech_job(job_id: str) -> None:
                 "space_id": space_id,
                 "conversation_id": conversation_id or None,
                 "sequence_number": sequence_number,
+                "provider": provider,
                 "audio_removed": audio_removed,
             },
         )
@@ -126,6 +128,7 @@ async def process_completed_speech_job(job_id: str) -> None:
             "space_id": space_id,
             "conversation_id": conversation_id or None,
             "sequence_number": sequence_number,
+            "provider": provider,
             "audio_removed": audio_removed,
         },
     )

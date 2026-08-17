@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import time
 from typing import Any
 
@@ -150,7 +151,7 @@ class OpenAICompatibleProvider:
         for _ in range(3):
             response = await self.generate(structured_request)
             try:
-                return response_schema.model_validate_json(response.content)
+                return _validate_structured_response(response_schema, response.content)
             except ValidationError as error:
                 last_error = error
                 structured_request.messages.append(
@@ -158,11 +159,11 @@ class OpenAICompatibleProvider:
                         role="user",
                         content=(
                             "Your previous response did not validate. Return corrected JSON only. "
-                            f"Validation error: {error}"
+                            f"Validation error: {str(error)[:1200]}"
                         ),
                     )
                 )
-        raise LLMProviderError(f"Structured response validation failed: {last_error}", retryable=False)
+        raise LLMProviderError(f"Structured response validation failed: {last_error}", retryable=True)
 
     async def health_check(self) -> ProviderHealth:
         started = time.perf_counter()
@@ -223,3 +224,51 @@ def _without_none_values(value: Any) -> Any:
     if isinstance(value, list):
         return [_without_none_values(item) for item in value]
     return value
+
+
+def _validate_structured_response(response_schema: type[BaseModel], content: str) -> BaseModel:
+    cleaned = _sanitize_json_text(content)
+    try:
+        return response_schema.model_validate_json(cleaned)
+    except ValidationError:
+        extracted = _extract_json_object(cleaned)
+        if extracted and extracted != cleaned:
+            return response_schema.model_validate_json(extracted)
+        raise
+
+
+def _sanitize_json_text(content: str) -> str:
+    value = str(content or "").strip()
+    value = value.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    # Remove ASCII control characters except whitespace JSON permits.
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", value)
+
+
+def _extract_json_object(content: str) -> str | None:
+    start = content.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(content)):
+        char = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "\"":
+                in_string = False
+            continue
+
+        if char == "\"":
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return content[start : index + 1]
+    return None

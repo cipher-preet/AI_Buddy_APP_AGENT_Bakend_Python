@@ -29,6 +29,17 @@ class Settings(BaseSettings):
     SARVAM_MAX_TOKENS: int = 4096
     SARVAM_STT_MAX_DURATION_MS: int = Field(default=30000, ge=1000, le=600000)
 
+    STT_PROVIDER_ORDER: str = "deepgram,sarvam"
+    STT_ALLOW_SARVAM_FALLBACK: bool = True
+    STT_TIMEOUT_SECONDS: float = 60
+    STT_MAX_RETRIES: int = 2
+
+    DEEPGRAM_API_KEY: SecretStr | str = ""
+    DEEPGRAM_MODEL: str = "nova-3"
+    DEEPGRAM_LANGUAGE: str = "multi"
+    DEEPGRAM_SMART_FORMAT: bool = True
+    DEEPGRAM_DETECT_LANGUAGE: bool = False
+
     OPENAI_API_KEY: SecretStr | str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
 
@@ -156,7 +167,7 @@ class Settings(BaseSettings):
     def normalize_enumish(cls, value: str) -> str:
         return str(value or "").strip().lower()
 
-    @field_validator("SARVAM_TIMEOUT_SECONDS", "LLM_TIMEOUT_SECONDS")
+    @field_validator("SARVAM_TIMEOUT_SECONDS", "STT_TIMEOUT_SECONDS", "LLM_TIMEOUT_SECONDS")
     @classmethod
     def positive_timeout(cls, value: float) -> float:
         if value <= 0:
@@ -218,6 +229,17 @@ class Settings(BaseSettings):
             for item in self.S3_ALLOWED_CONTENT_TYPES.split(",")
             if item.strip()
         }
+
+    @property
+    def stt_provider_order_list(self) -> list[str]:
+        providers = [
+            item.strip().lower()
+            for item in self.STT_PROVIDER_ORDER.split(",")
+            if item.strip()
+        ]
+        if not self.STT_ALLOW_SARVAM_FALLBACK:
+            providers = [item for item in providers if item != "sarvam"]
+        return providers or ["deepgram", "sarvam"]
 
     @staticmethod
     def _secret_value(value: SecretStr | str | None) -> str:
