@@ -216,16 +216,20 @@ async def extract_window(
     router: LLMRouter,
     window,
     context: dict[str, Any],
+    meeting_context: dict[str, Any] | None = None,
+    recovery: bool = False,
 ) -> tuple[WindowExtractionResult, str, str]:
     provider, model = router.route(LLMCapability.HIGH_ACCURACY_REASONING)
+    prompt_name = "memory-recovery-v1" if recovery else "window-extractor-v1"
+    current = _window_extraction_prompt_input(window, meeting_context)
     try:
         response = await _structured_with_provider(
             provider,
             model,
-            "window-extractor-v1",
+            prompt_name,
             WindowExtractionLLMResponse,
             json.dumps(context, default=str, ensure_ascii=True),
-            f"WINDOW {window.windowIndex} [{window.sequenceStart}-{window.sequenceEnd}]:\n{window.text}",
+            current,
         )
     except Exception as error:
         print(
@@ -235,12 +239,13 @@ async def extract_window(
                 "windowIndex": window.windowIndex,
                 "provider": getattr(provider, "name", "unknown"),
                 "model": model,
+                "recovery": recovery,
                 "error": str(error)[:500],
             },
         )
         response = _minimal_window_response(window.text)
     result = _window_result_from_llm(response, str(window.conversationId), str(window.spaceId))
-    if _needs_window_recovery(result, window.text):
+    if not recovery and _needs_window_recovery(result, window.text):
         try:
             recovery_response = await _structured_with_provider(
                 provider,
@@ -249,7 +254,7 @@ async def extract_window(
                 WindowExtractionLLMResponse,
                 json.dumps(context, default=str, ensure_ascii=True),
                 (
-                    f"WINDOW {window.windowIndex} [{window.sequenceStart}-{window.sequenceEnd}]:\n{window.text}\n\n"
+                    f"{current}\n\n"
                     "PREVIOUS EXTRACTION THAT MAY HAVE MISSED MEMORY ITEMS:\n"
                     f"{json.dumps(result.model_dump(), default=str, ensure_ascii=True)}"
                 ),
@@ -266,6 +271,21 @@ async def extract_window(
                 },
             )
     return result, provider.name, model
+
+
+def _window_extraction_prompt_input(window, meeting_context: dict[str, Any] | None) -> str:
+    parts = [
+        f"WINDOW {window.windowIndex} [{window.sequenceStart}-{window.sequenceEnd}]:",
+        window.text,
+    ]
+    if meeting_context:
+        parts = [
+            "CURRENT MEETING STATE (bounded, do not rediscover; use for NEW/UPDATE/CONFIRM/CONTRADICT/COMPLETE):",
+            json.dumps(meeting_context, default=str, ensure_ascii=True),
+            "",
+            *parts,
+        ]
+    return "\n".join(parts)
 
 
 async def repair_missing_items(
@@ -365,6 +385,53 @@ async def summarize_conversation(
         modelName=model,
         promptVersion="conversation-summary-v1",
     )
+
+
+async def reconcile_meeting(
+    router: LLMRouter,
+    conversation_id: str,
+    user_id: str,
+    space_id: str,
+    artifacts_payload: list[dict[str, Any]],
+    window_summaries: list[dict[str, Any]],
+    meeting_memory: dict[str, Any] | None,
+    context: dict[str, Any],
+    processing_version: int,
+) -> tuple[WindowExtractionResult, str, str]:
+    provider, model = router.route(LLMCapability.HIGH_ACCURACY_REASONING)
+    payload = _trim_reconcile_payload(
+        {
+            "conversationId": conversation_id,
+            "processingVersion": processing_version,
+            "meetingMemory": meeting_memory or {},
+            "artifacts": artifacts_payload,
+            "windowSummaries": window_summaries,
+        },
+        provider.name,
+    )
+    try:
+        result = await _structured_with_provider(
+            provider,
+            model,
+            "meeting-finalizer-v1",
+            WindowExtractionLLMResponse,
+            json.dumps(context, default=str, ensure_ascii=True),
+            json.dumps(payload, default=str, ensure_ascii=True),
+        )
+    except Exception as error:
+        print(
+            "Reconciliation using artifact fallback after structured LLM failure:",
+            {
+                "conversationId": conversation_id,
+                "provider": getattr(provider, "name", "unknown"),
+                "model": model,
+                "artifactCount": len(artifacts_payload),
+                "error": str(error)[:500],
+            },
+        )
+        return WindowExtractionResult(summary="Meeting organized from stored artifacts after LLM failure."), getattr(provider, "name", "unknown"), model
+    finalized = _window_result_from_llm(result, conversation_id, space_id)
+    return finalized, provider.name, model
 
 
 async def finalize_from_window_results(
@@ -556,18 +623,23 @@ def _preserve_window_candidates_when_final_empty(
     conversation_id: str,
     space_id: str,
 ) -> WindowExtractionResult:
-    if finalized.tasks and finalized.notes:
-        return finalized
-
     carried = _extract_window_candidates(window_payload, conversation_id, space_id)
-    if not finalized.tasks and carried.tasks:
+    if not finalized.tasks:
         finalized.tasks = _dedupe_items(carried.tasks)
-    if not finalized.notes and carried.notes:
+    else:
+        finalized.tasks = _dedupe_items([*finalized.tasks, *carried.tasks])
+    if not finalized.notes:
         finalized.notes = _dedupe_items(carried.notes)
-    if not finalized.decisions and carried.decisions:
+    else:
+        finalized.notes = _dedupe_items([*finalized.notes, *carried.notes])
+    if not finalized.decisions:
         finalized.decisions = _dedupe_items(carried.decisions)
-    if not finalized.issues and carried.issues:
+    else:
+        finalized.decisions = _dedupe_items([*finalized.decisions, *carried.decisions])
+    if not finalized.issues:
         finalized.issues = _dedupe_items(carried.issues)
+    else:
+        finalized.issues = _dedupe_items([*finalized.issues, *carried.issues])
     return finalized
 
 
@@ -690,6 +762,37 @@ def _dedupe_items(items: list[Any]) -> list[Any]:
         seen.add(identity)
         unique.append(item)
     return unique
+
+
+def _trim_reconcile_payload(payload: dict[str, Any], provider_name: str) -> dict[str, Any]:
+    limit = _provider_input_token_limit(provider_name)
+    artifacts = list(payload.get("artifacts") or [])
+    window_summaries = list(payload.get("windowSummaries") or [])
+    meeting_memory = payload.get("meetingMemory") or {}
+    content_limit = 240
+    while True:
+        candidate = {
+            "conversationId": payload.get("conversationId"),
+            "processingVersion": payload.get("processingVersion"),
+            "meetingMemory": meeting_memory,
+            "windowSummaries": window_summaries,
+            "artifacts": [
+                {
+                    **item,
+                    "content": str(item.get("content") or "")[:content_limit],
+                    "evidence": (item.get("evidence") or [])[:2],
+                }
+                for item in artifacts
+            ],
+        }
+        if _rough_token_count(json.dumps(candidate, default=str, ensure_ascii=True)) <= limit or content_limit <= 40:
+            return candidate
+        content_limit = max(40, content_limit // 2)
+        if content_limit <= 80:
+            window_summaries = [
+                {**item, "summary": str(item.get("summary") or "")[:160]}
+                for item in window_summaries
+            ]
 
 
 def _trim_payload_for_provider(window_payload: list[dict[str, Any]], provider_name: str) -> list[dict[str, Any]]:

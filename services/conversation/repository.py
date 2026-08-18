@@ -18,6 +18,8 @@ from services.conversation.models import (
     ConversationSummaryDocument,
     ExtractionRunStatus,
     ExtractionRunDocument,
+    MeetingArtifactDocument,
+    MeetingMemoryDocument,
     SpaceMemoryDocument,
     STTStatus,
     TranscriptChunkDocument,
@@ -204,6 +206,21 @@ class ConversationRepository:
         cursor = self.db.transcript_chunks.find({"conversationId": to_mongo_id(conversation_id)}).sort("sequenceNumber", 1)
         return [TranscriptChunkDocument.model_validate(doc) async for doc in cursor]
 
+    async def list_transcript_chunks_in_range(
+        self,
+        conversation_id: str,
+        sequence_start: int,
+        sequence_end: int,
+    ) -> list[TranscriptChunkDocument]:
+        cursor = self.db.transcript_chunks.find(
+            {
+                "conversationId": to_mongo_id(conversation_id),
+                "sequenceNumber": {"$gte": sequence_start, "$lte": sequence_end},
+                "sttStatus": STTStatus.COMPLETED.value,
+            }
+        ).sort("sequenceNumber", 1)
+        return [TranscriptChunkDocument.model_validate(doc) async for doc in cursor]
+
     async def list_completed_unwindowed_transcript_chunks(
         self,
         conversation_id: str,
@@ -335,6 +352,92 @@ class ConversationRepository:
         await self.db.conversation_windows.update_one(
             {"_id": to_mongo_id(window_id)},
             {"$set": {"queuedAt": utc_now(), "updatedAt": utc_now()}},
+        )
+
+    async def list_meeting_artifacts(self, conversation_id: str) -> list[MeetingArtifactDocument]:
+        cursor = self.db.meeting_artifacts.find({"conversationId": to_mongo_id(conversation_id)}).sort("createdAt", 1)
+        return [MeetingArtifactDocument.model_validate(doc) async for doc in cursor]
+
+    async def replace_meeting_artifacts(
+        self,
+        conversation_id: str,
+        artifacts: list[MeetingArtifactDocument],
+    ) -> None:
+        collection = self.db.meeting_artifacts
+        conversation_key = to_mongo_id(conversation_id)
+        await collection.delete_many({"conversationId": conversation_key})
+        if not artifacts:
+            return
+        docs = []
+        for artifact in artifacts:
+            artifact.updatedAt = utc_now()
+            doc = artifact.model_dump(by_alias=True)
+            doc["conversationId"] = conversation_key
+            doc["userId"] = to_mongo_id(artifact.userId)
+            doc["spaceId"] = to_mongo_id(artifact.spaceId)
+            if artifact.sourceWindowId is not None:
+                doc["sourceWindowId"] = to_mongo_id(artifact.sourceWindowId)
+            docs.append(doc)
+        await collection.insert_many(docs, ordered=False)
+
+    async def upsert_meeting_artifacts(self, artifacts: list[MeetingArtifactDocument]) -> None:
+        if not artifacts:
+            return
+        for artifact in artifacts:
+            artifact.updatedAt = utc_now()
+            doc = artifact.model_dump(by_alias=True)
+            artifact_id = doc.pop("_id", artifact.id)
+            doc["conversationId"] = to_mongo_id(artifact.conversationId)
+            doc["userId"] = to_mongo_id(artifact.userId)
+            doc["spaceId"] = to_mongo_id(artifact.spaceId)
+            if artifact.sourceWindowId is not None:
+                doc["sourceWindowId"] = to_mongo_id(artifact.sourceWindowId)
+            await self.db.meeting_artifacts.find_one_and_update(
+                {
+                    "conversationId": doc["conversationId"],
+                    "identityKey": artifact.identityKey,
+                },
+                {"$set": doc, "$setOnInsert": {"_id": to_mongo_id(artifact_id)}},
+                upsert=True,
+            )
+
+    async def get_meeting_memory(self, conversation_id: str) -> MeetingMemoryDocument | None:
+        data = await self.db.meeting_memory.find_one({"conversationId": to_mongo_id(conversation_id)})
+        return MeetingMemoryDocument.model_validate(data) if data else None
+
+    async def save_meeting_memory(self, memory: MeetingMemoryDocument) -> MeetingMemoryDocument:
+        memory.updatedAt = utc_now()
+        doc = memory.model_dump(by_alias=True)
+        doc["conversationId"] = to_mongo_id(memory.conversationId)
+        doc["userId"] = to_mongo_id(memory.userId)
+        doc["spaceId"] = to_mongo_id(memory.spaceId)
+        result = await self.db.meeting_memory.find_one_and_update(
+            {"conversationId": doc["conversationId"]},
+            {"$set": doc},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return MeetingMemoryDocument.model_validate(result)
+
+    async def append_meeting_debug_trace(
+        self,
+        conversation_id: str,
+        user_id: Any,
+        space_id: Any,
+        stage: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if not debug_traces_enabled():
+            return
+        await self.db.meeting_debug_traces.insert_one(
+            {
+                "conversationId": to_mongo_id(conversation_id),
+                "userId": to_mongo_id(user_id),
+                "spaceId": to_mongo_id(space_id),
+                "stage": stage,
+                "payload": payload,
+                "createdAt": utc_now(),
+            }
         )
 
     async def mark_transcripts_published(self, conversation_id: str) -> None:
@@ -776,6 +879,10 @@ class ConversationRepository:
             projection={"sequenceNumber": 1},
         )
         return int(doc["sequenceNumber"]) if doc else None
+
+
+def debug_traces_enabled() -> bool:
+    return bool(settings.ENABLE_TRANSCRIPT_DEBUG_LOGS or settings.APP_ENV in {"local", "development"})
 
 
 def to_mongo_id(value: Any) -> Any:

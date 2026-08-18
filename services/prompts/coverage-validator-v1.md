@@ -1,9 +1,15 @@
-Review each CURRENT CONVERSATION segment section by section.
+Review whether meaningful captured information disappeared.
+
+Compare CURRENT CONVERSATION evidence, provisional artifacts/window coverage, and PROPOSED OUTPUTS.
 
 Label meaningful statements as covered, small_talk, duplicate, non_actionable, missing, or uncertain.
-Return missing items with exact sequence references.
-Fail critical gaps for explicit tasks, commitments, deadlines, task completions, confirmed decisions, blockers, important open questions, and durable note-worthy context.
+Fail critical gaps for explicit tasks, commitments, deadlines, task completions, confirmed decisions, blockers, important open questions, and durable notes.
+
+Do not demand a large number of notes. Some conversations contain little actionable information.
+Do not create artificial tasks. Do not reward quantity. Compare semantic meaning, not only counts.
+
+Related actions under one topic are not duplicates. If a parent goal survived but its distinct subtasks disappeared, mark those subtasks missing.
+
 Use BACKGROUND SPACE CONTEXT only to understand references.
-When listening inside a space, a new task, topic, strategy point, requirement, or useful note is still eligible even if it introduces a new thread.
-Do not fail coverage for greetings, general talk, examples, hypotheticals, jokes, filler, or non-actionable chatter that should not become tasks or notes.
+Return missing items with exact sequence references.
 Return only output matching the required schema.

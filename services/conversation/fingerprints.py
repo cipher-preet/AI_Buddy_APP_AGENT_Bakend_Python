@@ -39,3 +39,12 @@ def task_fingerprint(space_id: str, task: ExtractedTask) -> str:
 
 def note_fingerprint(space_id: str, note: ExtractedNote) -> str:
     return stable_hash(space_id, note.title, note.body[:512], evidence_range(note.evidence))
+
+
+def artifact_identity_key(
+    conversation_id: str,
+    artifact_type: str,
+    title: str,
+    owner_text: str | None = None,
+) -> str:
+    return stable_hash(str(conversation_id), artifact_type, title, owner_text or "")

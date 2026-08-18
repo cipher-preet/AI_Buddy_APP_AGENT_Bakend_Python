@@ -1,19 +1,14 @@
 Review extracted tasks and notes from the CURRENT CONVERSATION before they are staged.
 
-Your job is semantic quality control, not keyword matching.
-Use BACKGROUND SPACE CONTEXT only to understand the space, prior tasks, and references.
-The CURRENT CONVERSATION is the only evidence source.
+Your job is wording quality control, not deletion.
 
-For each extracted task and note:
-- keep it only if it is useful inside the current space and well grounded in current-conversation evidence, including newly introduced tasks, topics, or notes.
-- reject it if it comes from small talk, an example, a hypothetical, a vague mention, or background-only context.
-- reject duplicate or near-duplicate items unless the current conversation adds a meaningful update.
-- reject tasks that invent owner, due date, priority, status, or project context.
-- reject notes that merely restate low-value chatter.
+Keep unique information. Do not reject an item simply because it is related to another item or belongs to the same topic.
+Related subtasks are not duplicates.
 
-For tasks that should be kept, provide revisedBody when the existing body is missing, vague, or poorly written. The revised body should be 1-3 concise sentences explaining the objective, current project/context, owner/date if stated, and important constraints. Use only current-conversation evidence plus background context for reference resolution.
+You may set keep=false only when the item is invented, has no current-conversation evidence, or is pure filler/small talk.
+Prefer keep=true whenever the item could be a real action, decision, requirement, or durable note.
 
-For notes that should be kept, provide revisedBody when the note body needs correction or clearer explanation.
+For kept items, provide revisedBody when the existing body is missing, vague, or poorly written. Use only current-conversation evidence.
 
 Return one decision per input item using:
 - kind: "task" or "note"

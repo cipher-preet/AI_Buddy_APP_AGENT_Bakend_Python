@@ -137,9 +137,19 @@ class Settings(BaseSettings):
     MAX_TRANSCRIPT_SEGMENTS: int = 80
     MAX_REPAIR_ROUNDS: int = 2
     ENABLE_INCREMENTAL_MEETING_PROCESSING: bool = True
-    INCREMENTAL_WINDOW_TARGET_TOKENS: int = Field(default=2200, ge=200, le=20000)
-    INCREMENTAL_WINDOW_OVERLAP_TOKENS: int = Field(default=180, ge=0, le=5000)
+    INCREMENTAL_WINDOW_TARGET_TOKENS: int = Field(default=1200, ge=200, le=20000)
+    INCREMENTAL_WINDOW_MAX_TOKENS: int = Field(default=1800, ge=200, le=40000)
+    INCREMENTAL_WINDOW_OVERLAP_TOKENS: int = Field(default=150, ge=0, le=5000)
+    INCREMENTAL_WINDOW_OVERLAP_RATIO: float = Field(default=0.12, ge=0, le=0.5)
     INCREMENTAL_WINDOW_MAX_DURATION_MS: int = Field(default=5 * 60 * 1000, ge=1000, le=60 * 60 * 1000)
+    MEETING_MEMORY_RETRIEVAL_LIMIT: int = Field(default=12, ge=1, le=50)
+    MEETING_MEMORY_GLOBAL_ITEM_LIMIT: int = Field(default=30, ge=5, le=100)
+    ARTIFACT_TITLE_JACCARD_DUPLICATE: float = Field(default=0.9, ge=0.5, le=1)
+    ARTIFACT_TITLE_JACCARD_UPDATE: float = Field(default=0.75, ge=0.4, le=1)
+    COVERAGE_COMPRESSION_RATIO_THRESHOLD: float = Field(default=0.75, ge=0.1, le=1)
+    COVERAGE_MIN_PROVISIONAL_FOR_GUARD: int = Field(default=8, ge=1, le=100)
+    COVERAGE_WEAK_WINDOW_MIN_TOKENS: int = Field(default=200, ge=20, le=5000)
+    SELECTIVE_RECOVERY_MAX_WINDOWS: int = Field(default=3, ge=0, le=20)
     FINAL_MODEL_INPUT_TOKEN_LIMIT: int = Field(default=24000, ge=1000, le=200000)
     FINAL_COMPRESSION_GROUP_TOKENS: int = Field(default=8000, ge=1000, le=50000)
 

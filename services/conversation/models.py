@@ -249,6 +249,9 @@ class ExtractedTask(BaseModel):
     fingerprint: str | None = None
     changes: dict[str, Any] = Field(default_factory=dict)
     evidence: list[EvidenceSpan]
+    artifactId: str | None = None
+    parentTitle: str | None = None
+    sourceWindowId: str | None = None
 
 
 class ExtractedNote(BaseModel):
@@ -258,6 +261,8 @@ class ExtractedNote(BaseModel):
     sourceConversationId: str
     fingerprint: str | None = None
     evidence: list[EvidenceSpan]
+    artifactId: str | None = None
+    sourceWindowId: str | None = None
 
 
 class ExtractedDecision(BaseModel):
@@ -266,6 +271,10 @@ class ExtractedDecision(BaseModel):
     confidence: float = Field(ge=0, le=1)
     sourceConversationId: str
     evidence: list[EvidenceSpan]
+    artifactId: str | None = None
+    sourceWindowId: str | None = None
+    superseded: bool = False
+    reason: str | None = None
 
 
 class ExtractedIssue(BaseModel):
@@ -274,6 +283,8 @@ class ExtractedIssue(BaseModel):
     confidence: float = Field(ge=0, le=1)
     sourceConversationId: str
     evidence: list[EvidenceSpan]
+    artifactId: str | None = None
+    sourceWindowId: str | None = None
 
 
 class Segment(BaseModel):
@@ -414,6 +425,137 @@ class SpaceMemoryDocument(BaseModel):
     recentConversationSummaryIds: list[Any] = Field(default_factory=list)
     lastUpdatedConversationId: Any | None = None
     version: int = 1
+    updatedAt: datetime = Field(default_factory=utc_now)
+
+    class Config:
+        populate_by_name = True
+
+
+class ArtifactType(str, Enum):
+    TASK = "task"
+    NOTE = "note"
+    DECISION = "decision"
+    COMMITMENT = "commitment"
+    DEADLINE = "deadline"
+    FOLLOW_UP = "follow_up"
+    QUESTION = "question"
+    ANSWER = "answer"
+    IDEA = "idea"
+    RISK = "risk"
+    BLOCKER = "blocker"
+    REQUIREMENT = "requirement"
+    FACT = "fact"
+    PREFERENCE = "preference"
+    REFERENCE = "reference"
+
+
+class ArtifactLifecycleStatus(str, Enum):
+    PROVISIONAL = "provisional"
+    ACTIVE = "active"
+    CONFIRMED = "confirmed"
+    SUPERSEDED = "superseded"
+    COMPLETED = "completed"
+    REJECTED = "rejected"
+    MERGED = "merged"
+
+
+class ArtifactResolutionKind(str, Enum):
+    NEW = "NEW"
+    UPDATE = "UPDATE"
+    DUPLICATE = "DUPLICATE"
+    RELATED = "RELATED"
+    CONTRADICTION = "CONTRADICTION"
+    COMPLETION = "COMPLETION"
+
+
+class ArtifactHistoryEntry(BaseModel):
+    at: datetime = Field(default_factory=utc_now)
+    sourceWindowId: str | None = None
+    resolution: ArtifactResolutionKind = ArtifactResolutionKind.UPDATE
+    change: str = ""
+    previousContent: str | None = None
+
+
+class MeetingArtifactDocument(BaseModel):
+    id: Any = Field(default_factory=new_id, alias="_id")
+    conversationId: Any
+    userId: Any
+    spaceId: Any
+    identityKey: str
+    artifactType: ArtifactType
+    title: str
+    content: str = ""
+    ownerText: str | None = None
+    ownerUserId: str | None = None
+    dueDateText: str | None = None
+    dueDateResolved: str | None = None
+    dueDateStatus: Literal["resolved", "ambiguous", "none"] = "none"
+    topic: str | None = None
+    parentArtifactId: str | None = None
+    relatedArtifactIds: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    status: ArtifactLifecycleStatus = ArtifactLifecycleStatus.PROVISIONAL
+    resolution: ArtifactResolutionKind = ArtifactResolutionKind.NEW
+    sourceWindowId: Any | None = None
+    sourceWindowIds: list[str] = Field(default_factory=list)
+    sourceChunkIds: list[int] = Field(default_factory=list)
+    sourceStartIndex: int | None = None
+    sourceEndIndex: int | None = None
+    evidence: list[EvidenceSpan] = Field(default_factory=list)
+    supersededBy: str | None = None
+    supersedes: str | None = None
+    reason: str | None = None
+    history: list[ArtifactHistoryEntry] = Field(default_factory=list)
+    fingerprint: str | None = None
+    needsConfirmation: bool = False
+    operation: Operation | None = None
+    existingTaskId: str | None = None
+    createdAt: datetime = Field(default_factory=utc_now)
+    updatedAt: datetime = Field(default_factory=utc_now)
+
+    class Config:
+        populate_by_name = True
+
+
+class MeetingMemoryItem(BaseModel):
+    artifactId: str
+    artifactType: str
+    title: str
+    status: str = ArtifactLifecycleStatus.PROVISIONAL.value
+    ownerText: str | None = None
+    dueDateText: str | None = None
+    topic: str | None = None
+    contentPreview: str = ""
+
+
+class TopicMemory(BaseModel):
+    topicId: str
+    label: str
+    windowIndexes: list[int] = Field(default_factory=list)
+    lastSequence: int | None = None
+    artifactCount: int = 0
+
+
+class MeetingMemoryDocument(BaseModel):
+    id: Any = Field(default_factory=new_id, alias="_id")
+    conversationId: Any
+    userId: Any
+    spaceId: Any
+    version: int = 1
+    shortSummary: str = ""
+    activeTopics: list[TopicMemory] = Field(default_factory=list)
+    knownTasks: list[MeetingMemoryItem] = Field(default_factory=list)
+    knownNotes: list[MeetingMemoryItem] = Field(default_factory=list)
+    decisions: list[MeetingMemoryItem] = Field(default_factory=list)
+    requirements: list[MeetingMemoryItem] = Field(default_factory=list)
+    commitments: list[MeetingMemoryItem] = Field(default_factory=list)
+    openQuestions: list[MeetingMemoryItem] = Field(default_factory=list)
+    deadlines: list[MeetingMemoryItem] = Field(default_factory=list)
+    blockers: list[MeetingMemoryItem] = Field(default_factory=list)
+    importantFacts: list[MeetingMemoryItem] = Field(default_factory=list)
+    unresolvedReferences: list[str] = Field(default_factory=list)
+    artifactCount: int = 0
+    windowCount: int = 0
     updatedAt: datetime = Field(default_factory=utc_now)
 
     class Config:

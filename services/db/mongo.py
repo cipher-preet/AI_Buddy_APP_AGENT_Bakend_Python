@@ -84,6 +84,26 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
             IndexModel([("status", ASCENDING), ("updatedAt", ASCENDING)]),
         ]
     )
+    await database.meeting_artifacts.create_indexes(
+        [
+            IndexModel([("conversationId", ASCENDING), ("identityKey", ASCENDING)], unique=True),
+            IndexModel([("conversationId", ASCENDING), ("artifactType", ASCENDING), ("status", ASCENDING)]),
+            IndexModel([("conversationId", ASCENDING), ("sourceWindowId", ASCENDING)]),
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("updatedAt", DESCENDING)]),
+        ]
+    )
+    await database.meeting_memory.create_indexes(
+        [
+            IndexModel([("conversationId", ASCENDING)], unique=True),
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("updatedAt", DESCENDING)]),
+        ]
+    )
+    await database.meeting_debug_traces.create_indexes(
+        [
+            IndexModel([("conversationId", ASCENDING), ("createdAt", ASCENDING)]),
+            IndexModel([("stage", ASCENDING), ("createdAt", DESCENDING)]),
+        ]
+    )
     await database.conversation_windows.create_indexes(
         [
             IndexModel(

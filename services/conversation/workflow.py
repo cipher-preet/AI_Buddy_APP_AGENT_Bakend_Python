@@ -7,7 +7,7 @@ from apps.api_gateway.config.setting import settings
 from services.conversation import agents
 from services.conversation.context import load_space_context
 from services.conversation.fingerprints import note_fingerprint, task_fingerprint
-from services.conversation.incremental import compact_window_payload
+from services.conversation.incremental import IncrementalMeetingProcessor
 from services.conversation.models import ConversationStatus, ConversationSummaryDocument, ExtractionRunStatus, WindowProcessingStatus
 from services.conversation.repository import ConversationRepository
 from services.conversation.safety import detect_rule_signals
@@ -183,19 +183,59 @@ class ConversationProcessingWorkflow:
 
     async def _run_incremental_finalization(self, conversation, run, windows, context: dict | None = None) -> None:
         started = utc_ms()
+        conversation_id = str(conversation.id)
         context = context or await load_space_context(self.repository, conversation.userId, conversation.spaceId)
         ordered_windows = sorted(windows, key=lambda window: (window.sequenceStart, window.windowIndex))
-        compacted = [_dedupe_window_payload(compact_window_payload(window)) for window in ordered_windows]
-        final_payload = _fit_payload_to_token_limit(compacted, settings.FINAL_MODEL_INPUT_TOKEN_LIMIT)
-        result, provider, model = await agents.finalize_from_window_results(
+        artifacts = await self.repository.list_meeting_artifacts(conversation_id)
+        if not artifacts:
+            from services.conversation.artifact_resolver import resolve_incoming_artifacts
+            from services.conversation.artifacts import artifacts_from_windows
+
+            incoming = artifacts_from_windows(ordered_windows)
+            artifacts = resolve_incoming_artifacts([], incoming)
+            await self.repository.upsert_meeting_artifacts(artifacts)
+            artifacts = await self.repository.list_meeting_artifacts(conversation_id)
+
+        from services.conversation.coverage import evaluate_coverage, preserve_unrepresented
+        from services.conversation.incremental import compact_artifact_payload, compact_window_summary
+        from services.conversation.meeting_memory import build_meeting_memory
+
+        memory = await self.repository.get_meeting_memory(conversation_id)
+        if memory is None:
+            memory = build_meeting_memory(
+                conversation_id,
+                conversation.userId,
+                conversation.spaceId,
+                artifacts,
+                ordered_windows,
+                None,
+            )
+            await self.repository.save_meeting_memory(memory)
+
+        artifact_payload = compact_artifact_payload(artifacts)
+        window_summaries = [compact_window_summary(window) for window in ordered_windows]
+        result, provider, model = await agents.reconcile_meeting(
             self.router,
-            str(conversation.id),
+            conversation_id,
             str(conversation.userId),
             str(conversation.spaceId),
-            final_payload,
+            artifact_payload,
+            window_summaries,
+            memory.model_dump(),
             context,
             conversation.processingVersion,
         )
+        llm_coverage = evaluate_coverage(ordered_windows, artifacts, result)
+        recovery_triggered = False
+        if llm_coverage.suspicious and llm_coverage.weakWindowIndexes:
+            processor = IncrementalMeetingProcessor(self.repository, router=self.router)
+            recovered = await processor.recover_windows(conversation_id, llm_coverage.weakWindowIndexes)
+            recovery_triggered = recovered > 0
+            if recovered:
+                artifacts = await self.repository.list_meeting_artifacts(conversation_id)
+        result = preserve_unrepresented(result, artifacts, conversation_id, str(conversation.spaceId))
+        coverage = evaluate_coverage(ordered_windows, artifacts, result)
+
         run.provider = provider
         run.model = model
         run.processedSegmentCount = len(ordered_windows)
@@ -204,22 +244,44 @@ class ConversationProcessingWorkflow:
         run.stagedNotes = result.notes
         run.stagedDecisions = result.decisions
         run.stagedIssues = result.issues
-        run.coverageScore = None
-        run.validationErrors = []
-        run.warningCount = 0
+        run.coverageScore = coverage.coverageScore
+        run.validationErrors = [{"code": reason} for reason in coverage.reasons] if coverage.suspicious else []
+        run.warningCount = len(coverage.unrepresentedTitles)
         run.checkpoints["incremental_window_finalization"] = {
             "windowCount": len(ordered_windows),
-            "inputTokenEstimate": estimate_tokens(str(final_payload)),
+            "inputTokenEstimate": estimate_tokens(str(artifact_payload)),
             "durationMs": utc_ms() - started,
+            "provisionalArtifactCount": coverage.meaningfulArtifactCount,
+            "finalArtifactCount": coverage.finalArtifactCount,
+            "llmCompressionRatio": llm_coverage.compressionRatio,
+            "compressionRatio": coverage.compressionRatio,
+            "coverageScore": coverage.coverageScore,
+            "llmCoverageScore": llm_coverage.coverageScore,
+            "recoveryTriggered": recovery_triggered,
+            "weakWindowIndexes": llm_coverage.weakWindowIndexes or coverage.weakWindowIndexes,
+            "taskCount": len(result.tasks),
+            "noteCount": len(result.notes),
+            "decisionCount": len(result.decisions),
+            "issueCount": len(result.issues),
+            "provider": provider,
+            "model": model,
         }
+        print("Meeting reconciliation completed:", run.checkpoints["incremental_window_finalization"])
+        await self.repository.append_meeting_debug_trace(
+            conversation_id,
+            conversation.userId,
+            conversation.spaceId,
+            "reconciliation",
+            run.checkpoints["incremental_window_finalization"],
+        )
         await self.repository.save_extraction_run(run)
-        await self.repository.transition(str(conversation.id), ConversationStatus.VALIDATING)
+        await self.repository.transition(conversation_id, ConversationStatus.VALIDATING)
         summary = ConversationSummaryDocument(
             conversationId=conversation.id,
             userId=conversation.userId,
             spaceId=conversation.spaceId,
             summary=result.summary,
-            topics=result.topics,
+            topics=result.topics or [topic.label for topic in memory.activeTopics],
             importantFacts=result.importantFacts,
             decisions=[decision.title for decision in result.decisions],
             openQuestions=result.openQuestions,
@@ -230,13 +292,16 @@ class ConversationProcessingWorkflow:
             promptVersion="meeting-finalizer-v1",
         )
         previous_memory = await self.repository.get_space_memory(conversation.userId, conversation.spaceId)
-        memory = await agents.update_space_memory(self.router, previous_memory, summary)
-        await self.repository.publish_outputs(run, summary, memory)
-        await self.repository.mark_transcripts_published(str(conversation.id))
-        await self.repository.schedule_transcript_expiry(str(conversation.id))
+        memory_update = await agents.update_space_memory(self.router, previous_memory, summary)
+        await self.repository.publish_outputs(run, summary, memory_update)
+        await self.repository.mark_transcripts_published(conversation_id)
+        await self.repository.schedule_transcript_expiry(conversation_id)
         run.status = ExtractionRunStatus.PUBLISHED
         await self.repository.save_extraction_run(run)
-        await self.repository.transition(str(conversation.id), ConversationStatus.COMPLETED)
+        terminal = ConversationStatus.COMPLETED
+        if not result.tasks and not result.notes and coverage.meaningfulArtifactCount:
+            terminal = ConversationStatus.PARTIAL
+        await self.repository.transition(conversation_id, terminal)
 
     def _merge(self, state: ConversationGraphState) -> None:
         seen_tasks: set[str] = set()
@@ -340,8 +405,7 @@ class ConversationProcessingWorkflow:
                 task.body = _clean_text(decision.revisedBody)
                 task.fingerprint = task_fingerprint(state.space_id, task)
             if decision and not decision.keep:
-                state.warnings.append(f"DROPPED_TASK_BY_LLM_REVIEW: {task.title} ({decision.reason})")
-                continue
+                state.warnings.append(f"REVIEW_FLAGGED_TASK_KEPT: {task.title} ({decision.reason})")
             kept_tasks.append(task)
         kept_notes = []
         for index, note in enumerate(state.merged_notes):
@@ -350,8 +414,7 @@ class ConversationProcessingWorkflow:
                 note.body = _clean_text(decision.revisedBody)
                 note.fingerprint = note_fingerprint(state.space_id, note)
             if decision and not decision.keep:
-                state.warnings.append(f"DROPPED_NOTE_BY_LLM_REVIEW: {note.title} ({decision.reason})")
-                continue
+                state.warnings.append(f"REVIEW_FLAGGED_NOTE_KEPT: {note.title} ({decision.reason})")
             kept_notes.append(note)
         state.merged_tasks = kept_tasks
         state.merged_notes = kept_notes
