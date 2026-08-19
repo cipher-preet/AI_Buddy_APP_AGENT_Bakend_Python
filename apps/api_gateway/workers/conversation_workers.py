@@ -97,11 +97,19 @@ async def handle_stt_event(event: EventEnvelope) -> None:
                 "contentType": content_type,
             },
         )
-        result = await transcribe_from_path_with_fallback(
-            file_path=file_path,
-            filename=filename,
-            content_type=content_type,
-        )
+        stt_kwargs = {
+            "file_path": file_path,
+            "filename": filename,
+            "content_type": content_type,
+        }
+        keyterm_context = {}
+        for field in ("keyterms", "keyterm", "space_keyterms", "terminology", "terms"):
+            value = payload.get(field)
+            if value and not isinstance(value, (bool, dict)):
+                keyterm_context[field] = value
+        if keyterm_context:
+            stt_kwargs["context"] = keyterm_context
+        result = await transcribe_from_path_with_fallback(**stt_kwargs)
         print(
             "Conversation chunk STT provider selected:",
             {
@@ -112,6 +120,7 @@ async def handle_stt_event(event: EventEnvelope) -> None:
                 "model": result.get("model"),
                 "languageCode": result.get("language_code"),
                 "isEmptyTranscript": result.get("is_empty_transcript"),
+                "isUncertainTranscript": result.get("is_uncertain_transcript"),
             },
         )
         await repository.complete_transcript_chunk(

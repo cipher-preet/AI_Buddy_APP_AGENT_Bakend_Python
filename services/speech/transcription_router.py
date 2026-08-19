@@ -21,6 +21,8 @@ async def transcribe_from_path_with_fallback(
     file_path: str,
     filename: str,
     content_type: str,
+    keyterms: list[str] | None = None,
+    context: dict | None = None,
 ) -> dict:
     attempts: list[dict] = []
     last_error: Exception | None = None
@@ -65,11 +67,17 @@ async def transcribe_from_path_with_fallback(
                         "max_attempts": _max_attempts(),
                     },
                 )
-                result = await transcriber(
-                    file_path=file_path,
-                    filename=filename,
-                    content_type=content_type,
-                )
+                transcribe_kwargs: dict = {
+                    "file_path": file_path,
+                    "filename": filename,
+                    "content_type": content_type,
+                }
+                if provider_name == "deepgram":
+                    if keyterms:
+                        transcribe_kwargs["keyterms"] = keyterms
+                    if context:
+                        transcribe_kwargs["context"] = context
+                result = await transcriber(**transcribe_kwargs)
                 result = _clean_result(result)
                 result["provider"] = str(result.get("provider") or provider_name)
                 result["fallback_attempts"] = attempts

@@ -57,11 +57,15 @@ async def _process_local_speech_job(job: dict) -> None:
                 "filename": job.get("filename"),
             },
         )
-        result = await transcribe_from_path_with_fallback(
-            file_path=job["file_path"],
-            filename=job["filename"],
-            content_type=job["content_type"],
-        )
+        stt_kwargs = {
+            "file_path": job["file_path"],
+            "filename": job["filename"],
+            "content_type": job["content_type"],
+        }
+        keyterms = _job_keyterms(job)
+        if keyterms:
+            stt_kwargs["keyterms"] = keyterms
+        result = await transcribe_from_path_with_fallback(**stt_kwargs)
         print(
             "Speech job STT provider selected:",
             {
@@ -70,6 +74,7 @@ async def _process_local_speech_job(job: dict) -> None:
                 "model": result.get("model"),
                 "language_code": result.get("language_code"),
                 "is_empty_transcript": result.get("is_empty_transcript"),
+                "is_uncertain_transcript": result.get("is_uncertain_transcript"),
             },
         )
 
@@ -197,6 +202,29 @@ def _normalize_speech_job(job: dict) -> dict:
         if normalized.get(field) is not None:
             normalized[field] = str(normalized[field]).strip()
     return normalized
+
+
+def _job_keyterms(job: dict) -> list[str] | None:
+    values: list[str] = []
+    for field in ("keyterms", "keyterm", "space_keyterms", "terminology", "terms"):
+        values.extend(_coerce_keyterm_values(job.get(field)))
+    return values or None
+
+
+def _coerce_keyterm_values(value) -> list[str]:
+    if value is None or isinstance(value, (bool, dict)):
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, (list, tuple, set)):
+        return [
+            str(item).strip()
+            for item in value
+            if item is not None and not isinstance(item, (bool, dict)) and str(item).strip()
+        ]
+    stripped = str(value).strip()
+    return [stripped] if stripped else []
 
 
 def _validate_local_job(job: dict) -> None:
