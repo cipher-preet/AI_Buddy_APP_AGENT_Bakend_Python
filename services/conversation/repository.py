@@ -23,6 +23,7 @@ from services.conversation.models import (
     SpaceMemoryDocument,
     STTStatus,
     TranscriptChunkDocument,
+    TranscriptExclusionReason,
     TranscriptProcessingStatus,
     WindowExtractionResult,
     WindowProcessingStatus,
@@ -88,7 +89,11 @@ class ConversationRepository:
                 **_id_query(metadata.conversationId),
                 "userId": doc["userId"],
                 "spaceId": doc["spaceId"],
-                "status": {"$in": [ConversationStatus.RECORDING.value, ConversationStatus.STOP_REQUESTED.value]},
+                "status": {"$in": [
+                    ConversationStatus.RECORDING.value,
+                    ConversationStatus.STOP_REQUESTED.value,
+                    ConversationStatus.WAITING_FOR_TRANSCRIPTS.value,
+                ]},
             },
             {"$set": update, **({"$inc": inc} if inc else {})},
         )
@@ -236,6 +241,128 @@ class ConversationRepository:
         cursor = self.db.transcript_chunks.find(query).sort("sequenceNumber", 1)
         return [TranscriptChunkDocument.model_validate(doc) async for doc in cursor]
 
+    async def count_unwindowed_non_empty_transcripts(
+        self,
+        conversation_id: str,
+        through_sequence: int | None = None,
+    ) -> int:
+        chunks = await self.list_completed_unwindowed_transcript_chunks(conversation_id, through_sequence)
+        return sum(1 for chunk in chunks if _is_useful_transcript(chunk) and not chunk.exclusionReason)
+
+    async def list_unwindowed_non_empty_transcript_chunks(
+        self,
+        conversation_id: str,
+        through_sequence: int | None = None,
+    ) -> list[TranscriptChunkDocument]:
+        chunks = await self.list_completed_unwindowed_transcript_chunks(conversation_id, through_sequence)
+        return [chunk for chunk in chunks if _is_useful_transcript(chunk) and not chunk.exclusionReason]
+
+    async def mark_transcripts_excluded(
+        self,
+        conversation_id: str,
+        sequence_numbers: list[int],
+        reason: str | TranscriptExclusionReason,
+    ) -> None:
+        if not sequence_numbers:
+            return
+        now = utc_now()
+        exclusion = reason.value if isinstance(reason, TranscriptExclusionReason) else str(reason)
+        await self.db.transcript_chunks.update_many(
+            {
+                "conversationId": to_mongo_id(conversation_id),
+                "sequenceNumber": {"$in": sequence_numbers},
+                "processingStatus": TranscriptProcessingStatus.UNPROCESSED.value,
+            },
+            {
+                "$set": {
+                    "processingStatus": TranscriptProcessingStatus.PROCESSED.value,
+                    "exclusionReason": exclusion,
+                    "processedAt": now,
+                    "updatedAt": now,
+                }
+            },
+        )
+
+    async def count_meeting_artifacts_for_window(self, conversation_id: str, window_id: Any) -> int:
+        return int(
+            await self.db.meeting_artifacts.count_documents(
+                {
+                    "conversationId": to_mongo_id(conversation_id),
+                    "$or": [
+                        {"sourceWindowId": to_mongo_id(window_id)},
+                        {"sourceWindowIds": str(window_id)},
+                    ],
+                }
+            )
+        )
+
+    async def reclaim_stale_processing_windows(
+        self,
+        conversation_id: str,
+        stale_before: datetime,
+    ) -> list[ConversationWindowDocument]:
+        reclaimed: list[ConversationWindowDocument] = []
+        cursor = self.db.conversation_windows.find(
+            {
+                "conversationId": to_mongo_id(conversation_id),
+                "status": WindowProcessingStatus.PROCESSING.value,
+                "updatedAt": {"$lte": stale_before},
+            }
+        )
+        async for doc in cursor:
+            result = await self.db.conversation_windows.find_one_and_update(
+                {
+                    "_id": doc["_id"],
+                    "status": WindowProcessingStatus.PROCESSING.value,
+                    "updatedAt": {"$lte": stale_before},
+                },
+                {
+                    "$set": {
+                        "status": WindowProcessingStatus.PENDING.value,
+                        "queuedAt": None,
+                        "lastError": "stale processing reclaimed",
+                        "updatedAt": utc_now(),
+                    }
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+            if result:
+                reclaimed.append(ConversationWindowDocument.model_validate(result))
+        return reclaimed
+
+    async def reclaim_stale_stt_chunks(
+        self,
+        conversation_id: str,
+        stale_before: datetime,
+    ) -> list[TranscriptChunkDocument]:
+        reclaimed: list[TranscriptChunkDocument] = []
+        cursor = self.db.transcript_chunks.find(
+            {
+                "conversationId": to_mongo_id(conversation_id),
+                "sttStatus": STTStatus.PROCESSING.value,
+                "updatedAt": {"$lte": stale_before},
+            }
+        )
+        async for doc in cursor:
+            result = await self.db.transcript_chunks.find_one_and_update(
+                {
+                    "_id": doc["_id"],
+                    "sttStatus": STTStatus.PROCESSING.value,
+                    "updatedAt": {"$lte": stale_before},
+                },
+                {
+                    "$set": {
+                        "sttStatus": STTStatus.PENDING.value,
+                        "lastError": "stale STT processing reclaimed",
+                        "updatedAt": utc_now(),
+                    }
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+            if result:
+                reclaimed.append(TranscriptChunkDocument.model_validate(result))
+        return reclaimed
+
     async def next_window_index(self, conversation_id: str) -> int:
         doc = await self.db.conversation_windows.find_one(
             {"conversationId": to_mongo_id(conversation_id)},
@@ -248,6 +375,7 @@ class ConversationRepository:
         self,
         window: ConversationWindowDocument,
         sequence_numbers: list[int],
+        skipped_sequence_numbers: list[int] | None = None,
     ) -> ConversationWindowDocument:
         now = utc_now()
         doc = window.model_dump(by_alias=True)
@@ -283,6 +411,12 @@ class ConversationRepository:
                         "updatedAt": now,
                     }
                 },
+            )
+        if skipped_sequence_numbers:
+            await self.mark_transcripts_excluded(
+                str(window.conversationId),
+                skipped_sequence_numbers,
+                TranscriptExclusionReason.EMPTY_TRANSCRIPT,
             )
         return saved
 
@@ -320,6 +454,8 @@ class ConversationRepository:
         provider: str,
         model: str,
         token_usage: dict[str, int] | None = None,
+        artifact_count: int = 0,
+        artifact_persistence_ok: bool = True,
     ) -> None:
         await self.db.conversation_windows.update_one(
             {"_id": to_mongo_id(window_id)},
@@ -330,6 +466,8 @@ class ConversationRepository:
                     "provider": provider,
                     "model": model,
                     "tokenUsage": token_usage or {},
+                    "artifactCount": artifact_count,
+                    "artifactPersistenceOk": artifact_persistence_ok,
                     "completedAt": utc_now(),
                     "updatedAt": utc_now(),
                 }
@@ -864,7 +1002,14 @@ class ConversationRepository:
     async def find_stale_unfinalized_conversations(self, before: datetime, limit: int = 100) -> list[ConversationDocument]:
         cursor = self.db.conversations.find(
             {
-                "status": {"$in": [ConversationStatus.STOP_REQUESTED.value, ConversationStatus.WAITING_FOR_TRANSCRIPTS.value]},
+                "status": {
+                    "$in": [
+                        ConversationStatus.STOP_REQUESTED.value,
+                        ConversationStatus.WAITING_FOR_TRANSCRIPTS.value,
+                        ConversationStatus.FINALIZING.value,
+                        ConversationStatus.READY_FOR_PROCESSING.value,
+                    ]
+                },
                 "expectedLastSequence": {"$ne": None},
                 "updatedAt": {"$lte": before},
                 "receivedAudioChunkCount": {"$gt": 0},
@@ -883,6 +1028,10 @@ class ConversationRepository:
 
 def debug_traces_enabled() -> bool:
     return bool(settings.ENABLE_TRANSCRIPT_DEBUG_LOGS or settings.APP_ENV in {"local", "development"})
+
+
+def _is_useful_transcript(chunk: TranscriptChunkDocument) -> bool:
+    return bool((chunk.normalizedText or chunk.rawText or "").strip())
 
 
 def to_mongo_id(value: Any) -> Any:

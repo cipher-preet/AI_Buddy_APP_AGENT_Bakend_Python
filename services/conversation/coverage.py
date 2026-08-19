@@ -93,10 +93,10 @@ def preserve_unrepresented(
     from services.conversation.artifacts import artifacts_to_extraction_result
 
     carried = artifacts_to_extraction_result(artifacts, conversation_id, space_id, summary=final_result.summary, topics=final_result.topics)
-    final_result.tasks = _union_by_title(final_result.tasks, carried.tasks)
-    final_result.notes = _union_by_title(final_result.notes, carried.notes)
-    final_result.decisions = _union_by_title(final_result.decisions, carried.decisions)
-    final_result.issues = _union_by_title(final_result.issues, carried.issues)
+    final_result.tasks = _union_by_title(final_result.tasks, carried.tasks, strict=True)
+    final_result.notes = _union_by_title(final_result.notes, carried.notes, strict=True)
+    final_result.decisions = _union_by_title(final_result.decisions, carried.decisions, strict=True)
+    final_result.issues = _union_by_title(final_result.issues, carried.issues, strict=True)
     final_result.importantFacts = _union_strings(final_result.importantFacts, carried.importantFacts)
     final_result.openQuestions = _union_strings(final_result.openQuestions, carried.openQuestions)
     if not final_result.topics:
@@ -138,7 +138,7 @@ def _weak_window_indexes(
             artifact_windows.add(str(artifact.sourceWindowId))
     weak: list[int] = []
     for window in windows:
-        if window.tokenCount < settings.COVERAGE_WEAK_WINDOW_MIN_TOKENS:
+        if not _window_is_meaningful(window):
             continue
         window_id = str(window.id)
         represented = window_id in artifact_windows
@@ -157,6 +157,17 @@ def _weak_window_indexes(
     return weak
 
 
+def _window_is_meaningful(window: ConversationWindowDocument) -> bool:
+    if getattr(window, "nonEmptyChunkCount", 0):
+        return True
+    text = (window.text or "").strip()
+    if not text:
+        return False
+    if not settings.COVERAGE_SPARSE_WINDOW_ENABLED and window.tokenCount < settings.COVERAGE_WEAK_WINDOW_MIN_TOKENS:
+        return False
+    return True
+
+
 def _topic_counts(windows: list[ConversationWindowDocument], artifacts: list[MeetingArtifactDocument]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for window in windows:
@@ -170,12 +181,12 @@ def _topic_counts(windows: list[ConversationWindowDocument], artifacts: list[Mee
     return counts
 
 
-def _union_by_title(primary: list, extra: list) -> list:
+def _union_by_title(primary: list, extra: list, strict: bool = False) -> list:
     titles = [getattr(item, "title", "") for item in primary]
     merged = list(primary)
     for item in extra:
         title = getattr(item, "title", "")
-        if item_is_represented(title, titles):
+        if item_is_represented(title, titles, strict=strict):
             continue
         merged.append(item)
         titles.append(title)

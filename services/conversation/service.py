@@ -9,7 +9,7 @@ import aiofiles
 from fastapi import UploadFile
 
 from apps.api_gateway.config.setting import settings
-from services.conversation.models import AudioChunkMetadata, ConversationStatus, utc_now
+from services.conversation.models import AudioChunkMetadata, ConversationStatus, as_utc, utc_now
 from services.conversation.repository import ConversationRepository, same_mongo_id
 from services.db.mongo import get_database
 from services.queue.streams import EventEnvelope, RedisStreamProducer
@@ -60,8 +60,9 @@ class ConversationService:
             raise ValueError("Conversation not found")
         if not same_mongo_id(conversation.userId, user_id) or not same_mongo_id(conversation.spaceId, space_id):
             raise PermissionError("Conversation does not belong to this user and space")
-        if conversation.status not in {ConversationStatus.RECORDING, ConversationStatus.STOP_REQUESTED}:
+        if conversation.status not in {ConversationStatus.RECORDING, ConversationStatus.STOP_REQUESTED, ConversationStatus.WAITING_FOR_TRANSCRIPTS}:
             raise ValueError(f"Conversation is not accepting audio: {conversation.status.value}")
+        _reject_closed_sequence(conversation, sequence_number)
         _validate_stt_chunk_duration(duration_ms)
 
         conversation_dir = UPLOAD_DIR / conversation_id
@@ -117,6 +118,7 @@ class ConversationService:
         chunk_id: str | None = None,
     ) -> dict:
         conversation = await self._get_owned_open_conversation(conversation_id, user_id, space_id)
+        _reject_closed_sequence(conversation, sequence_number)
         content_type, extension = validate_allowed_audio_upload(
             content_type=content_type,
             extension=extension,
@@ -164,6 +166,7 @@ class ConversationService:
         duration_ms: int | None = None,
     ) -> dict:
         conversation = await self._get_owned_open_conversation(conversation_id, user_id, space_id)
+        _reject_closed_sequence(conversation, sequence_number)
         _validate_stt_chunk_duration(duration_ms)
         content_type, extension = validate_allowed_audio_upload(
             content_type=content_type,
@@ -285,13 +288,14 @@ class ConversationService:
             userId=user_id,
             spaceId=space_id,
             conversationId=conversation_id,
-            payload={"expectedLastSequence": last_sequence_number},
+            payload={"expectedLastSequence": last_sequence_number, "inputClosed": True},
         )
         await self.producer.publish(settings.REDIS_FINALIZATION_STREAM, event)
         return {
             "conversationId": str(stopped.id),
             "status": stopped.status.value,
             "accepted": True,
+            "draining": True,
         }
 
     async def status(self, conversation_id: str, user_id: str, space_id: str) -> dict:
@@ -330,9 +334,20 @@ class ConversationService:
             raise ValueError("Conversation not found")
         if not same_mongo_id(conversation.userId, user_id) or not same_mongo_id(conversation.spaceId, space_id):
             raise PermissionError("Conversation does not belong to this user and space")
-        if conversation.status not in {ConversationStatus.RECORDING, ConversationStatus.STOP_REQUESTED}:
+        if conversation.status not in {
+            ConversationStatus.RECORDING,
+            ConversationStatus.STOP_REQUESTED,
+            ConversationStatus.WAITING_FOR_TRANSCRIPTS,
+        }:
             raise ValueError(f"Conversation is not accepting audio: {conversation.status.value}")
         return conversation
+
+
+def _reject_closed_sequence(conversation, sequence_number: int) -> None:
+    if conversation.status == ConversationStatus.RECORDING:
+        return
+    if conversation.expectedLastSequence is not None and sequence_number > conversation.expectedLastSequence:
+        raise ValueError("Conversation input is closed for sequences after stop")
 
 
 def _serialize_conversation(data: dict) -> dict:
@@ -346,7 +361,10 @@ def _is_stale_processing(conversation) -> bool:
     if conversation.status != ConversationStatus.PROCESSING:
         return False
     timeout = timedelta(seconds=settings.CONVERSATION_PROCESSING_TIMEOUT_SECONDS)
-    return utc_now() - conversation.updatedAt > timeout
+    updated_at = as_utc(conversation.updatedAt)
+    if updated_at is None:
+        return True
+    return utc_now() - updated_at > timeout
 
 
 def _stable_job_id(conversation_id: str, sequence_number: int, chunk_id: str) -> str:

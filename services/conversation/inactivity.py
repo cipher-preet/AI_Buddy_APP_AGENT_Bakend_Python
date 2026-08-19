@@ -51,19 +51,36 @@ class ConversationInactivityScanner:
         stale_conversations = await self.repository.find_stale_unfinalized_conversations(stale_cutoff)
         for conversation in stale_conversations:
             conversation_id = str(conversation.id)
-            await self.producer.publish(
-                settings.REDIS_FINALIZATION_STREAM,
-                EventEnvelope(
-                    eventType="conversation.finalization.requested",
-                    correlationId=conversation_id,
-                    userId=str(conversation.userId),
-                    spaceId=str(conversation.spaceId),
-                    conversationId=conversation_id,
-                    payload={
-                        "expectedLastSequence": conversation.expectedLastSequence,
-                        "source": "stale-finalization-recovery",
-                    },
-                ),
-            )
+            if conversation.status == ConversationStatus.READY_FOR_PROCESSING:
+                await self.producer.publish(
+                    settings.REDIS_PROCESSING_STREAM,
+                    EventEnvelope(
+                        eventType="conversation.processing.requested",
+                        correlationId=conversation_id,
+                        userId=str(conversation.userId),
+                        spaceId=str(conversation.spaceId),
+                        conversationId=conversation_id,
+                        payload={
+                            "expectedLastSequence": conversation.expectedLastSequence,
+                            "processingVersion": conversation.processingVersion,
+                            "source": "stale-processing-recovery",
+                        },
+                    ),
+                )
+            else:
+                await self.producer.publish(
+                    settings.REDIS_FINALIZATION_STREAM,
+                    EventEnvelope(
+                        eventType="conversation.finalization.requested",
+                        correlationId=conversation_id,
+                        userId=str(conversation.userId),
+                        spaceId=str(conversation.spaceId),
+                        conversationId=conversation_id,
+                        payload={
+                            "expectedLastSequence": conversation.expectedLastSequence,
+                            "source": "stale-finalization-recovery",
+                        },
+                    ),
+                )
             finalized += 1
         return finalized

@@ -559,11 +559,15 @@ def _window_result_from_llm(response: WindowExtractionLLMResponse, conversation_
 
 
 def _needs_window_recovery(result: WindowExtractionResult, window_text: str) -> bool:
-    if _rough_token_count(window_text) < 40:
+    text = (window_text or "").strip()
+    if not text:
         return False
-    if not (result.tasks or result.notes or result.decisions or result.issues):
+    extracted = bool(result.tasks or result.notes or result.decisions or result.issues)
+    if not extracted:
         return True
     if not result.notes and _result_has_note_source(result):
+        return True
+    if extracted and _looks_actionable(text) and not result.tasks and not result.notes:
         return True
     return False
 
@@ -859,6 +863,36 @@ def _provider_input_token_limit(provider_name: str) -> int:
 
 def _rough_token_count(text: str) -> int:
     return max(1, len(text) // 4)
+
+
+_ACTIONABLE_MARKERS = (
+    "will",
+    "should",
+    "need to",
+    "needs to",
+    "must",
+    "tomorrow",
+    "today",
+    "deadline",
+    "deploy",
+    "fix",
+    "send",
+    "call",
+    "schedule",
+    "decide",
+    "agreed",
+    "requirement",
+    "follow up",
+    "follow-up",
+    "?",
+)
+
+
+def _looks_actionable(text: str) -> bool:
+    lowered = (text or "").casefold()
+    if not lowered.strip():
+        return False
+    return any(marker in lowered for marker in _ACTIONABLE_MARKERS)
 
 
 def _minimal_window_response(window_text: str) -> WindowExtractionLLMResponse:

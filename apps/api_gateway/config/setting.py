@@ -142,6 +142,13 @@ class Settings(BaseSettings):
     INCREMENTAL_WINDOW_OVERLAP_TOKENS: int = Field(default=150, ge=0, le=5000)
     INCREMENTAL_WINDOW_OVERLAP_RATIO: float = Field(default=0.12, ge=0, le=0.5)
     INCREMENTAL_WINDOW_MAX_DURATION_MS: int = Field(default=5 * 60 * 1000, ge=1000, le=60 * 60 * 1000)
+    SPARSE_WINDOW_MAX_WALL_CLOCK_MS: int = Field(default=15 * 60 * 1000, ge=1000, le=60 * 60 * 1000)
+    SPARSE_WINDOW_MIN_USEFUL_TOKENS: int = Field(default=4, ge=1, le=500)
+    WINDOW_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=180, ge=15, le=3600)
+    STT_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=300, ge=30, le=3600)
+    FINALIZATION_MAX_RETRIES: int = Field(default=8, ge=1, le=50)
+    FINALIZATION_MISSING_SEQUENCE_TIMEOUT_SECONDS: int = Field(default=900, ge=15, le=3600)
+    COVERAGE_SPARSE_WINDOW_ENABLED: bool = True
     MEETING_MEMORY_RETRIEVAL_LIMIT: int = Field(default=12, ge=1, le=50)
     MEETING_MEMORY_GLOBAL_ITEM_LIMIT: int = Field(default=30, ge=5, le=100)
     ARTIFACT_TITLE_JACCARD_DUPLICATE: float = Field(default=0.9, ge=0.5, le=1)

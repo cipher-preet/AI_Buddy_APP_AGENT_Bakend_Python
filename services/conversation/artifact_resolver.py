@@ -239,13 +239,15 @@ def apply_resolution(existing: list[MeetingArtifactDocument], result: Resolution
     return matched
 
 
-def item_is_represented(title: str, represented_titles: list[str]) -> bool:
+def item_is_represented(title: str, represented_titles: list[str], strict: bool = False) -> bool:
     normalized = _normalize(title)
     if not normalized:
         return False
     for other in represented_titles:
         if _normalize(other) == normalized:
             return True
+        if strict:
+            continue
         if _title_jaccard(title, other) >= settings.ARTIFACT_TITLE_JACCARD_DUPLICATE and _primary_verb(title) == _primary_verb(other):
             return True
     return False

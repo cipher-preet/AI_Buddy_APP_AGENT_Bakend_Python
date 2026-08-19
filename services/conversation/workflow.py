@@ -14,6 +14,7 @@ from services.conversation.safety import detect_rule_signals
 from services.conversation.transcript import assemble_transcript, estimate_tokens, segment_transcript
 from services.conversation.workflow_state import ConversationGraphState
 from services.llm.router import LLMCapability, LLMRouter, get_llm_router
+from services.queue.streams import EventEnvelope, RedisStreamProducer
 
 
 class ConversationProcessingWorkflow:
@@ -30,6 +31,23 @@ class ConversationProcessingWorkflow:
         if not conversation:
             raise ValueError(f"Conversation not found: {conversation_id}")
         if conversation.status == ConversationStatus.COMPLETED:
+            return
+        if conversation.status in {
+            ConversationStatus.STOP_REQUESTED,
+            ConversationStatus.WAITING_FOR_TRANSCRIPTS,
+            ConversationStatus.FINALIZING,
+        }:
+            await RedisStreamProducer().publish(
+                settings.REDIS_FINALIZATION_STREAM,
+                EventEnvelope(
+                    eventType="conversation.finalization.requested",
+                    correlationId=conversation_id,
+                    userId=str(conversation.userId),
+                    spaceId=str(conversation.spaceId),
+                    conversationId=conversation_id,
+                    payload={"expectedLastSequence": conversation.expectedLastSequence, "source": "processing-not-ready"},
+                ),
+            )
             return
         if conversation.status in {ConversationStatus.FAILED, ConversationStatus.VALIDATING}:
             conversation = await self.repository.transition(
@@ -57,11 +75,34 @@ class ConversationProcessingWorkflow:
 
             if settings.ENABLE_INCREMENTAL_MEETING_PROCESSING:
                 windows = await self.repository.list_conversation_windows(conversation_id)
+                unwindowed = await self.repository.count_unwindowed_non_empty_transcripts(conversation_id)
+                incomplete = [window for window in windows if window.status != WindowProcessingStatus.COMPLETED]
+                if unwindowed or incomplete:
+                    print(
+                        "Processing deferred until drain completes:",
+                        {
+                            "conversationId": conversation_id,
+                            "unwindowedNonEmpty": unwindowed,
+                            "incompleteWindows": len(incomplete),
+                            "windowCount": len(windows),
+                        },
+                    )
+                    if conversation.status != ConversationStatus.FINALIZING:
+                        await self.repository.transition(conversation_id, ConversationStatus.FINALIZING)
+                    await RedisStreamProducer().publish(
+                        settings.REDIS_FINALIZATION_STREAM,
+                        EventEnvelope(
+                            eventType="conversation.finalization.requested",
+                            correlationId=conversation_id,
+                            userId=str(conversation.userId),
+                            spaceId=str(conversation.spaceId),
+                            conversationId=conversation_id,
+                            payload={"expectedLastSequence": conversation.expectedLastSequence, "source": "processing-drain-guard"},
+                        ),
+                    )
+                    return
                 if windows:
-                    if all(window.status == WindowProcessingStatus.COMPLETED for window in windows):
-                        await self._run_incremental_finalization(conversation, run, windows, context=None)
-                        return
-                    await self.repository.transition(conversation_id, ConversationStatus.FINALIZING)
+                    await self._run_incremental_finalization(conversation, run, windows, context=None)
                     return
 
             chunks = await self.repository.list_transcript_chunks(conversation_id)
@@ -187,14 +228,7 @@ class ConversationProcessingWorkflow:
         context = context or await load_space_context(self.repository, conversation.userId, conversation.spaceId)
         ordered_windows = sorted(windows, key=lambda window: (window.sequenceStart, window.windowIndex))
         artifacts = await self.repository.list_meeting_artifacts(conversation_id)
-        if not artifacts:
-            from services.conversation.artifact_resolver import resolve_incoming_artifacts
-            from services.conversation.artifacts import artifacts_from_windows
-
-            incoming = artifacts_from_windows(ordered_windows)
-            artifacts = resolve_incoming_artifacts([], incoming)
-            await self.repository.upsert_meeting_artifacts(artifacts)
-            artifacts = await self.repository.list_meeting_artifacts(conversation_id)
+        artifacts = await self._ensure_window_artifacts(conversation_id, ordered_windows, artifacts)
 
         from services.conversation.coverage import evaluate_coverage, preserve_unrepresented
         from services.conversation.incremental import compact_artifact_payload, compact_window_summary
@@ -214,6 +248,7 @@ class ConversationProcessingWorkflow:
 
         artifact_payload = compact_artifact_payload(artifacts)
         window_summaries = [compact_window_summary(window) for window in ordered_windows]
+        accounting = conversation.lastAccounting or {}
         result, provider, model = await agents.reconcile_meeting(
             self.router,
             conversation_id,
@@ -265,6 +300,16 @@ class ConversationProcessingWorkflow:
             "issueCount": len(result.issues),
             "provider": provider,
             "model": model,
+            "receivedAudioChunkCount": conversation.receivedAudioChunkCount,
+            "emptyTranscriptCount": accounting.get("emptyTranscripts"),
+            "nonEmptyTranscriptCount": accounting.get("validTranscripts"),
+            "failedSTTCount": accounting.get("failedTranscripts"),
+            "nonEmptyWindowedCount": accounting.get("validWindowed"),
+            "nonEmptyUnwindowedCount": accounting.get("validUnwindowed"),
+            "windowCompletedCount": accounting.get("windowsCompleted"),
+            "windowFailedCount": accounting.get("windowsFailed"),
+            "finalTaskCount": len(result.tasks),
+            "finalNoteCount": len(result.notes),
         }
         print("Meeting reconciliation completed:", run.checkpoints["incremental_window_finalization"])
         await self.repository.append_meeting_debug_trace(
@@ -299,9 +344,51 @@ class ConversationProcessingWorkflow:
         run.status = ExtractionRunStatus.PUBLISHED
         await self.repository.save_extraction_run(run)
         terminal = ConversationStatus.COMPLETED
-        if not result.tasks and not result.notes and coverage.meaningfulArtifactCount:
+        if accounting.get("permanentFailures") or (not result.tasks and not result.notes and coverage.meaningfulArtifactCount):
             terminal = ConversationStatus.PARTIAL
         await self.repository.transition(conversation_id, terminal)
+
+    async def _ensure_window_artifacts(self, conversation_id: str, windows: list, artifacts: list) -> list:
+        from services.conversation.artifact_resolver import resolve_incoming_artifacts
+        from services.conversation.artifacts import artifacts_from_window
+
+        represented = {
+            str(artifact.sourceWindowId)
+            for artifact in artifacts
+            if artifact.sourceWindowId is not None
+        }
+        represented.update(window_id for artifact in artifacts for window_id in artifact.sourceWindowIds)
+        working = list(artifacts)
+        repaired = 0
+        for window in windows:
+            window_id = str(window.id)
+            expected = 0
+            if window.result is not None:
+                expected = (
+                    len(window.result.tasks)
+                    + len(window.result.notes)
+                    + len(window.result.decisions)
+                    + len(window.result.issues)
+                    + len(window.result.importantFacts)
+                    + len(window.result.openQuestions)
+                )
+            if expected <= 0:
+                continue
+            if window_id in represented and window.artifactPersistenceOk:
+                continue
+            incoming = artifacts_from_window(window)
+            if not incoming:
+                continue
+            working = resolve_incoming_artifacts(working, incoming)
+            repaired += 1
+        if repaired:
+            await self.repository.upsert_meeting_artifacts(working)
+            working = await self.repository.list_meeting_artifacts(conversation_id)
+            print(
+                "Repaired window artifact persistence gaps:",
+                {"conversationId": conversation_id, "repairedWindows": repaired, "artifactCount": len(working)},
+            )
+        return working
 
     def _merge(self, state: ConversationGraphState) -> None:
         seen_tasks: set[str] = set()

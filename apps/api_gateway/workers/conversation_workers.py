@@ -23,7 +23,7 @@ from services.storage.s3_audio_storage import (
     validate_conversation_audio_object_key,
 )
 from services.speech.transcription_router import transcribe_from_path_with_fallback
-from services.conversation.models import STTStatus
+from services.conversation.models import ConversationStatus, STTStatus
 
 
 async def handle_stt_event(event: EventEnvelope) -> None:
@@ -122,6 +122,20 @@ async def handle_stt_event(event: EventEnvelope) -> None:
             request_id=result.get("request_id"),
             provider=result.get("provider") or "unknown",
         )
+        conversation = await repository.get_conversation(conversation_id)
+        if conversation and conversation.status in {ConversationStatus.COMPLETED, ConversationStatus.FAILED}:
+            print(
+                "Late STT completion after terminal conversation status:",
+                {
+                    "eventId": event.eventId,
+                    "conversationId": conversation_id,
+                    "sequenceNumber": sequence_number,
+                    "status": conversation.status.value,
+                    "isEmptyTranscript": result.get("is_empty_transcript"),
+                    "transcriptChars": len(str(result.get("transcript") or "")),
+                },
+            )
+            return
         await RedisStreamProducer().publish(
             settings.REDIS_TRANSCRIPT_READY_STREAM,
             EventEnvelope(
@@ -137,7 +151,6 @@ async def handle_stt_event(event: EventEnvelope) -> None:
                 },
             ),
         )
-        conversation = await repository.get_conversation(conversation_id)
         if conversation and conversation.expectedLastSequence is not None:
             await RedisStreamProducer().publish(
                 settings.REDIS_FINALIZATION_STREAM,
@@ -217,6 +230,17 @@ async def handle_window_extraction_event(event: EventEnvelope) -> None:
     window_id = event.payload.get("windowId")
     if not window_id:
         raise ValueError("Window extraction event missing windowId")
+    conversation = await repository.get_conversation(event.conversationId)
+    if conversation and conversation.status in {ConversationStatus.COMPLETED, ConversationStatus.FAILED}:
+        print(
+            "Late window extraction skipped after terminal conversation status:",
+            {
+                "conversationId": event.conversationId,
+                "windowId": window_id,
+                "status": conversation.status.value,
+            },
+        )
+        return
     await IncrementalMeetingProcessor(repository).extract_window(str(window_id))
     await _publish_finalization_if_stopped(repository, event.conversationId, event.eventId)
 

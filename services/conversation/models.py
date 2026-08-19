@@ -12,6 +12,24 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def as_utc(value: datetime | None) -> datetime | None:
+    """Treat Mongo naive datetimes as UTC so they can be compared with utc_now()."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+class UtcAwareModel(BaseModel):
+    @field_validator("*", mode="before")
+    @classmethod
+    def _coerce_utc_datetimes(cls, value):
+        if isinstance(value, datetime):
+            return as_utc(value)
+        return value
+
+
 def new_id(prefix: str | None = None) -> ObjectId:
     return ObjectId()
 
@@ -115,6 +133,12 @@ class TranscriptProcessingStatus(str, Enum):
     EXPIRED = "expired"
 
 
+class TranscriptExclusionReason(str, Enum):
+    EMPTY_TRANSCRIPT = "empty_transcript"
+    STT_FAILED = "stt_failed"
+    SEQUENCE_MISSING = "sequence_missing"
+
+
 class WindowProcessingStatus(str, Enum):
     PENDING = "PENDING"
     PROCESSING = "PROCESSING"
@@ -141,7 +165,7 @@ class FailureClass(str, Enum):
     PERMANENT = "PERMANENT"
 
 
-class ConversationDocument(BaseModel):
+class ConversationDocument(UtcAwareModel):
     id: Any = Field(default_factory=new_id, alias="_id")
     userId: Any
     spaceId: Any
@@ -159,6 +183,8 @@ class ConversationDocument(BaseModel):
     lastError: str | None = None
     lastActivityAt: datetime = Field(default_factory=utc_now)
     processedAt: datetime | None = None
+    finalizationAttempts: int = 0
+    lastAccounting: dict[str, Any] = Field(default_factory=dict)
     createdAt: datetime = Field(default_factory=utc_now)
     updatedAt: datetime = Field(default_factory=utc_now)
 
@@ -185,7 +211,7 @@ class AudioChunkMetadata(BaseModel):
     createdAt: datetime = Field(default_factory=utc_now)
 
 
-class TranscriptChunkDocument(BaseModel):
+class TranscriptChunkDocument(UtcAwareModel):
     id: Any = Field(default_factory=new_id, alias="_id")
     conversationId: Any
     userId: Any
@@ -208,6 +234,7 @@ class TranscriptChunkDocument(BaseModel):
     processingWindowId: Any | None = None
     processedAt: datetime | None = None
     publishedAt: datetime | None = None
+    exclusionReason: str | None = None
     createdAt: datetime = Field(default_factory=utc_now)
     updatedAt: datetime = Field(default_factory=utc_now)
     expiresAt: datetime | None = None
@@ -329,7 +356,7 @@ class WindowExtractionResult(BaseModel):
     openQuestions: list[str] = Field(default_factory=list)
 
 
-class ConversationWindowDocument(BaseModel):
+class ConversationWindowDocument(UtcAwareModel):
     id: Any = Field(default_factory=new_id, alias="_id")
     conversationId: Any
     userId: Any
@@ -343,6 +370,17 @@ class ConversationWindowDocument(BaseModel):
     durationMs: int | None = None
     overlapSequenceStart: int | None = None
     isFinalPartial: bool = False
+    closeReason: str | None = None
+    sequenceCount: int = 0
+    emptyChunkCount: int = 0
+    nonEmptyChunkCount: int = 0
+    usefulCharCount: int = 0
+    usefulWordCount: int = 0
+    usefulTokenCount: int = 0
+    wallClockSpanMs: int | None = None
+    meaningfulSpeechMs: int | None = None
+    artifactCount: int = 0
+    artifactPersistenceOk: bool = True
     status: WindowProcessingStatus = WindowProcessingStatus.PENDING
     result: WindowExtractionResult | None = None
     provider: str | None = None

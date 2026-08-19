@@ -9,9 +9,18 @@ from services.conversation.artifact_resolver import resolve_incoming_artifacts
 from services.conversation.artifacts import artifacts_from_window, compact_artifact
 from services.conversation.context import load_space_context
 from services.conversation.meeting_memory import build_meeting_memory, select_context_for_window
-from services.conversation.models import WindowProcessingStatus
+from services.conversation.models import (
+    STTStatus,
+    TranscriptExclusionReason,
+    TranscriptProcessingStatus,
+    WindowProcessingStatus,
+)
 from services.conversation.repository import ConversationRepository
-from services.conversation.windowing import build_ready_windows
+from services.conversation.windowing import (
+    build_ready_windows,
+    is_useful_chunk,
+    leading_skippable_sequences,
+)
 from services.llm.router import LLMRouter, get_llm_router
 from services.queue.streams import EventEnvelope, RedisStreamProducer
 
@@ -32,22 +41,73 @@ class IncrementalMeetingProcessor:
         conversation_id: str,
         force_final: bool = False,
         through_sequence: int | None = None,
+        skippable_sequences: set[int] | None = None,
     ) -> list[str]:
         if not settings.ENABLE_INCREMENTAL_MEETING_PROCESSING:
             return []
         conversation = await self.repository.get_conversation(conversation_id)
         if not conversation:
             return []
-        chunks = await self.repository.list_completed_unwindowed_transcript_chunks(
-            conversation_id,
-            through_sequence=through_sequence,
-        )
+        all_chunks = await self.repository.list_transcript_chunks(conversation_id)
+        if through_sequence is not None:
+            all_chunks = [chunk for chunk in all_chunks if chunk.sequenceNumber <= through_sequence]
+        skippable = set(skippable_sequences or ())
+        skippable.update(_derived_skippable_sequences(all_chunks))
+        unwindowed = [
+            chunk
+            for chunk in all_chunks
+            if chunk.sttStatus == STTStatus.COMPLETED
+            and chunk.processingStatus == TranscriptProcessingStatus.UNPROCESSED
+            and not chunk.exclusionReason
+        ]
         existing_windows = await self.repository.list_conversation_windows(conversation_id)
         start_index = len(existing_windows)
         expected_start = existing_windows[-1].sequenceEnd + 1 if existing_windows else 0
-        chunks = [chunk for chunk in chunks if chunk.sequenceNumber >= expected_start]
-        if chunks and chunks[0].sequenceNumber != expected_start:
+        unwindowed = [chunk for chunk in unwindowed if chunk.sequenceNumber >= expected_start]
+        if not unwindowed and not skippable:
             return []
+
+        failed_terminal = [
+            chunk.sequenceNumber
+            for chunk in all_chunks
+            if chunk.sequenceNumber >= expected_start and chunk.sttStatus == STTStatus.FAILED and chunk.sequenceNumber in skippable
+        ]
+        if failed_terminal:
+            await self.repository.mark_transcripts_excluded(
+                conversation_id,
+                failed_terminal,
+                TranscriptExclusionReason.STT_FAILED,
+            )
+
+        leading_empty = leading_skippable_sequences(unwindowed, skippable)
+        if leading_empty:
+            await self.repository.mark_transcripts_excluded(
+                conversation_id,
+                leading_empty,
+                TranscriptExclusionReason.EMPTY_TRANSCRIPT,
+            )
+            unwindowed = [chunk for chunk in unwindowed if chunk.sequenceNumber not in set(leading_empty)]
+
+        if unwindowed and unwindowed[0].sequenceNumber != expected_start:
+            hole = list(range(expected_start, unwindowed[0].sequenceNumber))
+            if any(sequence not in skippable for sequence in hole):
+                return []
+            present = {chunk.sequenceNumber for chunk in all_chunks}
+            missing_hole = [sequence for sequence in hole if sequence not in present]
+            failed_hole = [sequence for sequence in hole if sequence in present]
+            if missing_hole:
+                await self.repository.mark_transcripts_excluded(
+                    conversation_id,
+                    missing_hole,
+                    TranscriptExclusionReason.SEQUENCE_MISSING,
+                )
+            if failed_hole:
+                await self.repository.mark_transcripts_excluded(
+                    conversation_id,
+                    failed_hole,
+                    TranscriptExclusionReason.STT_FAILED,
+                )
+
         overlap_prefix = []
         if existing_windows:
             last = existing_windows[-1]
@@ -59,16 +119,21 @@ class IncrementalMeetingProcessor:
                 )
         built_windows = build_ready_windows(
             conversation,
-            chunks,
+            unwindowed,
             start_index,
             force_final=force_final,
             overlap_prefix=overlap_prefix,
+            skippable_sequences=skippable,
         )
         window_ids: list[str] = []
         for built in built_windows:
-            saved = await self.repository.create_conversation_window(built.window, built.owned_sequence_numbers)
+            saved = await self.repository.create_conversation_window(
+                built.window,
+                built.owned_sequence_numbers,
+                skipped_sequence_numbers=built.skipped_sequence_numbers,
+            )
             window_ids.append(str(saved.id))
-            if saved.status in {WindowProcessingStatus.PENDING, WindowProcessingStatus.FAILED}:
+            if saved.status in {WindowProcessingStatus.PENDING, WindowProcessingStatus.FAILED} and saved.queuedAt is None:
                 await self.repository.mark_window_queued(saved.id)
                 await self.producer.publish(
                     settings.REDIS_WINDOW_EXTRACTION_STREAM,
@@ -85,8 +150,59 @@ class IncrementalMeetingProcessor:
                             "sequenceEnd": saved.sequenceEnd,
                             "ownedSequenceCount": len(built.owned_sequence_numbers),
                             "overlapSequenceCount": max(0, len(built.sequence_numbers) - len(built.owned_sequence_numbers)),
+                            "closeReason": built.close_reason,
+                            "emptyChunkCount": saved.emptyChunkCount,
+                            "nonEmptyChunkCount": saved.nonEmptyChunkCount,
+                            "usefulTokenCount": saved.usefulTokenCount,
                         },
                     ),
+                )
+            print(
+                "Window closed:",
+                {
+                    "conversationId": conversation_id,
+                    "windowIndex": saved.windowIndex,
+                    "sequenceStart": saved.sequenceStart,
+                    "sequenceEnd": saved.sequenceEnd,
+                    "sequenceCount": saved.sequenceCount,
+                    "emptyChunkCount": saved.emptyChunkCount,
+                    "nonEmptyChunkCount": saved.nonEmptyChunkCount,
+                    "usefulTokenCount": saved.usefulTokenCount,
+                    "usefulWordCount": saved.usefulWordCount,
+                    "wallClockSpanMs": saved.wallClockSpanMs,
+                    "meaningfulSpeechMs": saved.meaningfulSpeechMs,
+                    "closeReason": saved.closeReason or built.close_reason,
+                },
+            )
+            await self.repository.append_meeting_debug_trace(
+                conversation_id,
+                conversation.userId,
+                conversation.spaceId,
+                "window_closed",
+                {
+                    "windowId": str(saved.id),
+                    "windowIndex": saved.windowIndex,
+                    "sequenceStart": saved.sequenceStart,
+                    "sequenceEnd": saved.sequenceEnd,
+                    "ownedSequences": built.owned_sequence_numbers,
+                    "skippedSequences": built.skipped_sequence_numbers,
+                    "closeReason": built.close_reason,
+                    "emptyChunkCount": saved.emptyChunkCount,
+                    "nonEmptyChunkCount": saved.nonEmptyChunkCount,
+                    "usefulTokenCount": saved.usefulTokenCount,
+                },
+            )
+        if force_final:
+            leftover_empty = [
+                chunk.sequenceNumber
+                for chunk in unwindowed
+                if not is_useful_chunk(chunk) and not chunk.exclusionReason
+            ]
+            if leftover_empty:
+                await self.repository.mark_transcripts_excluded(
+                    conversation_id,
+                    leftover_empty,
+                    TranscriptExclusionReason.EMPTY_TRANSCRIPT,
                 )
         if built_windows:
             print(
@@ -96,12 +212,26 @@ class IncrementalMeetingProcessor:
                     "windowCount": len(built_windows),
                     "forceFinal": force_final,
                     "overlapPrefixCount": len(overlap_prefix),
+                    "skippableCount": len(skippable),
                 },
             )
         return window_ids
 
     async def extract_window(self, window_id: str, recovery: bool = False) -> None:
         started = time.perf_counter()
+        existing = await self.repository.get_conversation_window(window_id)
+        if existing:
+            conversation = await self.repository.get_conversation(str(existing.conversationId))
+            if conversation and conversation.status.value in {"COMPLETED", "FAILED"}:
+                print(
+                    "Late window extraction skipped after terminal conversation status:",
+                    {
+                        "conversationId": str(existing.conversationId),
+                        "windowId": window_id,
+                        "status": conversation.status.value,
+                    },
+                )
+                return
         window = await self.repository.mark_window_processing(window_id)
         if not window:
             existing = await self.repository.get_conversation_window(window_id)
@@ -128,20 +258,40 @@ class IncrementalMeetingProcessor:
             incoming = artifacts_from_window(window, result)
             resolved = resolve_incoming_artifacts(existing_artifacts, incoming)
             await self.repository.upsert_meeting_artifacts(resolved)
+            persisted = await self.repository.count_meeting_artifacts_for_window(str(window.conversationId), window.id)
+            if incoming and persisted <= 0:
+                await self.repository.fail_window(window.id, "artifact persistence failed")
+                print(
+                    "Window extraction artifact persistence failed:",
+                    {"conversationId": str(window.conversationId), "windowId": str(window.id), "incoming": len(incoming)},
+                )
+                return
             await self._refresh_meeting_memory(str(window.conversationId), window.userId, window.spaceId)
-            await self.repository.complete_window(window.id, result, provider, model)
+            await self.repository.complete_window(
+                window.id,
+                result,
+                provider,
+                model,
+                artifact_count=len(incoming),
+                artifact_persistence_ok=True,
+            )
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             metrics = {
                 "conversationId": str(window.conversationId),
                 "windowId": str(window.id),
                 "windowIndex": window.windowIndex,
                 "tokenCount": window.tokenCount,
+                "usefulTokenCount": window.usefulTokenCount,
+                "emptyChunkCount": window.emptyChunkCount,
+                "nonEmptyChunkCount": window.nonEmptyChunkCount,
+                "closeReason": window.closeReason,
                 "chunkCount": window.sequenceEnd - window.sequenceStart + 1,
                 "elapsedMs": elapsed_ms,
                 "provider": provider,
                 "model": model,
                 "retryCount": window.attemptCount,
                 "artifactsExtracted": len(incoming),
+                "artifactsPersisted": persisted,
                 "artifactCountAfterResolve": len(resolved),
                 "taskCount": len(result.tasks),
                 "noteCount": len(result.notes),
@@ -158,6 +308,7 @@ class IncrementalMeetingProcessor:
                 {
                     **metrics,
                     "artifactIds": [str(item.id) for item in incoming],
+                    "ownedSequences": list(range(window.sequenceStart, window.sequenceEnd + 1)),
                 },
             )
         except Exception as error:
@@ -212,7 +363,18 @@ class IncrementalMeetingProcessor:
         await self.repository.upsert_meeting_artifacts(resolved)
         await self._refresh_meeting_memory(str(window.conversationId), window.userId, window.spaceId)
         if window.result is None:
-            await self.repository.complete_window(window.id, result, provider, model)
+            persisted = await self.repository.count_meeting_artifacts_for_window(str(window.conversationId), window.id)
+            if incoming and persisted <= 0:
+                await self.repository.fail_window(window.id, "artifact persistence failed during recovery")
+                return
+            await self.repository.complete_window(
+                window.id,
+                result,
+                provider,
+                model,
+                artifact_count=len(incoming),
+                artifact_persistence_ok=True,
+            )
         print(
             "Selective window recovery completed:",
             {
@@ -276,6 +438,8 @@ def compact_window_summary(window: Any) -> dict[str, Any]:
         "sequenceStart": window.sequenceStart,
         "sequenceEnd": window.sequenceEnd,
         "tokenCount": window.tokenCount,
+        "usefulTokenCount": getattr(window, "usefulTokenCount", 0),
+        "closeReason": getattr(window, "closeReason", None),
         "summary": (result.summary if result else "")[:400],
         "topics": result.topics if result else [],
     }
@@ -283,3 +447,34 @@ def compact_window_summary(window: Any) -> dict[str, Any]:
 
 def compact_artifact_payload(artifacts: list) -> list[dict[str, Any]]:
     return [compact_artifact(artifact) for artifact in artifacts]
+
+
+def _derived_skippable_sequences(chunks) -> set[int]:
+    skippable: set[int] = set()
+    for chunk in chunks:
+        if chunk.exclusionReason:
+            skippable.add(chunk.sequenceNumber)
+            continue
+        if chunk.sttStatus == STTStatus.COMPLETED and not is_useful_chunk(chunk):
+            skippable.add(chunk.sequenceNumber)
+            continue
+        if chunk.sttStatus == STTStatus.FAILED and _is_terminal_failed_chunk(chunk):
+            skippable.add(chunk.sequenceNumber)
+    return skippable
+
+
+def _is_terminal_failed_chunk(chunk) -> bool:
+    error = str(chunk.lastError or "").lower()
+    permanent_markers = (
+        "audio duration exceeds",
+        "exceeds the maximum limit",
+        "failed to read the file",
+        "audio format",
+        "invalid audio",
+        "file too large",
+        "batch api",
+        "unsupported audio content type",
+    )
+    if any(marker in error for marker in permanent_markers):
+        return True
+    return int(chunk.sttAttempts or 0) >= settings.WORKER_MAX_RETRIES

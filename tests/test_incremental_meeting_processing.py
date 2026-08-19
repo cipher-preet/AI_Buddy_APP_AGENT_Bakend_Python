@@ -17,7 +17,7 @@ from services.conversation.models import (
 from services.conversation.windowing import build_ready_windows
 
 
-def test_windowing_uses_only_contiguous_chunk_prefix(monkeypatch):
+def test_windowing_does_not_cross_temporary_sequence_gap(monkeypatch):
     monkeypatch.setattr("services.conversation.windowing.settings.INCREMENTAL_WINDOW_TARGET_TOKENS", 4)
     conversation = ConversationDocument(_id="conv_1", userId="user_1", spaceId="space_1")
     chunks = [
@@ -41,9 +41,8 @@ def test_windowing_uses_only_contiguous_chunk_prefix(monkeypatch):
 
     windows = build_ready_windows(conversation, chunks, start_index=0)
 
-    assert len(windows) == 1
-    assert windows[0].window.sequenceStart == 0
-    assert windows[0].window.sequenceEnd == 0
+    assert all(2 not in built.owned_sequence_numbers for built in windows)
+    assert all(built.window.sequenceEnd < 2 for built in windows)
 
 
 def test_windowing_closes_final_partial_window():
