@@ -11,8 +11,25 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from apps.api_gateway.config.setting import settings
-from services.llm.errors import LLMProviderError, is_retryable_status
+from services.llm.errors import LLMProviderError, StructuredOutputError, is_retryable_status
 from services.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StructuredLLMRequest
+from services.llm.schema_adapter import (
+    HTTP_ERROR,
+    INCOMPLETE_STRUCTURED_OUTPUT,
+    MALFORMED_JSON,
+    MALFORMED_STRUCTURED_OUTPUT,
+    PARSED_INSTANCE,
+    PROVIDER_TIMEOUT,
+    RATE_LIMITED,
+    SCHEMA_ECHO,
+    STRUCTURED_SCHEMA_ECHO,
+    STRUCTURED_SCHEMA_UNSUPPORTED,
+    WIRE_REQUIRED_COLLECTIONS,
+    build_structured_plan,
+    classify_validation_error,
+    is_schema_echo,
+    provider_local_recovery_eligible,
+)
 
 
 class OpenAICompatibleProvider:
@@ -34,6 +51,7 @@ class OpenAICompatibleProvider:
         self.default_model = default_model
         self.max_retries = max_retries
         self.max_tokens_limit = max_tokens_limit
+        self.last_structured_diagnostics: dict[str, Any] = {}
         self._auth_header = auth_header
         self._auth_value = f"{auth_prefix}{api_key}" if auth_prefix else api_key
         self._semaphore = asyncio.Semaphore(max_concurrency)
@@ -75,6 +93,7 @@ class OpenAICompatibleProvider:
                 totalTokens=int(usage.get("total_tokens") or 0),
             ),
             latencyMs=latency_ms,
+            finishReason=str(choice.get("finish_reason") or "") or None,
         )
 
     async def generate_structured(
@@ -82,57 +101,85 @@ class OpenAICompatibleProvider:
         request: StructuredLLMRequest,
         response_schema: type[BaseModel],
     ) -> BaseModel:
-        schema = response_schema.model_json_schema()
-        schema_text = json.dumps(schema, ensure_ascii=True)
-        structured_request = self._with_structured_response_format(
-            request,
-            {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": request.schema_name or response_schema.__name__,
-                    "schema": schema,
-                    "strict": True,
-                },
-            },
-        )
-        try:
-            return await self._generate_structured_with_validation(
-                structured_request,
-                response_schema,
-            )
-        except LLMProviderError as error:
-            if error.status_code not in {400, 422}:
-                raise
+        schema_name = request.schema_name or response_schema.__name__
+        model = request.model or self.default_model
+        plan = build_structured_plan(self.name, model, response_schema, schema_name)
+        last_error: Exception | None = None
+        for index, attempt in enumerate(plan.attempts):
+            structured_request = self._request_from_attempt(request, attempt)
+            try:
+                return await self._generate_structured_with_validation(
+                    structured_request,
+                    response_schema,
+                    requested_mode=attempt.mode,
+                    model=model,
+                )
+            except StructuredOutputError as error:
+                last_error = error
+                if index >= len(plan.attempts) - 1 or not provider_local_recovery_eligible(error):
+                    raise
+                continue
+            except LLMProviderError as error:
+                last_error = error
+                if index >= len(plan.attempts) - 1 or not provider_local_recovery_eligible(error):
+                    raise
+                continue
+        raise last_error or LLMProviderError("structured output failed", retryable=True, status_code=422)
 
-        fallback_request = self._with_structured_response_format(
-            request,
-            {"type": "json_object"},
-            (
-                "Return valid JSON only. The JSON must match this schema exactly: "
-                f"{schema_text}"
-            ),
+    def _request_from_attempt(self, request: StructuredLLMRequest, attempt) -> StructuredLLMRequest:
+        structured_request = request.model_copy(deep=True)
+        structured_request.temperature = attempt.temperature
+        structured_request.max_tokens = structured_request.max_tokens or settings.LLM_STRUCTURED_MAX_TOKENS
+        structured_request.metadata.setdefault("extra_body", {})
+        extra_body = dict(structured_request.metadata.get("extra_body") or {})
+        extra_body.pop("response_format", None)
+        extra_body.update(attempt.extra_body or {})
+        if attempt.response_format is not None:
+            extra_body["response_format"] = attempt.response_format
+        if self.name == "sarvam":
+            extra_body["reasoning_effort"] = None
+        structured_request.metadata["extra_body"] = extra_body
+        structured_request.messages.append(
+            type(request.messages[0])(
+                role="system",
+                content=attempt.instruction
+                or "Return only the JSON object requested by the response schema. Do not wrap it in markdown.",
+            )
         )
-        return await self._generate_structured_with_validation(
-            fallback_request,
-            response_schema,
+        return structured_request
+
+    def _request_for_structured_mode(
+        self,
+        request: StructuredLLMRequest,
+        schema: dict[str, Any],
+        schema_name: str,
+        mode: str,
+    ) -> StructuredLLMRequest:
+        plan = build_structured_plan(self.name, request.model or self.default_model, None, schema_name)
+        for attempt in plan.attempts:
+            if attempt.mode == mode:
+                return self._request_from_attempt(request, attempt)
+        return self._with_structured_response_format(
+            request,
+            {"type": mode} if mode in {"json_schema", "json_object"} else None,
         )
 
     def _with_structured_response_format(
         self,
         request: StructuredLLMRequest,
-        response_format: dict[str, Any],
+        response_format: dict[str, Any] | None,
         schema_instruction: str | None = None,
     ) -> StructuredLLMRequest:
         structured_request = request.model_copy(deep=True)
         structured_request.max_tokens = structured_request.max_tokens or settings.LLM_STRUCTURED_MAX_TOKENS
         structured_request.metadata.setdefault("extra_body", {})
-        structured_request.metadata["extra_body"].update(
-            {
-                "response_format": response_format,
-            }
-        )
+        extra_body = dict(structured_request.metadata.get("extra_body") or {})
+        extra_body.pop("response_format", None)
+        if response_format is not None:
+            extra_body["response_format"] = response_format
         if self.name == "sarvam":
-            structured_request.metadata["extra_body"]["reasoning_effort"] = None
+            extra_body["reasoning_effort"] = None
+        structured_request.metadata["extra_body"] = extra_body
         structured_request.messages.append(
             type(request.messages[0])(
                 role="system",
@@ -146,24 +193,58 @@ class OpenAICompatibleProvider:
         self,
         structured_request: StructuredLLMRequest,
         response_schema: type[BaseModel],
+        requested_mode: str,
+        model: str,
     ) -> BaseModel:
-        last_error: Exception | None = None
-        for _ in range(3):
-            response = await self.generate(structured_request)
-            try:
-                return _validate_structured_response(response_schema, response.content)
-            except ValidationError as error:
-                last_error = error
-                structured_request.messages.append(
-                    type(structured_request.messages[0])(
-                        role="user",
-                        content=(
-                            "Your previous response did not validate. Return corrected JSON only. "
-                            f"Validation error: {str(error)[:1200]}"
-                        ),
-                    )
-                )
-        raise LLMProviderError(f"Structured response validation failed: {last_error}", retryable=True)
+        response = await self.generate(structured_request)
+        try:
+            parsed, diagnostics = parse_structured_content(response_schema, response.content)
+            diagnostics.update(
+                {
+                    "provider": self.name,
+                    "model": model,
+                    "requestedStructuredMode": requested_mode,
+                    "actualResponseFormatMode": requested_mode,
+                    "structuredModeUsed": requested_mode,
+                    "finishReason": response.finishReason,
+                    "completionTokens": int(response.usage.completionTokens or 0),
+                    "promptTokens": int(response.usage.promptTokens or 0),
+                }
+            )
+            self.last_structured_diagnostics = diagnostics
+            _log_structured_attempt(diagnostics)
+            return parsed
+        except StructuredOutputError as error:
+            diagnostics = {
+                "provider": self.name,
+                "model": model,
+                "requestedStructuredMode": requested_mode,
+                "actualResponseFormatMode": requested_mode,
+                "structuredModeUsed": requested_mode,
+                "topLevelResponseKeys": _top_level_keys(response.content),
+                "schemaEchoDetected": error.outcome in {STRUCTURED_SCHEMA_ECHO, SCHEMA_ECHO},
+                "parsingOutcome": error.outcome,
+                "finishReason": response.finishReason,
+            }
+            self.last_structured_diagnostics = diagnostics
+            _log_structured_attempt(diagnostics)
+            raise
+        except ValidationError as error:
+            reason = classify_validation_error(response_schema, _load_json_payload(_sanitize_json_text(response.content))[0], error)
+            diagnostics = {
+                "provider": self.name,
+                "model": model,
+                "requestedStructuredMode": requested_mode,
+                "actualResponseFormatMode": requested_mode,
+                "structuredModeUsed": requested_mode,
+                "topLevelResponseKeys": _top_level_keys(response.content),
+                "schemaEchoDetected": False,
+                "parsingOutcome": reason,
+                "finishReason": response.finishReason,
+            }
+            self.last_structured_diagnostics = diagnostics
+            _log_structured_attempt(diagnostics)
+            raise StructuredOutputError(reason, f"Structured response validation failed: {error}")
 
     async def health_check(self) -> ProviderHealth:
         started = time.perf_counter()
@@ -187,21 +268,65 @@ class OpenAICompatibleProvider:
                     json=payload,
                 )
                 if response.status_code < 400:
+                    print(
+                        "LLM HTTP call succeeded:",
+                        {
+                            "provider": self.name,
+                            "model": payload.get("model"),
+                            "statusCode": response.status_code,
+                            "attempt": attempt + 1,
+                        },
+                    )
                     return response
+                print(
+                    "LLM HTTP call failed:",
+                    {
+                        "provider": self.name,
+                        "model": payload.get("model"),
+                        "statusCode": response.status_code,
+                        "attempt": attempt + 1,
+                        "retryable": is_retryable_status(response.status_code),
+                    },
+                )
                 retryable = is_retryable_status(response.status_code)
+                failure_reason = RATE_LIMITED if response.status_code == 429 else HTTP_ERROR
+                body = response.text[:1000]
+                if response.status_code in {400, 422} and any(
+                    token in body.casefold() for token in ("json_schema", "response_format", "schema", "strict")
+                ):
+                    failure_reason = STRUCTURED_SCHEMA_UNSUPPORTED
                 if not retryable:
-                    body = response.text[:1000]
                     raise LLMProviderError(
                         f"{self.name} permanent error {response.status_code}: {body}",
                         retryable=False,
                         status_code=response.status_code,
+                        failure_reason=failure_reason,
                     )
                 retry_after = response.headers.get("retry-after")
+                last_error = LLMProviderError(
+                    f"{self.name} error {response.status_code}: {body}",
+                    retryable=True,
+                    status_code=response.status_code,
+                    failure_reason=failure_reason,
+                )
                 await asyncio.sleep(_retry_delay(attempt, retry_after))
             except (httpx.ConnectError, httpx.ReadTimeout, httpx.PoolTimeout) as error:
-                last_error = error
+                last_error = LLMProviderError(
+                    f"{self.name} request failed: {error}",
+                    retryable=True,
+                    failure_reason=PROVIDER_TIMEOUT,
+                )
+                print(
+                    "LLM HTTP call failed:",
+                    {
+                        "provider": self.name,
+                        "model": payload.get("model"),
+                        "attempt": attempt + 1,
+                        "error": type(error).__name__,
+                    },
+                )
                 await asyncio.sleep(_retry_delay(attempt, None))
-        raise LLMProviderError(f"{self.name} request failed: {last_error}", retryable=True)
+        raise last_error or LLMProviderError(f"{self.name} request failed", retryable=True, failure_reason=HTTP_ERROR)
 
     def _bounded_max_tokens(self, max_tokens: int | None) -> int | None:
         if max_tokens is None or self.max_tokens_limit is None:
@@ -227,14 +352,92 @@ def _without_none_values(value: Any) -> Any:
 
 
 def _validate_structured_response(response_schema: type[BaseModel], content: str) -> BaseModel:
+    parsed, _ = parse_structured_content(response_schema, content)
+    return parsed
+
+
+def parse_structured_content(response_schema: type[BaseModel], content: str) -> tuple[BaseModel, dict[str, Any]]:
     cleaned = _sanitize_json_text(content)
+    payload, top_level_keys = _load_json_payload(cleaned)
+    diagnostics = {
+        "topLevelResponseKeys": top_level_keys,
+        "schemaEchoDetected": is_schema_echo(payload),
+        "parsingOutcome": PARSED_INSTANCE,
+    }
+    if payload is None:
+        raise StructuredOutputError(MALFORMED_JSON, MALFORMED_STRUCTURED_OUTPUT)
+    if is_schema_echo(payload):
+        diagnostics["parsingOutcome"] = STRUCTURED_SCHEMA_ECHO
+        raise StructuredOutputError(STRUCTURED_SCHEMA_ECHO, STRUCTURED_SCHEMA_ECHO)
+    required = WIRE_REQUIRED_COLLECTIONS.get(getattr(response_schema, "__name__", ""), ())
+    if isinstance(payload, dict) and any(field not in payload or payload.get(field) is None for field in required):
+        diagnostics["parsingOutcome"] = INCOMPLETE_STRUCTURED_OUTPUT
+        raise StructuredOutputError(INCOMPLETE_STRUCTURED_OUTPUT, INCOMPLETE_STRUCTURED_OUTPUT)
     try:
-        return response_schema.model_validate_json(cleaned)
-    except ValidationError:
+        return response_schema.model_validate(payload), diagnostics
+    except ValidationError as error:
         extracted = _extract_json_object(cleaned)
         if extracted and extracted != cleaned:
-            return response_schema.model_validate_json(extracted)
-        raise
+            nested, nested_keys = _load_json_payload(extracted)
+            diagnostics["topLevelResponseKeys"] = nested_keys or top_level_keys
+            if is_schema_echo(nested):
+                diagnostics["schemaEchoDetected"] = True
+                diagnostics["parsingOutcome"] = STRUCTURED_SCHEMA_ECHO
+                raise StructuredOutputError(STRUCTURED_SCHEMA_ECHO, STRUCTURED_SCHEMA_ECHO)
+            if isinstance(nested, dict) and any(field not in nested or nested.get(field) is None for field in required):
+                diagnostics["parsingOutcome"] = INCOMPLETE_STRUCTURED_OUTPUT
+                raise StructuredOutputError(INCOMPLETE_STRUCTURED_OUTPUT, INCOMPLETE_STRUCTURED_OUTPUT)
+            if nested is not None:
+                try:
+                    return response_schema.model_validate(nested), diagnostics
+                except ValidationError as nested_error:
+                    error = nested_error
+                    payload = nested
+        reason = classify_validation_error(response_schema, payload, error)
+        diagnostics["parsingOutcome"] = reason
+        raise StructuredOutputError(reason, str(error))
+
+
+def _load_json_payload(content: str) -> tuple[Any, list[str]]:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        extracted = _extract_json_object(content)
+        if not extracted:
+            return None, []
+        try:
+            payload = json.loads(extracted)
+        except json.JSONDecodeError:
+            return None, []
+    if isinstance(payload, dict):
+        return payload, sorted(str(key) for key in payload.keys())
+    return payload, []
+
+
+def _top_level_keys(content: str) -> list[str]:
+    _, keys = _load_json_payload(_sanitize_json_text(content))
+    return keys
+
+
+def _instance_instruction(schema_name: str, schema: dict[str, Any]) -> str:
+    from services.llm.schema_adapter import _schema_instruction
+
+    return _schema_instruction(schema_name, schema)
+
+
+def _log_structured_attempt(diagnostics: dict[str, Any]) -> None:
+    print(
+        "Structured output attempt:",
+        {
+            "provider": diagnostics.get("provider"),
+            "model": diagnostics.get("model"),
+            "requestedStructuredMode": diagnostics.get("requestedStructuredMode"),
+            "actualResponseFormatMode": diagnostics.get("actualResponseFormatMode"),
+            "topLevelResponseKeys": diagnostics.get("topLevelResponseKeys") or [],
+            "schemaEchoDetected": bool(diagnostics.get("schemaEchoDetected")),
+            "parsingOutcome": diagnostics.get("parsingOutcome"),
+        },
+    )
 
 
 def _sanitize_json_text(content: str) -> str:

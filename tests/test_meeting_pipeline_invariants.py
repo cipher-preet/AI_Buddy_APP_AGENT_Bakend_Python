@@ -136,7 +136,7 @@ def test_empty_placeholders_are_omitted_from_window_text():
     assert windows[0].window.closeReason == CLOSE_REASON_FORCED_FINAL
 
 
-def test_sparse_timeout_closes_small_useful_window(monkeypatch):
+def test_sparse_timeout_is_disabled_by_default_and_can_be_enabled(monkeypatch):
     monkeypatch.setattr("services.conversation.windowing.settings.SPARSE_WINDOW_MAX_WALL_CLOCK_MS", 120_000)
     monkeypatch.setattr("services.conversation.windowing.settings.SPARSE_WINDOW_MIN_USEFUL_TOKENS", 4)
     monkeypatch.setattr("services.conversation.windowing.settings.INCREMENTAL_WINDOW_TARGET_TOKENS", 1200)
@@ -353,10 +353,10 @@ def test_window_job_publish_skips_already_queued_pending():
     assert accounting["missingSequences"] == [4, 5]
 
 
-def test_sparse_one_liner_triggers_window_recovery():
+def test_sparse_one_liner_without_semantic_evidence_does_not_trigger_recovery():
     result = WindowExtractionResult()
     text = "[12] Rahul will deploy production tomorrow."
-    assert _needs_window_recovery(result, text) is True
+    assert _needs_window_recovery(result, text) is False
 
 
 def test_empty_window_text_does_not_trigger_recovery():

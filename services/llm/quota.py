@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
 from services.llm.errors import LLMProviderError
+from services.llm.schema_adapter import QUOTA_UNAVAILABLE
 
 
 @dataclass
@@ -37,13 +38,33 @@ class InMemoryQuotaGuard:
         self._trim_minute(window, now)
 
         if quota.rpm is not None and len(window.minute_requests) >= quota.rpm:
-            raise LLMProviderError(f"{key} quota guard blocked request: RPM limit reached", retryable=True, status_code=429)
+            raise LLMProviderError(
+                f"{key} quota guard blocked request: RPM limit reached",
+                retryable=True,
+                status_code=429,
+                failure_reason=QUOTA_UNAVAILABLE,
+            )
         if quota.rpd is not None and window.day_requests >= quota.rpd:
-            raise LLMProviderError(f"{key} quota guard blocked request: RPD limit reached", retryable=True, status_code=429)
+            raise LLMProviderError(
+                f"{key} quota guard blocked request: RPD limit reached",
+                retryable=True,
+                status_code=429,
+                failure_reason=QUOTA_UNAVAILABLE,
+            )
         if quota.tpm is not None and self._minute_token_total(window) + estimated_tokens > quota.tpm:
-            raise LLMProviderError(f"{key} quota guard blocked request: TPM limit reached", retryable=True, status_code=429)
+            raise LLMProviderError(
+                f"{key} quota guard blocked request: TPM limit reached",
+                retryable=True,
+                status_code=429,
+                failure_reason=QUOTA_UNAVAILABLE,
+            )
         if quota.tpd is not None and window.day_tokens + estimated_tokens > quota.tpd:
-            raise LLMProviderError(f"{key} quota guard blocked request: TPD limit reached", retryable=True, status_code=429)
+            raise LLMProviderError(
+                f"{key} quota guard blocked request: TPD limit reached",
+                retryable=True,
+                status_code=429,
+                failure_reason=QUOTA_UNAVAILABLE,
+            )
 
         window.minute_requests.append(now)
         window.minute_tokens.append((now, estimated_tokens))
@@ -78,6 +99,9 @@ class InMemoryQuotaGuard:
 
     def _minute_token_total(self, window: _QuotaWindow) -> int:
         return sum(tokens for _, tokens in window.minute_tokens)
+
+    def reset(self) -> None:
+        self._windows.clear()
 
 
 quota_guard = InMemoryQuotaGuard()

@@ -24,7 +24,7 @@ def assemble_transcript(chunks: list[TranscriptChunkDocument]) -> AssembledTrans
     previous = ""
 
     for chunk in ordered:
-        text = (chunk.rawText or "").strip()
+        text = (chunk.normalizedText or chunk.rawText or "").strip()
         normalized = normalize_chunk_text(text, previous)
         raw_parts.append(f"[{chunk.sequenceNumber}] {text}")
         normalized_parts.append(f"[{chunk.sequenceNumber}] {normalized}")
@@ -54,7 +54,37 @@ def normalize_chunk_text(text: str, previous_text: str = "") -> str:
 
 
 def estimate_tokens(text: str) -> int:
-    return max(1, len(text.split()))
+    """Estimate tokens using a tokenizer when available, else a safe char/word mix."""
+    value = text or ""
+    if not value.strip():
+        return 0
+    tokenizer = _tiktoken_encoder()
+    if tokenizer is not None:
+        try:
+            return max(1, len(tokenizer.encode(value)))
+        except Exception:
+            pass
+    words = len(value.split())
+    char_estimate = max(1, (len(value) + 3) // 4)
+    return max(words, char_estimate)
+
+
+_TIKTOKEN_ENCODER = None
+_TIKTOKEN_LOADED = False
+
+
+def _tiktoken_encoder():
+    global _TIKTOKEN_ENCODER, _TIKTOKEN_LOADED
+    if _TIKTOKEN_LOADED:
+        return _TIKTOKEN_ENCODER
+    _TIKTOKEN_LOADED = True
+    try:
+        import tiktoken
+
+        _TIKTOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        _TIKTOKEN_ENCODER = None
+    return _TIKTOKEN_ENCODER
 
 
 def segment_transcript(

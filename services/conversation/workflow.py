@@ -7,11 +7,15 @@ from apps.api_gateway.config.setting import settings
 from services.conversation import agents
 from services.conversation.context import load_space_context
 from services.conversation.fingerprints import note_fingerprint, task_fingerprint
+from services.conversation.intelligence import score_and_filter_result
 from services.conversation.incremental import IncrementalMeetingProcessor
-from services.conversation.models import ConversationStatus, ConversationSummaryDocument, ExtractionRunStatus, WindowProcessingStatus
+from services.conversation.models import ConversationStatus, ConversationSummaryDocument, ExtractionOutcome, ExtractionRunStatus, WindowProcessingStatus
 from services.conversation.repository import ConversationRepository
-from services.conversation.safety import detect_rule_signals
 from services.conversation.transcript import assemble_transcript, estimate_tokens, segment_transcript
+from services.conversation.semantic_input import (
+    SEMANTIC_INPUT_ASSEMBLY_FAILED,
+    assemble_semantic_window_input,
+)
 from services.conversation.workflow_state import ConversationGraphState
 from services.llm.router import LLMCapability, LLMRouter, get_llm_router
 from services.queue.streams import EventEnvelope, RedisStreamProducer
@@ -76,7 +80,11 @@ class ConversationProcessingWorkflow:
             if settings.ENABLE_INCREMENTAL_MEETING_PROCESSING:
                 windows = await self.repository.list_conversation_windows(conversation_id)
                 unwindowed = await self.repository.count_unwindowed_non_empty_transcripts(conversation_id)
-                incomplete = [window for window in windows if window.status != WindowProcessingStatus.COMPLETED]
+                incomplete = [
+                    window
+                    for window in windows
+                    if window.status != WindowProcessingStatus.COMPLETED and not window.extractionSkipped
+                ]
                 if unwindowed or incomplete:
                     print(
                         "Processing deferred until drain completes:",
@@ -102,6 +110,10 @@ class ConversationProcessingWorkflow:
                     )
                     return
                 if windows:
+                    checkpoints = [window for window in windows if _is_completed_checkpoint(window)]
+                    if not checkpoints:
+                        await self._run_short_session_finalization(conversation, run, windows)
+                        return
                     await self._run_incremental_finalization(conversation, run, windows, context=None)
                     return
 
@@ -222,6 +234,54 @@ class ConversationProcessingWorkflow:
 
         return await asyncio.gather(*(run_segment(segment) for segment in state.segments))
 
+    async def _run_short_session_finalization(self, conversation, run, windows) -> None:
+        started = utc_ms()
+        conversation_id = str(conversation.id)
+        context = await load_space_context(self.repository, conversation.userId, conversation.spaceId)
+        chunks = await self.repository.list_transcript_chunks(conversation_id)
+        assembly = assemble_semantic_window_input(
+            conversation_id=conversation_id,
+            chunks=chunks,
+            windows=windows,
+            mode="final_raw",
+        )
+        if assembly.failed:
+            raise RuntimeError(SEMANTIC_INPUT_ASSEMBLY_FAILED)
+        transcript = assembly.text
+        result, provider, model = await agents.extract_from_raw_transcript(
+            self.router,
+            conversation_id,
+            str(conversation.userId),
+            str(conversation.spaceId),
+            transcript,
+            context,
+            sequence_start=assembly.sequence_start,
+            sequence_end=assembly.sequence_end,
+            window_index=assembly.window_index,
+            window_id=assembly.window_id,
+            semantic_input_diagnostics=assembly.diagnostics,
+        )
+        if result.extractionOutcome in {
+            ExtractionOutcome.EXTRACTION_FAILED,
+            ExtractionOutcome.SEMANTIC_INPUT_ASSEMBLY_FAILED,
+        }:
+            raise RuntimeError(result.extractionError or "raw transcript extraction failed after structured-output recovery")
+        result = await self._quality_review_and_repair(result, transcript, context, conversation_id, str(conversation.spaceId))
+        diagnostics = dict(result.extractionDiagnostics or {})
+        diagnostics["qualityAcceptedTaskCount"] = len(result.tasks)
+        diagnostics["qualityAcceptedNoteCount"] = len(result.notes)
+        result.extractionDiagnostics = diagnostics
+        await self._publish_final_result(
+            conversation,
+            run,
+            result,
+            provider,
+            model,
+            windows,
+            started,
+            path="short_raw_transcript",
+        )
+
     async def _run_incremental_finalization(self, conversation, run, windows, context: dict | None = None) -> None:
         started = utc_ms()
         conversation_id = str(conversation.id)
@@ -246,6 +306,22 @@ class ConversationProcessingWorkflow:
             )
             await self.repository.save_meeting_memory(memory)
 
+        checkpoints = [compact_window_summary(window) for window in ordered_windows if _is_completed_checkpoint(window)]
+        leftover_windows = [
+            window for window in ordered_windows if window.isFinalPartial or window.extractionSkipped
+        ]
+        leftover_chunks = await self.repository.list_transcript_chunks(conversation_id)
+        leftover_assembly = assemble_semantic_window_input(
+            conversation_id=conversation_id,
+            chunks=leftover_chunks,
+            windows=ordered_windows,
+            mode="leftover",
+        )
+        if leftover_assembly.failed:
+            raise RuntimeError(SEMANTIC_INPUT_ASSEMBLY_FAILED)
+        leftover = leftover_assembly.text or "\n\n".join(
+            window.text for window in leftover_windows
+        ).strip()
         artifact_payload = compact_artifact_payload(artifacts)
         window_summaries = [compact_window_summary(window) for window in ordered_windows]
         accounting = conversation.lastAccounting or {}
@@ -259,6 +335,8 @@ class ConversationProcessingWorkflow:
             memory.model_dump(),
             context,
             conversation.processingVersion,
+            leftover_raw=leftover,
+            checkpoints=checkpoints,
         )
         llm_coverage = evaluate_coverage(ordered_windows, artifacts, result)
         recovery_triggered = False
@@ -268,23 +346,40 @@ class ConversationProcessingWorkflow:
             recovery_triggered = recovered > 0
             if recovered:
                 artifacts = await self.repository.list_meeting_artifacts(conversation_id)
+                result, provider, model = await agents.reconcile_meeting(
+                    self.router,
+                    conversation_id,
+                    str(conversation.userId),
+                    str(conversation.spaceId),
+                    compact_artifact_payload(artifacts),
+                    window_summaries,
+                    memory.model_dump(),
+                    context,
+                    conversation.processingVersion,
+                    leftover_raw=leftover,
+                    checkpoints=checkpoints,
+                )
         result = preserve_unrepresented(result, artifacts, conversation_id, str(conversation.spaceId))
         coverage = evaluate_coverage(ordered_windows, artifacts, result)
-
-        run.provider = provider
-        run.model = model
-        run.processedSegmentCount = len(ordered_windows)
-        run.segmentCount = len(ordered_windows)
-        run.stagedTasks = result.tasks
-        run.stagedNotes = result.notes
-        run.stagedDecisions = result.decisions
-        run.stagedIssues = result.issues
-        run.coverageScore = coverage.coverageScore
-        run.validationErrors = [{"code": reason} for reason in coverage.reasons] if coverage.suspicious else []
-        run.warningCount = len(coverage.unrepresentedTitles)
+        evidence_corpus = leftover or "\n".join(window.text for window in ordered_windows)
+        result = await self._quality_review_and_repair(
+            result,
+            evidence_corpus,
+            context,
+            conversation_id,
+            str(conversation.spaceId),
+        )
+        result.extractionDiagnostics = {
+            **(result.extractionDiagnostics or {}),
+            "qualityAcceptedTaskCount": len(result.tasks),
+            "qualityAcceptedNoteCount": len(result.notes),
+        }
         run.checkpoints["incremental_window_finalization"] = {
+            "path": "long_checkpoint_synthesis",
             "windowCount": len(ordered_windows),
-            "inputTokenEstimate": estimate_tokens(str(artifact_payload)),
+            "checkpointCount": len(checkpoints),
+            "leftoverRawTokens": estimate_tokens(leftover) if leftover else 0,
+            "inputTokenEstimate": estimate_tokens(str(artifact_payload) + leftover),
             "durationMs": utc_ms() - started,
             "provisionalArtifactCount": coverage.meaningfulArtifactCount,
             "finalArtifactCount": coverage.finalArtifactCount,
@@ -319,14 +414,62 @@ class ConversationProcessingWorkflow:
             "reconciliation",
             run.checkpoints["incremental_window_finalization"],
         )
+        await self._publish_final_result(
+            conversation,
+            run,
+            result,
+            provider,
+            model,
+            ordered_windows,
+            started,
+            path="long_checkpoint_synthesis",
+            coverage=coverage,
+            accounting=accounting,
+        )
+
+    async def _publish_final_result(
+        self,
+        conversation,
+        run,
+        result,
+        provider: str,
+        model: str,
+        windows,
+        started: int,
+        path: str,
+        coverage=None,
+        accounting: dict | None = None,
+    ) -> None:
+        conversation_id = str(conversation.id)
+        accounting = accounting or conversation.lastAccounting or {}
+        run.provider = provider
+        run.model = model
+        run.processedSegmentCount = len(windows)
+        run.segmentCount = len(windows)
+        run.stagedTasks = result.tasks
+        run.stagedNotes = result.notes
+        run.stagedDecisions = result.decisions
+        run.stagedIssues = result.issues
+        run.coverageScore = coverage.coverageScore if coverage else None
+        run.validationErrors = [{"code": reason} for reason in coverage.reasons] if coverage and coverage.suspicious else []
+        run.warningCount = len(coverage.unrepresentedTitles) if coverage else 0
+        run.checkpoints[path] = {
+            **(run.checkpoints.get(path) or {}),
+            "durationMs": utc_ms() - started,
+            "finalTaskCount": len(result.tasks),
+            "finalNoteCount": len(result.notes),
+            "provider": provider,
+            "model": model,
+            "evidenceCoverage": bool(result.tasks or result.notes),
+        }
         await self.repository.save_extraction_run(run)
         await self.repository.transition(conversation_id, ConversationStatus.VALIDATING)
         summary = ConversationSummaryDocument(
             conversationId=conversation.id,
             userId=conversation.userId,
             spaceId=conversation.spaceId,
-            summary=result.summary,
-            topics=result.topics or [topic.label for topic in memory.activeTopics],
+            summary=result.summary or result.narrative,
+            topics=result.topics,
             importantFacts=result.importantFacts,
             decisions=[decision.title for decision in result.decisions],
             openQuestions=result.openQuestions,
@@ -334,22 +477,148 @@ class ConversationProcessingWorkflow:
             processingVersion=conversation.processingVersion,
             modelProvider=provider,
             modelName=model,
-            promptVersion="meeting-finalizer-v1",
+            promptVersion="final-synthesis-v1",
         )
         previous_memory = await self.repository.get_space_memory(conversation.userId, conversation.spaceId)
         memory_update = await agents.update_space_memory(self.router, previous_memory, summary)
-        await self.repository.publish_outputs(run, summary, memory_update)
+        expected_tasks = [task for task in result.tasks if task.operation != "NO_ACTION"]
+        expected_notes = list(result.notes)
+        persistence = {
+            "persistenceAttempted": True,
+            "tasksPersistedCount": 0,
+            "notesPersistedCount": 0,
+            "persistedTaskIds": [],
+            "persistedNoteIds": [],
+        }
+        result.extractionDiagnostics = {**(result.extractionDiagnostics or {}), **persistence}
+        try:
+            published = await self.repository.publish_outputs(run, summary, memory_update)
+        except Exception as error:
+            result.extractionDiagnostics["persistenceOutcome"] = "PERSISTENCE_FAILED"
+            agents._log_final_synthesis(result.extractionDiagnostics)
+            run.validationErrors = [*(run.validationErrors or []), {"code": "PERSISTENCE_FAILED", "message": str(error)[:500]}]
+            await self.repository.save_extraction_run(run)
+            raise agents.PersistenceFailedError("PERSISTENCE_FAILED") from error
+        task_ids = [str(item) for item in (published or {}).get("taskIds") or []]
+        note_ids = [str(item) for item in (published or {}).get("noteIds") or []]
+        result.extractionDiagnostics.update(
+            {
+                "persistenceAttempted": True,
+                "tasksPersistedCount": len(task_ids),
+                "notesPersistedCount": len(note_ids),
+                "persistedTaskIds": task_ids,
+                "persistedNoteIds": note_ids,
+            }
+        )
+        summary.taskIds = task_ids
+        if expected_tasks or expected_notes:
+            if (expected_tasks and not task_ids) or (expected_notes and not note_ids):
+                result.extractionDiagnostics["persistenceOutcome"] = "PERSISTENCE_FAILED"
+                agents._log_final_synthesis(result.extractionDiagnostics)
+                run.validationErrors = [*(run.validationErrors or []), {"code": "PERSISTENCE_FAILED"}]
+                await self.repository.save_extraction_run(run)
+                raise agents.PersistenceFailedError("PERSISTENCE_FAILED")
+            result.extractionDiagnostics["persistenceOutcome"] = "PERSISTED"
+        else:
+            result.extractionDiagnostics["persistenceOutcome"] = "NO_PUBLISHABLE_ARTIFACTS"
+        agents._log_final_synthesis(result.extractionDiagnostics)
+        run.checkpoints[path] = {
+            **(run.checkpoints.get(path) or {}),
+            **{
+                key: result.extractionDiagnostics.get(key)
+                for key in (
+                    "validatedSemanticUnitCount",
+                    "finalSynthesisInvoked",
+                    "finalSynthesisInputUnitCount",
+                    "finalSynthesisProvider",
+                    "finalSynthesisModel",
+                    "finalSynthesisRawTaskCount",
+                    "finalSynthesisRawNoteCount",
+                    "finalSynthesisParsedTaskCount",
+                    "finalSynthesisParsedNoteCount",
+                    "finalSynthesisVerdict",
+                    "taskCountAfterConfidence",
+                    "noteCountAfterConfidence",
+                    "qualityAcceptedTaskCount",
+                    "qualityAcceptedNoteCount",
+                    "qualityRejectedTaskCount",
+                    "qualityRejectedNoteCount",
+                    "qualityArtifactDiagnostics",
+                    "qualityRepairAttempted",
+                    "qualityRepairRound",
+                    "requiredConfidence",
+                    "persistenceAttempted",
+                    "persistenceOutcome",
+                    "tasksPersistedCount",
+                    "notesPersistedCount",
+                    "persistedTaskIds",
+                    "persistedNoteIds",
+                    "persistedTranscriptCount",
+                    "persistedNonEmptyTranscriptCount",
+                    "persistedSequenceNumbers",
+                    "queriedTranscriptCount",
+                    "queriedSequenceNumbers",
+                    "windowId",
+                    "windowIndex",
+                    "sequenceStart",
+                    "sequenceEnd",
+                    "expectedSequenceCount",
+                    "windowTranscriptCountBeforeFiltering",
+                    "emptyFilteredCount",
+                    "unusableFilteredCount",
+                    "usefulTranscriptCountAfterFiltering",
+                    "usefulSequenceNumbers",
+                    "semanticInputTranscriptCount",
+                    "semanticInputCharacterCount",
+                    "semanticInputEstimatedTokens",
+                    "semanticInputAssemblyFailed",
+                    "rejectionCounts",
+                )
+            },
+        }
         await self.repository.mark_transcripts_published(conversation_id)
         await self.repository.schedule_transcript_expiry(conversation_id)
         run.status = ExtractionRunStatus.PUBLISHED
         await self.repository.save_extraction_run(run)
         terminal = ConversationStatus.COMPLETED
-        if accounting.get("permanentFailures") or (not result.tasks and not result.notes and coverage.meaningfulArtifactCount):
+        if accounting.get("permanentFailures") or (path != "short_raw_transcript" and not result.tasks and not result.notes and coverage and coverage.meaningfulArtifactCount):
             terminal = ConversationStatus.PARTIAL
         await self.repository.transition(conversation_id, terminal)
 
+    async def _quality_review_and_repair(self, result, transcript: str, context: dict, conversation_id: str, space_id: str):
+        outputs = {
+            "tasks": [item.model_dump() for item in result.tasks],
+            "notes": [item.model_dump() for item in result.notes],
+        }
+        if not outputs["tasks"] and not outputs["notes"]:
+            return result
+        try:
+            review = await agents.review_extraction_quality(self.router, transcript, outputs, context)
+        except Exception as error:
+            print("Quality review skipped:", {"conversationId": conversation_id, "error": str(error)[:300]})
+            return result
+        result.tasks, result.notes = _apply_quality_decisions(result.tasks, result.notes, review)
+        needs_repair = bool(review.failed or review.missingActionable or review.missingNotes)
+        already_repaired = bool((result.extractionDiagnostics or {}).get("qualityRepairAttempted"))
+        if needs_repair and settings.MAX_QUALITY_REPAIR_ROUNDS >= 1 and not already_repaired:
+            try:
+                repair = await agents.repair_missing_items(
+                    self.router,
+                    transcript,
+                    [{"label": "missing", "reason": item} for item in [*review.missingActionable, *review.missingNotes]],
+                    {"tasks": [item.model_dump() for item in result.tasks], "notes": [item.model_dump() for item in result.notes]},
+                    context,
+                    conversation_id,
+                    space_id,
+                )
+                result.tasks = _dedupe_items_by_key([*result.tasks, *repair.tasks])
+                result.notes = _dedupe_items_by_key([*result.notes, *repair.notes])
+            except Exception as error:
+                print("Quality repair skipped:", {"conversationId": conversation_id, "error": str(error)[:300]})
+        return result
+
     async def _ensure_window_artifacts(self, conversation_id: str, windows: list, artifacts: list) -> list:
-        from services.conversation.artifact_resolver import resolve_incoming_artifacts
+        from services.conversation.artifact_resolver import reconcile_incoming_artifacts
         from services.conversation.artifacts import artifacts_from_window
 
         represented = {
@@ -379,7 +648,7 @@ class ConversationProcessingWorkflow:
             incoming = artifacts_from_window(window)
             if not incoming:
                 continue
-            working = resolve_incoming_artifacts(working, incoming)
+            working = await reconcile_incoming_artifacts(self.router, working, incoming, window.text)
             repaired += 1
         if repaired:
             await self.repository.upsert_meeting_artifacts(working)
@@ -491,8 +760,11 @@ class ConversationProcessingWorkflow:
             if decision and decision.revisedBody:
                 task.body = _clean_text(decision.revisedBody)
                 task.fingerprint = task_fingerprint(state.space_id, task)
+            if decision and decision.quality:
+                task.changes = {**task.changes, "quality": decision.quality, "synthesisSource": "llm"}
             if decision and not decision.keep:
-                state.warnings.append(f"REVIEW_FLAGGED_TASK_KEPT: {task.title} ({decision.reason})")
+                state.warnings.append(f"REVIEW_REJECTED_TASK: {task.title} ({decision.reason})")
+                continue
             kept_tasks.append(task)
         kept_notes = []
         for index, note in enumerate(state.merged_notes):
@@ -500,16 +772,30 @@ class ConversationProcessingWorkflow:
             if decision and decision.revisedBody:
                 note.body = _clean_text(decision.revisedBody)
                 note.fingerprint = note_fingerprint(state.space_id, note)
+            if decision and decision.quality:
+                note.debug = {**note.debug, "quality": decision.quality, "synthesisSource": "llm"}
             if decision and not decision.keep:
-                state.warnings.append(f"REVIEW_FLAGGED_NOTE_KEPT: {note.title} ({decision.reason})")
+                state.warnings.append(f"REVIEW_REJECTED_NOTE: {note.title} ({decision.reason})")
+                continue
             kept_notes.append(note)
         state.merged_tasks = kept_tasks
         state.merged_notes = kept_notes
 
     def _deterministic_validate(self, state: ConversationGraphState) -> None:
-        transcript_signals = detect_rule_signals(state.normalized_transcript)
-        if transcript_signals["actionSignals"] and not state.merged_tasks:
-            state.warnings.append("Action-like language detected but no tasks were extracted.")
+        scored = score_and_filter_result(
+            type("_Result", (), {
+                "tasks": state.merged_tasks,
+                "notes": state.merged_notes,
+                "decisions": state.merged_decisions,
+                "issues": state.merged_questions + state.merged_blockers,
+            })(),
+            state.normalized_transcript,
+        )
+        state.merged_tasks = scored.tasks
+        state.merged_notes = scored.notes
+        state.merged_decisions = scored.decisions
+        state.merged_questions = [item for item in scored.issues if item.kind in {"open_question", "missing_information"}]
+        state.merged_blockers = [item for item in scored.issues if item.kind in {"blocker", "risk"}]
         for collection_name, items in {
             "tasks": state.merged_tasks,
             "notes": state.merged_notes,
@@ -633,3 +919,62 @@ def utc_ms() -> int:
     import time
 
     return int(time.time() * 1000)
+
+
+def _is_completed_checkpoint(window) -> bool:
+    if window.isFinalPartial or getattr(window, "extractionSkipped", False):
+        return False
+    if window.status.value != "COMPLETED":
+        return False
+    result = window.result
+    if result is None:
+        return False
+    return bool(
+        getattr(result, "isCheckpoint", False)
+        or getattr(result, "semanticUnits", None)
+        or result.tasks
+        or result.notes
+        or result.decisions
+        or result.issues
+        or result.importantFacts
+        or result.summary
+    )
+
+
+def _apply_quality_decisions(tasks, notes, review):
+    task_decisions = {item.index: item for item in review.decisions if item.kind == "task"}
+    note_decisions = {item.index: item for item in review.decisions if item.kind == "note"}
+    kept_tasks = []
+    for index, task in enumerate(tasks):
+        decision = task_decisions.get(index)
+        if decision and decision.revisedBody:
+            task.body = _clean_text(decision.revisedBody)
+        if decision and decision.quality:
+            task.changes = {**task.changes, "quality": decision.quality, "synthesisSource": "llm"}
+        if decision and not decision.keep:
+            continue
+        kept_tasks.append(task)
+    kept_notes = []
+    for index, note in enumerate(notes):
+        decision = note_decisions.get(index)
+        if decision and decision.revisedBody:
+            note.body = _clean_text(decision.revisedBody)
+        if decision and decision.quality:
+            note.debug = {**(note.debug or {}), "quality": decision.quality, "synthesisSource": "llm"}
+        if decision and not decision.keep:
+            continue
+        kept_notes.append(note)
+    return kept_tasks, kept_notes
+
+
+def _dedupe_items_by_key(items: list) -> list:
+    seen: set[str] = set()
+    unique = []
+    for item in items:
+        key = str((getattr(item, "changes", {}) or getattr(item, "debug", {}) or {}).get("semanticArtifactKey") or "")
+        identity = key or f"{getattr(item, 'title', '')}|{getattr(item, 'body', '')[:120]}"
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(item)
+    return unique

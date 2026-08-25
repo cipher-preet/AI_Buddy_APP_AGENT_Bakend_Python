@@ -14,11 +14,14 @@ from apps.api_gateway.workers.conversation_workers import (
     run_retry_relay,
 )
 from services.db.mongo import ensure_mongo_indexes
+from services.llm.router import log_llm_provider_status
 
 
 async def main():
     await test_redis_connection()
     await ensure_mongo_indexes()
+    print("Conversation workers starting...")
+    log_llm_provider_status("conversation-worker-startup")
 
     stt_consumer = build_stt_consumer()
     audio_consumer = build_audio_consumer()

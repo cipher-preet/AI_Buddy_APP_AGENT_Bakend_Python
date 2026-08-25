@@ -14,6 +14,7 @@ async def load_space_context(
     return {
         "spaceMemory": memory.model_dump(by_alias=True),
         "activeTasks": await repository.list_active_tasks(user_id, space_id),
+        "recentNotes": await repository.list_recent_notes(user_id, space_id, limit=25),
         "recentSummaries": await repository.list_recent_summaries(user_id, space_id, limit=5),
         "openQuestions": [],
         "unresolvedBlockers": [],

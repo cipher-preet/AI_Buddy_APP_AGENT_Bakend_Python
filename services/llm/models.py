@@ -34,6 +34,7 @@ class LLMResponse(BaseModel):
     model: str
     usage: LLMUsage = Field(default_factory=LLMUsage)
     latencyMs: int | None = None
+    finishReason: str | None = None
 
 
 class ProviderHealth(BaseModel):

@@ -11,12 +11,19 @@ from services.conversation.finalization import ConversationFinalizationCoordinat
 from services.conversation.inactivity import ConversationInactivityScanner
 from services.conversation.incremental import IncrementalMeetingProcessor
 from services.conversation.repository import ConversationRepository
+from services.conversation.stt_failure import (
+    TERMINAL_FAILED_PERMANENTLY,
+    classify_stt_failure,
+    is_terminal_failed_chunk,
+    log_stt_terminal_state,
+)
 from services.conversation.workflow import ConversationProcessingWorkflow
 from services.db.mongo import get_database
 from services.queue.streams import EventEnvelope, NonRetryableQueueError, RedisStreamConsumer
 from services.queue.streams import RedisStreamProducer
 from services.queue.redis_queue import redis_client
 from services.storage.s3_audio_storage import (
+    PermanentS3StorageError,
     get_s3_audio_storage,
     safe_temp_audio_path,
     temp_audio_root,
@@ -24,6 +31,7 @@ from services.storage.s3_audio_storage import (
 )
 from services.speech.transcription_router import transcribe_from_path_with_fallback
 from services.conversation.models import ConversationStatus, STTStatus
+from services.llm.router import LLMCapability, get_llm_router
 
 
 async def handle_stt_event(event: EventEnvelope) -> None:
@@ -41,6 +49,18 @@ async def handle_stt_event(event: EventEnvelope) -> None:
                 "conversationId": conversation_id,
                 "sequenceNumber": sequence_number,
                 "stage": "stt_duplicate_completed",
+            },
+        )
+        return
+    if existing and is_terminal_failed_chunk(existing):
+        print(
+            "Duplicate STT event skipped:",
+            {
+                "eventId": event.eventId,
+                "correlationId": event.correlationId,
+                "conversationId": conversation_id,
+                "sequenceNumber": sequence_number,
+                "stage": "stt_duplicate_terminal_failed",
             },
         )
         return
@@ -173,12 +193,19 @@ async def handle_stt_event(event: EventEnvelope) -> None:
                     payload={"expectedLastSequence": conversation.expectedLastSequence},
                 ),
             )
-    except ValueError as error:
-        await repository.fail_transcript_chunk(conversation_id, sequence_number, str(error))
-        await _publish_finalization_if_stopped(repository, conversation_id, event.eventId)
-        raise NonRetryableQueueError(str(error)) from error
     except Exception as error:
-        await repository.fail_transcript_chunk(conversation_id, sequence_number, str(error))
+        await _record_stt_sequence_failure(
+            repository,
+            event=event,
+            conversation_id=conversation_id,
+            sequence_number=sequence_number,
+            error=error,
+            existing=existing,
+            retry_exhausted=False,
+        )
+        classification = classify_stt_failure(error)
+        if classification.permanent:
+            raise NonRetryableQueueError(classification.sanitized_message) from error
         raise
     finally:
         if job_dir is not None:
@@ -186,6 +213,74 @@ async def handle_stt_event(event: EventEnvelope) -> None:
                 _cleanup_job_dir(job_dir)
             except Exception as cleanup_error:
                 print("Conversation worker temporary audio cleanup failed:", str(cleanup_error))
+
+
+async def handle_stt_dead_letter(event: EventEnvelope, error: Exception) -> None:
+    payload = event.payload or {}
+    conversation_id = str(payload.get("conversationId") or event.conversationId or "").strip()
+    sequence_value = payload.get("sequenceNumber")
+    if not conversation_id or sequence_value is None:
+        return
+    repository = ConversationRepository(get_database())
+    existing = await repository.get_transcript_chunk(conversation_id, int(sequence_value))
+    await _record_stt_sequence_failure(
+        repository,
+        event=event,
+        conversation_id=conversation_id,
+        sequence_number=int(sequence_value),
+        error=error,
+        existing=existing,
+        retry_exhausted=True,
+    )
+
+
+async def _record_stt_sequence_failure(
+    repository: ConversationRepository,
+    *,
+    event: EventEnvelope,
+    conversation_id: str,
+    sequence_number: int,
+    error: Exception,
+    existing,
+    retry_exhausted: bool,
+) -> bool:
+    payload = event.payload or {}
+    job_id = str(payload.get("jobId") or payload.get("chunkId") or event.eventId)
+    stage = "queue_dlq" if retry_exhausted else None
+    if stage is None and (isinstance(error, PermanentS3StorageError) or _is_s3_event(payload)):
+        stage = "s3_download"
+    classification = classify_stt_failure(error, retry_exhausted=retry_exhausted, stage=stage)
+    retry_count = int(getattr(existing, "sttAttempts", 0) or event.attempt or 0) + 1
+    terminal = bool(classification.permanent or retry_exhausted)
+    transitioned = await repository.fail_transcript_chunk(
+        conversation_id,
+        sequence_number,
+        classification.sanitized_message,
+        job_id=job_id,
+        failure_stage=classification.failure_stage,
+        failure_type=classification.failure_type,
+        provider=classification.provider,
+        retry_count=retry_count,
+        terminal=terminal,
+    )
+    if terminal:
+        if transitioned:
+            log_stt_terminal_state(
+                conversation_id=conversation_id,
+                sequence_number=sequence_number,
+                job_id=job_id,
+                failure_type=classification.failure_type,
+                retry_count=retry_count,
+                terminal_state=TERMINAL_FAILED_PERMANENTLY,
+            )
+        await _publish_finalization_if_stopped(repository, conversation_id, event.eventId)
+    return transitioned
+
+
+def _is_s3_event(payload: dict) -> bool:
+    return str(payload.get("storageProvider") or payload.get("storage_provider") or "").lower() == "s3" or bool(
+        payload.get("objectKey") or payload.get("s3ObjectKey") or payload.get("bucket")
+    )
 
 
 async def handle_audio_event(event: EventEnvelope) -> None:
@@ -250,24 +345,54 @@ async def handle_window_extraction_event(event: EventEnvelope) -> None:
             },
         )
         return
+    provider, model = get_llm_router().route(LLMCapability.HIGH_ACCURACY_REASONING)
+    print(
+        "Window extraction LLM route:",
+        {
+            "conversationId": event.conversationId,
+            "windowId": window_id,
+            "provider": getattr(provider, "name", None),
+            "model": model,
+            "geminiConfigured": _provider_configured("gemini"),
+            "groqConfigured": _provider_configured("groq"),
+        },
+    )
     await IncrementalMeetingProcessor(repository).extract_window(str(window_id))
     await _publish_finalization_if_stopped(repository, event.conversationId, event.eventId)
 
 
 async def handle_processing_event(event: EventEnvelope) -> None:
     repository = ConversationRepository(get_database())
+    provider, model = get_llm_router().route(LLMCapability.HIGH_ACCURACY_REASONING)
+    print(
+        "Meeting processing LLM route:",
+        {
+            "conversationId": event.conversationId,
+            "provider": getattr(provider, "name", None),
+            "model": model,
+            "geminiConfigured": _provider_configured("gemini"),
+            "groqConfigured": _provider_configured("groq"),
+        },
+    )
     try:
         await asyncio.wait_for(
             ConversationProcessingWorkflow(repository).run(event.conversationId),
             timeout=settings.CONVERSATION_PROCESSING_TIMEOUT_SECONDS,
         )
+        print("Meeting processing completed:", {"conversationId": event.conversationId, "provider": getattr(provider, "name", None), "model": model})
     except asyncio.TimeoutError as error:
         message = f"Conversation processing timed out after {settings.CONVERSATION_PROCESSING_TIMEOUT_SECONDS} seconds."
+        print("Meeting processing timed out:", {"conversationId": event.conversationId, "error": message})
         await repository.mark_active_extraction_run_failed(event.conversationId, message)
         await repository.mark_conversation_failed(
             event.conversationId,
             message,
         )
+
+
+def _provider_configured(name: str) -> bool:
+    provider = get_llm_router().providers.get(name)
+    return bool(provider) and getattr(provider, "configured", True) is not False
 
 
 def build_stt_consumer() -> RedisStreamConsumer:
@@ -277,6 +402,7 @@ def build_stt_consumer() -> RedisStreamConsumer:
         consumer_name=f"stt-{uuid4().hex[:8]}",
         handler=handle_stt_event,
         concurrency=settings.STT_WORKER_CONCURRENCY or min(settings.WORKER_CONCURRENCY, settings.SARVAM_MAX_CONCURRENCY),
+        on_dead_letter=handle_stt_dead_letter,
     )
 
 

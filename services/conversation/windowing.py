@@ -3,6 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from apps.api_gateway.config.setting import settings
+from services.conversation.budget import (
+    semantic_window_token_max,
+    semantic_window_token_target,
+    semantic_window_useful_duration_ms,
+)
 from services.conversation.models import ConversationDocument, ConversationWindowDocument, TranscriptChunkDocument
 from services.conversation.transcript import estimate_tokens, normalize_chunk_text
 
@@ -24,7 +29,7 @@ class BuiltWindow:
 
 
 def overlap_token_budget() -> int:
-    ratio_tokens = int(settings.INCREMENTAL_WINDOW_TARGET_TOKENS * settings.INCREMENTAL_WINDOW_OVERLAP_RATIO)
+    ratio_tokens = int(semantic_window_token_target() * settings.INCREMENTAL_WINDOW_OVERLAP_RATIO)
     return max(settings.INCREMENTAL_WINDOW_OVERLAP_TOKENS, ratio_tokens, 0)
 
 
@@ -33,7 +38,16 @@ def useful_transcript_text(chunk: TranscriptChunkDocument) -> str:
 
 
 def is_useful_chunk(chunk: TranscriptChunkDocument) -> bool:
+    """Non-empty transcript text only (technical). Not semantic usefulness."""
     return bool(useful_transcript_text(chunk))
+
+
+# Alias clarifying that this is transcript integrity, not LLM usefulness.
+is_transcript_usable = is_useful_chunk
+
+
+def semantic_window_text(chunks: list[TranscriptChunkDocument]) -> str:
+    return _window_text(chunks)
 
 
 def chunk_duration_ms(chunk: TranscriptChunkDocument) -> int:
@@ -64,8 +78,9 @@ def build_ready_windows(
     previous_text = _last_useful_text(current)
     index = start_index
     budget = overlap_token_budget()
-    target = settings.INCREMENTAL_WINDOW_TARGET_TOKENS
-    maximum = max(settings.INCREMENTAL_WINDOW_MAX_TOKENS, target)
+    target = semantic_window_token_target()
+    maximum = max(semantic_window_token_max(), target)
+    useful_duration_limit = semantic_window_useful_duration_ms()
     pending_empties: list[TranscriptChunkDocument] = []
 
     def flush(reason: str, final_partial: bool = False) -> None:
@@ -147,8 +162,8 @@ def build_ready_windows(
         useful_duration_exceeded = bool(
             current
             and owned_exists
-            and settings.INCREMENTAL_WINDOW_MAX_DURATION_MS > 0
-            and current_useful_duration + useful_duration > settings.INCREMENTAL_WINDOW_MAX_DURATION_MS
+            and useful_duration_limit > 0
+            and current_useful_duration + useful_duration > useful_duration_limit
         )
         sparse_timeout = bool(
             current

@@ -79,6 +79,7 @@ def select_context_for_window(
             "shortSummary": memory.shortSummary,
             "activeTopics": [topic.model_dump() for topic in memory.activeTopics[:12]],
             "knownTasks": [item.model_dump() for item in memory.knownTasks[: settings.MEETING_MEMORY_GLOBAL_ITEM_LIMIT]],
+            "knownNotes": [item.model_dump() for item in memory.knownNotes[: settings.MEETING_MEMORY_GLOBAL_ITEM_LIMIT]],
             "decisions": [item.model_dump() for item in memory.decisions[: settings.MEETING_MEMORY_GLOBAL_ITEM_LIMIT]],
             "openQuestions": [item.model_dump() for item in memory.openQuestions[: settings.MEETING_MEMORY_GLOBAL_ITEM_LIMIT]],
             "blockers": [item.model_dump() for item in memory.blockers[: settings.MEETING_MEMORY_GLOBAL_ITEM_LIMIT]],
@@ -89,6 +90,7 @@ def select_context_for_window(
         },
         "relevantArtifacts": relevant,
         "activeTopics": [topic.label for topic in memory.activeTopics],
+        "unresolvedArtifacts": relevant,
     }
 
 
@@ -98,25 +100,16 @@ def _relevant_artifacts(
     window_text: str,
     window_topics: list[str],
 ) -> list[dict[str, Any]]:
-    window_tokens = _tokens(window_text)
-    topic_labels = {_normalize(label) for label in [*window_topics, *[topic.label for topic in memory.activeTopics]]}
-    scored: list[tuple[float, MeetingArtifactDocument]] = []
-    for artifact in meaningful_artifacts(artifacts):
-        score = 0.0
-        artifact_tokens = _tokens(f"{artifact.title} {artifact.content} {artifact.topic or ''}")
-        if window_tokens and artifact_tokens:
-            score += len(window_tokens & artifact_tokens) / max(1, len(artifact_tokens))
-        if artifact.topic and _normalize(artifact.topic) in topic_labels:
-            score += 0.4
-        if artifact.artifactType in {ArtifactType.TASK, ArtifactType.DECISION, ArtifactType.QUESTION, ArtifactType.BLOCKER}:
-            score += 0.1
-        scored.append((score, artifact))
-    scored.sort(key=lambda item: item[0], reverse=True)
-    selected = [artifact for score, artifact in scored if score > 0][: settings.MEETING_MEMORY_RETRIEVAL_LIMIT]
-    if len(selected) < min(6, len(artifacts)):
-        recent = meaningful_artifacts(artifacts)[-6:]
+    active = meaningful_artifacts(artifacts)
+    unresolved = [
+        artifact
+        for artifact in active
+        if artifact.status.value not in {"completed", "cancelled", "rejected", "superseded", "merged"}
+    ]
+    selected = unresolved[-settings.MEETING_MEMORY_RETRIEVAL_LIMIT :]
+    if len(selected) < min(6, len(active)):
         seen = {str(item.id) for item in selected}
-        for artifact in recent:
+        for artifact in active[-6:]:
             if str(artifact.id) in seen:
                 continue
             selected.append(artifact)
@@ -125,13 +118,17 @@ def _relevant_artifacts(
     return [
         {
             "artifactId": str(artifact.id),
+            "semanticHint": artifact.semanticHint or "",
             "artifactType": artifact.artifactType.value,
             "title": artifact.title,
-            "content": (artifact.content or "")[:180],
+            "content": (artifact.content or "")[:240],
             "status": artifact.status.value,
             "ownerText": artifact.ownerText,
             "dueDateText": artifact.dueDateText or artifact.dueDateResolved,
             "topic": artifact.topic,
+            "sourceWindowIds": artifact.sourceWindowIds[:4],
+            "sourceChunkIds": artifact.sourceChunkIds[:8],
+            "evidence": [span.model_dump() for span in artifact.evidence[:3]],
         }
         for artifact in selected[: settings.MEETING_MEMORY_RETRIEVAL_LIMIT]
     ]

@@ -130,8 +130,8 @@ class ConversationRepository:
         now = utc_now()
         result = await self.db.transcript_chunks.update_one(
             {
-                "conversationId": to_mongo_id(conversation_id),
-                "sequenceNumber": sequence_number,
+                "conversationId": {"$in": mongo_id_candidates(conversation_id)},
+                **_sequence_number_query(sequence_number),
                 "sttStatus": {"$ne": STTStatus.COMPLETED.value},
             },
             {
@@ -141,6 +141,11 @@ class ConversationRepository:
                     "sttRequestId": request_id,
                     "sttProvider": provider,
                     "sttStatus": STTStatus.COMPLETED.value,
+                    "lastError": None,
+                    "failureStage": None,
+                    "failureType": None,
+                    "terminal": False,
+                    "exclusionReason": None,
                     "updatedAt": now,
                 },
                 "$inc": {"sttAttempts": 1},
@@ -156,12 +161,7 @@ class ConversationRepository:
             )
 
     async def get_transcript_chunk(self, conversation_id: str, sequence_number: int) -> TranscriptChunkDocument | None:
-        data = await self.db.transcript_chunks.find_one(
-            {
-                "conversationId": to_mongo_id(conversation_id),
-                "sequenceNumber": sequence_number,
-            }
-        )
+        data = await self.db.transcript_chunks.find_one(_transcript_chunk_query(conversation_id, sequence_number))
         return TranscriptChunkDocument.model_validate(data) if data else None
 
     async def get_audio_chunk(self, conversation_id: str, sequence_number: int) -> dict[str, Any] | None:
@@ -175,9 +175,9 @@ class ConversationRepository:
     async def mark_transcript_chunk_processing(self, conversation_id: str, sequence_number: int) -> bool:
         result = await self.db.transcript_chunks.update_one(
             {
-                "conversationId": to_mongo_id(conversation_id),
-                "sequenceNumber": sequence_number,
+                **_transcript_chunk_query(conversation_id, sequence_number),
                 "sttStatus": {"$ne": STTStatus.COMPLETED.value},
+                **_non_terminal_stt_filter(),
             },
             {
                 "$set": {
@@ -188,28 +188,77 @@ class ConversationRepository:
         )
         return bool(result.modified_count)
 
-    async def fail_transcript_chunk(self, conversation_id: str, sequence_number: int, error: str) -> None:
+    async def fail_transcript_chunk(
+        self,
+        conversation_id: str,
+        sequence_number: int,
+        error: str,
+        *,
+        job_id: str | None = None,
+        failure_stage: str | None = None,
+        failure_type: str | None = None,
+        provider: str | None = None,
+        retry_count: int | None = None,
+        terminal: bool = False,
+    ) -> bool:
         now = utc_now()
+        existing = await self.db.transcript_chunks.find_one(_transcript_chunk_query(conversation_id, sequence_number))
+        if not existing:
+            return False
+        existing_status = str(existing.get("sttStatus") or "")
+        already_terminal = existing_status == STTStatus.COMPLETED.value or (
+            existing_status == STTStatus.FAILED.value and bool(existing.get("terminal"))
+        )
+        if already_terminal:
+            return False
+
+        fields: dict[str, Any] = {
+            "sttStatus": STTStatus.FAILED.value,
+            "lastError": str(error or failure_type or "stt_failed")[:200],
+            "updatedAt": now,
+        }
+        if job_id:
+            fields["jobId"] = str(job_id)
+        if failure_stage:
+            fields["failureStage"] = str(failure_stage)
+        if failure_type:
+            fields["failureType"] = str(failure_type)
+        if provider:
+            fields["sttProvider"] = str(provider)
+        if retry_count is not None:
+            fields["retryCount"] = int(retry_count)
+        if terminal:
+            fields["terminal"] = True
+            fields["exclusionReason"] = TranscriptExclusionReason.STT_FAILED.value
+        else:
+            fields["terminal"] = False
+
         result = await self.db.transcript_chunks.update_one(
-            {"conversationId": to_mongo_id(conversation_id), "sequenceNumber": sequence_number},
             {
-                "$set": {
-                    "sttStatus": STTStatus.FAILED.value,
-                    "lastError": error[:1000],
-                    "updatedAt": now,
-                },
+                **_transcript_chunk_query(conversation_id, sequence_number),
+                "sttStatus": {"$ne": STTStatus.COMPLETED.value},
+                **_non_terminal_stt_filter(),
+            },
+            {
+                "$set": fields,
                 "$inc": {"sttAttempts": 1},
             },
         )
-        if result.modified_count:
+        if not result.modified_count:
+            return False
+        if existing_status != STTStatus.FAILED.value:
             await self.db.conversations.update_one(
                 _id_query(conversation_id),
                 {"$inc": {"failedTranscriptChunkCount": 1}, "$set": {"updatedAt": now}},
             )
+        return True
 
     async def list_transcript_chunks(self, conversation_id: str) -> list[TranscriptChunkDocument]:
-        cursor = self.db.transcript_chunks.find({"conversationId": to_mongo_id(conversation_id)}).sort("sequenceNumber", 1)
-        return [TranscriptChunkDocument.model_validate(doc) async for doc in cursor]
+        cursor = self.db.transcript_chunks.find(
+            {"conversationId": {"$in": mongo_id_candidates(conversation_id)}}
+        ).sort("sequenceNumber", 1)
+        chunks = [TranscriptChunkDocument.model_validate(doc) async for doc in cursor]
+        return sorted(chunks, key=lambda chunk: int(chunk.sequenceNumber))
 
     async def list_transcript_chunks_in_range(
         self,
@@ -217,29 +266,29 @@ class ConversationRepository:
         sequence_start: int,
         sequence_end: int,
     ) -> list[TranscriptChunkDocument]:
-        cursor = self.db.transcript_chunks.find(
-            {
-                "conversationId": to_mongo_id(conversation_id),
-                "sequenceNumber": {"$gte": sequence_start, "$lte": sequence_end},
-                "sttStatus": STTStatus.COMPLETED.value,
-            }
-        ).sort("sequenceNumber", 1)
-        return [TranscriptChunkDocument.model_validate(doc) async for doc in cursor]
+        start = int(sequence_start)
+        end = int(sequence_end)
+        chunks = await self.list_transcript_chunks(conversation_id)
+        return [
+            chunk
+            for chunk in chunks
+            if chunk.sttStatus == STTStatus.COMPLETED and start <= int(chunk.sequenceNumber) <= end
+        ]
 
     async def list_completed_unwindowed_transcript_chunks(
         self,
         conversation_id: str,
         through_sequence: int | None = None,
     ) -> list[TranscriptChunkDocument]:
-        query: dict[str, Any] = {
-            "conversationId": to_mongo_id(conversation_id),
-            "sttStatus": STTStatus.COMPLETED.value,
-            "processingStatus": TranscriptProcessingStatus.UNPROCESSED.value,
-        }
-        if through_sequence is not None:
-            query["sequenceNumber"] = {"$lte": through_sequence}
-        cursor = self.db.transcript_chunks.find(query).sort("sequenceNumber", 1)
-        return [TranscriptChunkDocument.model_validate(doc) async for doc in cursor]
+        chunks = await self.list_transcript_chunks(conversation_id)
+        through = int(through_sequence) if through_sequence is not None else None
+        return [
+            chunk
+            for chunk in chunks
+            if chunk.sttStatus == STTStatus.COMPLETED
+            and chunk.processingStatus == TranscriptProcessingStatus.UNPROCESSED
+            and (through is None or int(chunk.sequenceNumber) <= through)
+        ]
 
     async def count_unwindowed_non_empty_transcripts(
         self,
@@ -338,9 +387,10 @@ class ConversationRepository:
         reclaimed: list[TranscriptChunkDocument] = []
         cursor = self.db.transcript_chunks.find(
             {
-                "conversationId": to_mongo_id(conversation_id),
+                "conversationId": {"$in": mongo_id_candidates(conversation_id)},
                 "sttStatus": STTStatus.PROCESSING.value,
                 "updatedAt": {"$lte": stale_before},
+                **_non_terminal_stt_filter(),
             }
         )
         async for doc in cursor:
@@ -425,14 +475,20 @@ class ConversationRepository:
         return ConversationWindowDocument.model_validate(data) if data else None
 
     async def list_conversation_windows(self, conversation_id: str) -> list[ConversationWindowDocument]:
-        cursor = self.db.conversation_windows.find({"conversationId": to_mongo_id(conversation_id)}).sort("sequenceStart", 1)
+        cursor = self.db.conversation_windows.find(
+            {"conversationId": {"$in": mongo_id_candidates(conversation_id)}}
+        ).sort("sequenceStart", 1)
         return [ConversationWindowDocument.model_validate(doc) async for doc in cursor]
 
     async def mark_window_processing(self, window_id: Any) -> ConversationWindowDocument | None:
         data = await self.db.conversation_windows.find_one_and_update(
             {
                 "_id": to_mongo_id(window_id),
-                "status": {"$in": [WindowProcessingStatus.PENDING.value, WindowProcessingStatus.FAILED.value]},
+                "status": {"$in": [
+                    WindowProcessingStatus.PENDING.value,
+                    WindowProcessingStatus.FAILED.value,
+                    WindowProcessingStatus.RETRYING.value,
+                ]},
             },
             {
                 "$set": {
@@ -456,6 +512,8 @@ class ConversationRepository:
         token_usage: dict[str, int] | None = None,
         artifact_count: int = 0,
         artifact_persistence_ok: bool = True,
+        extraction_skipped: bool = False,
+        checkpoint_kind: str | None = None,
     ) -> None:
         await self.db.conversation_windows.update_one(
             {"_id": to_mongo_id(window_id)},
@@ -468,6 +526,8 @@ class ConversationRepository:
                     "tokenUsage": token_usage or {},
                     "artifactCount": artifact_count,
                     "artifactPersistenceOk": artifact_persistence_ok,
+                    "extractionSkipped": extraction_skipped,
+                    "checkpointKind": checkpoint_kind or ("semantic_checkpoint" if not extraction_skipped else "raw_final"),
                     "completedAt": utc_now(),
                     "updatedAt": utc_now(),
                 }
@@ -531,10 +591,7 @@ class ConversationRepository:
             if artifact.sourceWindowId is not None:
                 doc["sourceWindowId"] = to_mongo_id(artifact.sourceWindowId)
             await self.db.meeting_artifacts.find_one_and_update(
-                {
-                    "conversationId": doc["conversationId"],
-                    "identityKey": artifact.identityKey,
-                },
+                {"_id": to_mongo_id(artifact_id)},
                 {"$set": doc, "$setOnInsert": {"_id": to_mongo_id(artifact_id)}},
                 upsert=True,
             )
@@ -1047,7 +1104,30 @@ def mongo_id_candidates(value: Any) -> list[Any]:
     candidates = [mongo_id]
     if isinstance(mongo_id, ObjectId):
         candidates.append(str(mongo_id))
+    elif value is not None and value not in candidates:
+        candidates.append(value)
     return candidates
+
+
+def _sequence_number_query(sequence_number: Any) -> dict[str, Any]:
+    number = int(sequence_number)
+    return {"sequenceNumber": {"$in": [number, str(number)]}}
+
+
+def _transcript_chunk_query(conversation_id: Any, sequence_number: Any) -> dict[str, Any]:
+    return {
+        "conversationId": {"$in": mongo_id_candidates(conversation_id)},
+        **_sequence_number_query(sequence_number),
+    }
+
+
+def _non_terminal_stt_filter() -> dict[str, Any]:
+    return {
+        "$or": [
+            {"terminal": {"$ne": True}},
+            {"terminal": {"$exists": False}},
+        ]
+    }
 
 
 def same_mongo_id(left: Any, right: Any) -> bool:

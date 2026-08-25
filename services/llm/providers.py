@@ -53,6 +53,7 @@ def build_gemini_provider() -> OpenAICompatibleProvider | NotConfiguredProvider:
 
 
 def build_groq_provider() -> OpenAICompatibleProvider | NotConfiguredProvider:
+    # Groq Cloud OpenAI-compatible API (api.groq.com). This is not xAI Grok.
     if not settings.secret_value(settings.GROQ_API_KEY):
         return NotConfiguredProvider("groq")
     return OpenAICompatibleProvider(

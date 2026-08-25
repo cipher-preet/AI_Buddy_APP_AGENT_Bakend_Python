@@ -70,6 +70,7 @@ class RedisStreamConsumer:
         handler: Callable[[EventEnvelope], Awaitable[None]],
         concurrency: int | None = None,
         max_retries: int | None = None,
+        on_dead_letter: Callable[[EventEnvelope, Exception], Awaitable[None]] | None = None,
     ):
         self.stream = stream
         self.group = group
@@ -77,6 +78,7 @@ class RedisStreamConsumer:
         self.handler = handler
         self.concurrency = concurrency or settings.WORKER_CONCURRENCY
         self.max_retries = max_retries or settings.WORKER_MAX_RETRIES
+        self.on_dead_letter = on_dead_letter
         self._shutdown = asyncio.Event()
         self._semaphore = asyncio.Semaphore(self.concurrency)
 
@@ -204,6 +206,19 @@ class RedisStreamConsumer:
                 },
             )
             await redis_client.xack(self.stream, self.group, message_id)
+            if self.on_dead_letter is not None:
+                try:
+                    await self.on_dead_letter(event, error)
+                except Exception as callback_error:
+                    print(
+                        "Redis stream dead-letter callback failed:",
+                        {
+                            "stream": self.stream,
+                            "eventId": event.eventId,
+                            "eventType": event.eventType,
+                            "error": str(callback_error),
+                        },
+                    )
             return
 
         retry = event.model_copy(update={"attempt": event.attempt + 1})

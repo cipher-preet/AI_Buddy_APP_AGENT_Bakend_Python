@@ -138,7 +138,7 @@ def _weak_window_indexes(
             artifact_windows.add(str(artifact.sourceWindowId))
     weak: list[int] = []
     for window in windows:
-        if not _window_is_meaningful(window):
+        if not _window_is_meaningful(window) or window.isFinalPartial or window.extractionSkipped:
             continue
         window_id = str(window.id)
         represented = window_id in artifact_windows

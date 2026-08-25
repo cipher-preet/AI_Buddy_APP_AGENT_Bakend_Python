@@ -13,7 +13,12 @@ from services.llm.providers import (
     build_openai_provider,
     build_sarvam_provider,
 )
-from services.llm.quota import ProviderQuota
+from services.llm.routing_policy import (
+    conversation_intelligence_provider_order,
+    provider_model_for,
+    provider_quota_for,
+    uses_conversation_intelligence_policy,
+)
 
 
 class LLMCapability(str, Enum):
@@ -58,37 +63,19 @@ class LLMRouter:
         return provider, model
 
     def _cost_optimized_candidates(self, capability: LLMCapability) -> list[LLMRouteCandidate]:
-        gemini = self._candidate(
-            "gemini",
-            settings.GEMINI_FREE_MODEL,
-            ProviderQuota(rpm=settings.GEMINI_MAX_RPM, rpd=settings.GEMINI_MAX_RPD),
-        )
-        groq = self._candidate(
-            "groq",
-            settings.GROQ_FREE_MODEL,
-            ProviderQuota(
-                rpm=settings.GROQ_MAX_RPM,
-                rpd=settings.GROQ_MAX_RPD,
-                tpm=settings.GROQ_MAX_TPM,
-                tpd=settings.GROQ_MAX_TPD,
-            ),
-        )
-        mistral = self._candidate("mistral", settings.MISTRAL_CHEAP_MODEL)
-        sarvam = self._candidate("sarvam", settings.SARVAM_DEFAULT_MODEL)
-
+        if uses_conversation_intelligence_policy(capability) or capability == LLMCapability.CHAT_ANSWER:
+            return self._candidates_in_order(conversation_intelligence_provider_order())
         if capability == LLMCapability.NORMALIZATION:
-            return [item for item in [gemini, groq, mistral, sarvam] if item]
-        if capability == LLMCapability.SIMPLE_SUMMARY:
-            return [item for item in [groq, mistral, sarvam] if item]
-        if capability == LLMCapability.CHAT_ANSWER:
-            return [item for item in [groq, gemini, mistral, sarvam] if item]
-        if capability == LLMCapability.VALIDATION:
-            return [item for item in [groq, mistral, sarvam] if item]
-        if capability in {LLMCapability.HIGH_ACCURACY_REASONING, LLMCapability.COMPLEX_TASK_MATCHING}:
-            return [item for item in [groq, mistral, sarvam] if item]
-        if capability == LLMCapability.FALLBACK:
-            return [item for item in [mistral, sarvam] if item]
-        return [item for item in [groq, mistral, sarvam] if item]
+            return self._candidates_in_order(("gemini", "groq", "mistral", "sarvam"))
+        return self._candidates_in_order(conversation_intelligence_provider_order())
+
+    def _candidates_in_order(self, names: tuple[str, ...] | list[str]) -> list[LLMRouteCandidate]:
+        candidates: list[LLMRouteCandidate] = []
+        for name in names:
+            item = self._candidate(name, provider_model_for(name), provider_quota_for(name))
+            if item:
+                candidates.append(item)
+        return candidates
 
     def _candidate(
         self,
@@ -119,3 +106,31 @@ def get_llm_router() -> LLMRouter:
             }
         )
     return _router
+
+
+def llm_provider_status() -> list[dict]:
+    router = get_llm_router()
+    status = []
+    for name in ("gemini", "groq", "mistral", "sarvam", "openai"):
+        provider = router.providers.get(name)
+        configured = bool(provider) and getattr(provider, "configured", True) is not False
+        status.append(
+            {
+                "provider": name,
+                "configured": configured,
+                "model": getattr(provider, "default_model", None),
+            }
+        )
+    return status
+
+
+def log_llm_provider_status(source: str = "worker") -> None:
+    status = llm_provider_status()
+    print("LLM provider status:", {"source": source, "providers": status})
+    for item in status:
+        if item["provider"] in {"gemini", "groq"}:
+            state = "READY" if item["configured"] else "NOT CONFIGURED (missing API key)"
+            print(
+                "LLM provider check:",
+                {"provider": item["provider"], "model": item["model"], "state": state},
+            )

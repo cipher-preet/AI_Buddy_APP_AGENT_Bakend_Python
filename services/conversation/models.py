@@ -143,6 +143,7 @@ class WindowProcessingStatus(str, Enum):
     PENDING = "PENDING"
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
+    RETRYING = "RETRYING"
     FAILED = "FAILED"
 
 
@@ -228,8 +229,13 @@ class TranscriptChunkDocument(UtcAwareModel):
     startTimeMs: int | None = None
     endTimeMs: int | None = None
     audioFilePath: str | None = None
+    jobId: str | None = None
     sttAttempts: int = 0
+    retryCount: int = 0
     lastError: str | None = None
+    failureStage: str | None = None
+    failureType: str | None = None
+    terminal: bool = False
     archiveRef: str | None = None
     processingWindowId: Any | None = None
     processedAt: datetime | None = None
@@ -279,6 +285,7 @@ class ExtractedTask(BaseModel):
     artifactId: str | None = None
     parentTitle: str | None = None
     sourceWindowId: str | None = None
+    origin: Literal["explicit", "strongly_inferred", "unknown"] = "unknown"
 
 
 class ExtractedNote(BaseModel):
@@ -290,6 +297,7 @@ class ExtractedNote(BaseModel):
     evidence: list[EvidenceSpan]
     artifactId: str | None = None
     sourceWindowId: str | None = None
+    debug: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExtractedDecision(BaseModel):
@@ -345,15 +353,41 @@ class CoverageReport(BaseModel):
     items: list[CoverageItem] = Field(default_factory=list)
 
 
+class SemanticUnit(BaseModel):
+    semanticKey: str = ""
+    kind: str = "fact"
+    meaning: str
+    state: str = "unresolved"
+    ownerText: str | None = None
+    dueDateText: str | None = None
+    relatedSemanticKeys: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceSpan] = Field(default_factory=list)
+    evidenceIds: list[int] = Field(default_factory=list)
+    quality: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExtractionOutcome(str, Enum):
+    SUCCESS = "SUCCESS"
+    VALID_EMPTY_EXTRACTION = "VALID_EMPTY_EXTRACTION"
+    EXTRACTION_FAILED = "EXTRACTION_FAILED"
+    SEMANTIC_INPUT_ASSEMBLY_FAILED = "SEMANTIC_INPUT_ASSEMBLY_FAILED"
+
+
 class WindowExtractionResult(BaseModel):
     summary: str = ""
+    narrative: str = ""
     topics: list[str] = Field(default_factory=list)
     importantFacts: list[str] = Field(default_factory=list)
+    semanticUnits: list[SemanticUnit] = Field(default_factory=list)
     tasks: list[ExtractedTask] = Field(default_factory=list)
     notes: list[ExtractedNote] = Field(default_factory=list)
     decisions: list[ExtractedDecision] = Field(default_factory=list)
     issues: list[ExtractedIssue] = Field(default_factory=list)
     openQuestions: list[str] = Field(default_factory=list)
+    isCheckpoint: bool = False
+    extractionOutcome: ExtractionOutcome = ExtractionOutcome.SUCCESS
+    extractionError: str | None = None
+    extractionDiagnostics: dict[str, Any] = Field(default_factory=dict)
 
 
 class ConversationWindowDocument(UtcAwareModel):
@@ -381,6 +415,8 @@ class ConversationWindowDocument(UtcAwareModel):
     meaningfulSpeechMs: int | None = None
     artifactCount: int = 0
     artifactPersistenceOk: bool = True
+    extractionSkipped: bool = False
+    checkpointKind: str | None = None
     status: WindowProcessingStatus = WindowProcessingStatus.PENDING
     result: WindowExtractionResult | None = None
     provider: str | None = None
@@ -489,12 +525,18 @@ class ArtifactType(str, Enum):
 
 class ArtifactLifecycleStatus(str, Enum):
     PROVISIONAL = "provisional"
+    PROPOSED = "proposed"
     ACTIVE = "active"
     CONFIRMED = "confirmed"
+    MODIFIED = "modified"
+    ASSIGNED = "assigned"
+    BLOCKED = "blocked"
     SUPERSEDED = "superseded"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
     REJECTED = "rejected"
     MERGED = "merged"
+    UNRESOLVED = "unresolved"
 
 
 class ArtifactResolutionKind(str, Enum):
@@ -506,12 +548,69 @@ class ArtifactResolutionKind(str, Enum):
     COMPLETION = "COMPLETION"
 
 
+class ReconcileAction(str, Enum):
+    CREATE_NEW = "CREATE_NEW"
+    UPDATE_EXISTING = "UPDATE_EXISTING"
+    COMPLETE_EXISTING = "COMPLETE_EXISTING"
+    CANCEL_EXISTING = "CANCEL_EXISTING"
+    SUPERSEDE_EXISTING = "SUPERSEDE_EXISTING"
+    RELATED_BUT_DISTINCT = "RELATED_BUT_DISTINCT"
+
+
+class ArtifactReconcileDecision(BaseModel):
+    incomingIndex: int = Field(ge=0)
+    action: ReconcileAction = ReconcileAction.CREATE_NEW
+    targetArtifactId: str | None = None
+    evidence: list[EvidenceSpan] = Field(default_factory=list)
+    reason: str = ""
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _coerce_action(cls, value):
+        if isinstance(value, ReconcileAction):
+            return value
+        raw = getattr(value, "value", value)
+        normalized = str(raw or "").strip().upper().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "CREATE": ReconcileAction.CREATE_NEW,
+            "CREATE_NEW": ReconcileAction.CREATE_NEW,
+            "UPDATE": ReconcileAction.UPDATE_EXISTING,
+            "UPDATE_EXISTING": ReconcileAction.UPDATE_EXISTING,
+            "COMPLETE": ReconcileAction.COMPLETE_EXISTING,
+            "COMPLETION": ReconcileAction.COMPLETE_EXISTING,
+            "COMPLETE_EXISTING": ReconcileAction.COMPLETE_EXISTING,
+            "CANCEL": ReconcileAction.CANCEL_EXISTING,
+            "CANCELLATION": ReconcileAction.CANCEL_EXISTING,
+            "CANCEL_EXISTING": ReconcileAction.CANCEL_EXISTING,
+            "SUPERSEDE": ReconcileAction.SUPERSEDE_EXISTING,
+            "SUPERSEDE_EXISTING": ReconcileAction.SUPERSEDE_EXISTING,
+            "RELATED": ReconcileAction.RELATED_BUT_DISTINCT,
+            "RELATED_BUT_DISTINCT": ReconcileAction.RELATED_BUT_DISTINCT,
+            "DUPLICATE": ReconcileAction.UPDATE_EXISTING,
+        }
+        if normalized in ReconcileAction._value2member_map_:
+            return ReconcileAction(normalized)
+        return aliases.get(normalized, ReconcileAction.CREATE_NEW)
+
+    @field_validator("targetArtifactId", mode="before")
+    @classmethod
+    def _blank_target_id(cls, value):
+        text = str(value or "").strip()
+        return text or None
+
+
+class ArtifactReconcileResponse(BaseModel):
+    decisions: list[ArtifactReconcileDecision] = Field(default_factory=list)
+
+
 class ArtifactHistoryEntry(BaseModel):
     at: datetime = Field(default_factory=utc_now)
     sourceWindowId: str | None = None
     resolution: ArtifactResolutionKind = ArtifactResolutionKind.UPDATE
     change: str = ""
     previousContent: str | None = None
+    evidence: list[EvidenceSpan] = Field(default_factory=list)
+    reconcileAction: str | None = None
 
 
 class MeetingArtifactDocument(BaseModel):
@@ -520,6 +619,7 @@ class MeetingArtifactDocument(BaseModel):
     userId: Any
     spaceId: Any
     identityKey: str
+    semanticHint: str | None = None
     artifactType: ArtifactType
     title: str
     content: str = ""

@@ -43,8 +43,11 @@ def note_fingerprint(space_id: str, note: ExtractedNote) -> str:
 
 def artifact_identity_key(
     conversation_id: str,
-    artifact_type: str,
-    title: str,
+    artifact_id: str,
+    artifact_type: str | None = None,
+    title: str | None = None,
     owner_text: str | None = None,
+    semantic_key: str | None = None,
 ) -> str:
-    return stable_hash(str(conversation_id), artifact_type, title, owner_text or "")
+    """Stable per-artifact identity. semantic_key is never identity."""
+    return stable_hash(str(conversation_id), "id", str(artifact_id))

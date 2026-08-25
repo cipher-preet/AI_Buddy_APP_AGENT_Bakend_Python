@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     GEMINI_MAX_RPM: int = 12
     GEMINI_MAX_RPD: int = 900
 
+    # Groq Cloud (https://api.groq.com). This is not xAI Grok.
     GROQ_API_KEY: SecretStr | str = ""
     GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"
     GROQ_FREE_MODEL: str = "openai/gpt-oss-20b"
@@ -137,13 +138,17 @@ class Settings(BaseSettings):
     MAX_TRANSCRIPT_SEGMENTS: int = 80
     MAX_REPAIR_ROUNDS: int = 2
     ENABLE_INCREMENTAL_MEETING_PROCESSING: bool = True
-    INCREMENTAL_WINDOW_TARGET_TOKENS: int = Field(default=1200, ge=200, le=20000)
-    INCREMENTAL_WINDOW_MAX_TOKENS: int = Field(default=1800, ge=200, le=40000)
-    INCREMENTAL_WINDOW_OVERLAP_TOKENS: int = Field(default=150, ge=0, le=5000)
-    INCREMENTAL_WINDOW_OVERLAP_RATIO: float = Field(default=0.12, ge=0, le=0.5)
-    INCREMENTAL_WINDOW_MAX_DURATION_MS: int = Field(default=5 * 60 * 1000, ge=1000, le=60 * 60 * 1000)
-    SPARSE_WINDOW_MAX_WALL_CLOCK_MS: int = Field(default=15 * 60 * 1000, ge=1000, le=60 * 60 * 1000)
+    SEMANTIC_WINDOW_MAX_USEFUL_MINUTES: int = Field(default=60, ge=1, le=480)
+    SEMANTIC_WINDOW_MAX_TRANSCRIPT_TOKENS: int = Field(default=22000, ge=200, le=100000)
+    SEMANTIC_WINDOW_SAFE_CONTEXT_RATIO: float = Field(default=0.72, ge=0.3, le=0.95)
+    INCREMENTAL_WINDOW_TARGET_TOKENS: int = Field(default=22000, ge=200, le=100000)
+    INCREMENTAL_WINDOW_MAX_TOKENS: int = Field(default=28000, ge=200, le=120000)
+    INCREMENTAL_WINDOW_OVERLAP_TOKENS: int = Field(default=200, ge=0, le=8000)
+    INCREMENTAL_WINDOW_OVERLAP_RATIO: float = Field(default=0.02, ge=0, le=0.5)
+    INCREMENTAL_WINDOW_MAX_DURATION_MS: int = Field(default=60 * 60 * 1000, ge=1000, le=8 * 60 * 60 * 1000)
+    SPARSE_WINDOW_MAX_WALL_CLOCK_MS: int = Field(default=0, ge=0, le=8 * 60 * 60 * 1000)
     SPARSE_WINDOW_MIN_USEFUL_TOKENS: int = Field(default=4, ge=1, le=500)
+    LLM_PROVIDER_CONTEXT_TOKENS: str = "groq:8192,gemini:1048576,mistral:32768,sarvam:32768,openai:128000,anthropic:200000"
     WINDOW_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=180, ge=15, le=3600)
     STT_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=300, ge=30, le=3600)
     FINALIZATION_MAX_RETRIES: int = Field(default=8, ge=1, le=50)
@@ -157,8 +162,19 @@ class Settings(BaseSettings):
     COVERAGE_MIN_PROVISIONAL_FOR_GUARD: int = Field(default=8, ge=1, le=100)
     COVERAGE_WEAK_WINDOW_MIN_TOKENS: int = Field(default=200, ge=20, le=5000)
     SELECTIVE_RECOVERY_MAX_WINDOWS: int = Field(default=3, ge=0, le=20)
-    FINAL_MODEL_INPUT_TOKEN_LIMIT: int = Field(default=24000, ge=1000, le=200000)
+    FINAL_MODEL_INPUT_TOKEN_LIMIT: int = Field(default=48000, ge=1000, le=200000)
     FINAL_COMPRESSION_GROUP_TOKENS: int = Field(default=8000, ge=1000, le=50000)
+    MAX_QUALITY_REPAIR_ROUNDS: int = Field(default=1, ge=0, le=2)
+    INTELLIGENCE_CONFIDENCE_PUBLISH_THRESHOLD: float = Field(default=0.55, ge=0, le=1)
+    INTELLIGENCE_CONFIDENCE_SUGGESTION_THRESHOLD: float = Field(default=0.45, ge=0, le=1)
+    INTELLIGENCE_CONFIDENCE_EVIDENCE_WEIGHT: float = Field(default=0.28, ge=0, le=1)
+    INTELLIGENCE_CONFIDENCE_EXPLICITNESS_WEIGHT: float = Field(default=0.20, ge=0, le=1)
+    INTELLIGENCE_CONFIDENCE_COMPLETENESS_WEIGHT: float = Field(default=0.16, ge=0, le=1)
+    INTELLIGENCE_CONFIDENCE_CONTEXT_WEIGHT: float = Field(default=0.12, ge=0, le=1)
+    INTELLIGENCE_CONFIDENCE_VALIDATION_WEIGHT: float = Field(default=0.16, ge=0, le=1)
+    INTELLIGENCE_CONFIDENCE_CONFLICT_PENALTY: float = Field(default=0.22, ge=0, le=1)
+    INTELLIGENCE_CONFIDENCE_SHALLOW_PENALTY: float = Field(default=0.12, ge=0, le=1)
+    INTELLIGENCE_CONFIDENCE_SPECULATION_PENALTY: float = Field(default=0.22, ge=0, le=1)
 
     LLM_DEFAULT_PROVIDER: str = "sarvam"
     LLM_SECONDARY_PROVIDER: str = "openai"
@@ -171,6 +187,7 @@ class Settings(BaseSettings):
     LLM_MAX_CONCURRENCY: int = 8
     LLM_TEMPERATURE: float = 0.1
     LLM_STRUCTURED_MAX_TOKENS: int = 4096
+    LLM_EXTRACTION_OUTPUT_MAX_TOKENS: int = Field(default=4096, ge=512, le=16000)
 
     MAX_QUEUED_CONVERSATIONS_PER_USER: int = 50
     MAX_ACTIVE_PROCESSING_JOBS_PER_USER: int = 2
@@ -246,6 +263,23 @@ class Settings(BaseSettings):
             for item in self.S3_ALLOWED_CONTENT_TYPES.split(",")
             if item.strip()
         }
+
+    @property
+    def semantic_window_useful_duration_ms(self) -> int:
+        return int(self.SEMANTIC_WINDOW_MAX_USEFUL_MINUTES * 60 * 1000)
+
+    @property
+    def provider_context_token_limits(self) -> dict[str, int]:
+        limits: dict[str, int] = {}
+        for item in self.LLM_PROVIDER_CONTEXT_TOKENS.split(","):
+            if ":" not in item:
+                continue
+            name, raw = item.split(":", 1)
+            try:
+                limits[name.strip().lower()] = int(raw.strip())
+            except ValueError:
+                continue
+        return limits
 
     @property
     def stt_provider_order_list(self) -> list[str]:

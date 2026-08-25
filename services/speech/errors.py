@@ -55,6 +55,7 @@ def is_permanent_audio_message(message: str) -> bool:
         "unsupported file",
         "unsupported media",
         "unsupported audio",
+        "unsupported data",
         "unprocessable",
     )
     return any(marker in normalized for marker in permanent_markers)

@@ -7,6 +7,7 @@ from apps.api_gateway.config.setting import settings
 from services.conversation.incremental import IncrementalMeetingProcessor
 from services.conversation.models import ConversationStatus, STTStatus, WindowProcessingStatus, as_utc, utc_now
 from services.conversation.repository import ConversationRepository, to_mongo_id
+from services.conversation.stt_failure import is_permanent_stt_failure, is_terminal_failed_chunk
 from services.conversation.transcript import detect_missing_sequences
 from services.conversation.windowing import is_useful_chunk
 from services.queue.streams import EventEnvelope, RedisStreamProducer
@@ -220,7 +221,7 @@ class ConversationFinalizationCoordinator:
             reclaimed.append(chunk)
         retryable_count = 0
         for chunk in reclaimed:
-            if chunk.sttStatus == STTStatus.FAILED and _is_permanent_audio_failure(chunk):
+            if chunk.sttStatus == STTStatus.FAILED and is_terminal_failed_chunk(chunk):
                 continue
             audio_chunk = await self.repository.get_audio_chunk(str(chunk.conversationId), chunk.sequenceNumber)
             if chunk.sttStatus == STTStatus.FAILED and chunk.sttAttempts >= settings.WORKER_MAX_RETRIES:
@@ -283,7 +284,7 @@ def _session_readiness(conversation, chunks, windows) -> tuple[set[int], bool, d
     pending = [chunk for chunk in chunks if chunk.sttStatus in {STTStatus.PENDING, STTStatus.PROCESSING}]
     failed = [chunk for chunk in chunks if chunk.sttStatus == STTStatus.FAILED]
     missing_timeout = _missing_sequences_are_terminal(conversation)
-    terminal_failed = [chunk.sequenceNumber for chunk in failed if _is_terminal_failed_chunk(chunk)]
+    terminal_failed = [chunk.sequenceNumber for chunk in failed if is_terminal_failed_chunk(chunk)]
     retryable_failed = [chunk.sequenceNumber for chunk in failed if chunk.sequenceNumber not in terminal_failed]
     skippable = {
         chunk.sequenceNumber
@@ -303,14 +304,20 @@ def _session_readiness(conversation, chunks, windows) -> tuple[set[int], bool, d
         chunk for chunk in useful if chunk.processingWindowId is None and not chunk.exclusionReason
     ]
     incomplete_windows = [window for window in windows if window.status != WindowProcessingStatus.COMPLETED]
+    permanently_failed = len(terminal_failed) + (len(missing) if missing_timeout else 0)
+    successful = len(useful)
+    empty_count = len(empty)
+    pending_only = sum(1 for chunk in chunks if chunk.sttStatus == STTStatus.PENDING)
+    processing = sum(1 for chunk in chunks if chunk.sttStatus == STTStatus.PROCESSING)
+    terminal_sequences = successful + empty_count + permanently_failed
     accounting = {
         "expectedSequences": expected_last + 1,
         "accountedSequences": len(present) + (len(missing) if missing_timeout else 0),
         "missingSequences": missing,
-        "emptyTranscripts": len(empty),
-        "failedTranscripts": len(failed),
+        "emptyTranscripts": empty_count,
+        "failedTranscripts": permanently_failed,
         "pendingTranscripts": len(pending),
-        "validTranscripts": len(useful),
+        "validTranscripts": successful,
         "validWindowed": len(useful_windowed),
         "validExcluded": len(useful_excluded),
         "validUnwindowed": len(useful_unwindowed),
@@ -321,7 +328,13 @@ def _session_readiness(conversation, chunks, windows) -> tuple[set[int], bool, d
         "windowsFailed": sum(1 for window in windows if window.status == WindowProcessingStatus.FAILED),
         "windowStaleRecoveredCount": 0,
         "unresolvedExpected": len(pending) + len(retryable_failed) + (0 if missing_timeout else len(missing)),
-        "permanentFailures": len(terminal_failed) + (len(missing) if missing_timeout else 0),
+        "permanentFailures": permanently_failed,
+        "terminalSequences": terminal_sequences,
+        "successfulSequences": successful,
+        "emptySequences": empty_count,
+        "permanentlyFailedSequences": permanently_failed,
+        "pendingSequences": pending_only + processing,
+        "retryingSequences": len(retryable_failed),
         "artifactPersistenceGaps": sum(
             1 for window in windows if window.status == WindowProcessingStatus.COMPLETED and window.artifactPersistenceOk is False
         ),
@@ -345,6 +358,12 @@ def _public_accounting(accounting: dict) -> dict:
         "windowsProcessing": accounting["windowsProcessing"],
         "windowsFailed": accounting["windowsFailed"],
         "unresolvedExpected": accounting["unresolvedExpected"],
+        "terminalSequences": accounting["terminalSequences"],
+        "successfulSequences": accounting["successfulSequences"],
+        "emptySequences": accounting["emptySequences"],
+        "permanentlyFailedSequences": accounting["permanentlyFailedSequences"],
+        "pendingSequences": accounting["pendingSequences"],
+        "retryingSequences": accounting["retryingSequences"],
     }
 
 
@@ -357,6 +376,8 @@ def _missing_sequences_are_terminal(conversation) -> bool:
 
 
 def _should_publish_window_job(window, stale_before) -> bool:
+    if getattr(window, "extractionSkipped", False) or window.isFinalPartial:
+        return False
     if window.status == WindowProcessingStatus.FAILED:
         return True
     if window.status != WindowProcessingStatus.PENDING:
@@ -374,7 +395,7 @@ def _is_lost_stt_job(chunk, stale_before) -> bool:
         return False
     if chunk.sttStatus == STTStatus.COMPLETED:
         return False
-    if chunk.sttStatus == STTStatus.FAILED and _is_permanent_audio_failure(chunk):
+    if chunk.sttStatus == STTStatus.FAILED and is_terminal_failed_chunk(chunk):
         return False
     if chunk.sttStatus == STTStatus.FAILED and chunk.sttAttempts >= settings.WORKER_MAX_RETRIES:
         return False
@@ -385,9 +406,7 @@ def _is_lost_stt_job(chunk, stale_before) -> bool:
 
 
 def _is_terminal_failed_chunk(chunk) -> bool:
-    if _is_permanent_audio_failure(chunk):
-        return True
-    return int(chunk.sttAttempts or 0) >= settings.WORKER_MAX_RETRIES
+    return is_terminal_failed_chunk(chunk)
 
 
 def _stt_payload_audio_fields(chunk, audio_chunk: dict | None) -> dict:
@@ -465,15 +484,6 @@ def _is_recoverable_s3_retry(chunk, audio_fields: dict) -> bool:
 
 
 def _is_permanent_audio_failure(chunk) -> bool:
-    error = str(chunk.lastError or "").lower()
-    permanent_markers = (
-        "audio duration exceeds",
-        "exceeds the maximum limit",
-        "failed to read the file",
-        "audio format",
-        "invalid audio",
-        "file too large",
-        "batch api",
-        "unsupported audio content type",
-    )
-    return any(marker in error for marker in permanent_markers)
+    if getattr(chunk, "failureType", None) and is_terminal_failed_chunk(chunk):
+        return True
+    return is_permanent_stt_failure(chunk.lastError)

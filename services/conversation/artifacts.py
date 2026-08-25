@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from services.conversation.fingerprints import artifact_identity_key, note_fingerprint, task_fingerprint
+from services.conversation.intelligence import score_and_filter_result
 from services.conversation.models import (
     ArtifactLifecycleStatus,
     ArtifactResolutionKind,
@@ -15,7 +16,9 @@ from services.conversation.models import (
     ExtractedTask,
     MeetingArtifactDocument,
     Operation,
+    SemanticUnit,
     WindowExtractionResult,
+    new_id,
     utc_now,
 )
 
@@ -39,14 +42,20 @@ DECISION_ARTIFACT_TYPES = {ArtifactType.DECISION}
 ISSUE_ARTIFACT_TYPES = {ArtifactType.QUESTION, ArtifactType.RISK, ArtifactType.BLOCKER}
 ACTIVE_STATUSES = {
     ArtifactLifecycleStatus.PROVISIONAL,
+    ArtifactLifecycleStatus.PROPOSED,
     ArtifactLifecycleStatus.ACTIVE,
     ArtifactLifecycleStatus.CONFIRMED,
+    ArtifactLifecycleStatus.MODIFIED,
+    ArtifactLifecycleStatus.ASSIGNED,
+    ArtifactLifecycleStatus.BLOCKED,
     ArtifactLifecycleStatus.COMPLETED,
+    ArtifactLifecycleStatus.UNRESOLVED,
 }
 TERMINAL_HIDDEN_STATUSES = {
     ArtifactLifecycleStatus.SUPERSEDED,
     ArtifactLifecycleStatus.MERGED,
     ArtifactLifecycleStatus.REJECTED,
+    ArtifactLifecycleStatus.CANCELLED,
 }
 
 
@@ -62,45 +71,30 @@ def artifacts_from_window(
     fallback_evidence = _window_evidence(window)
     topic = extraction.topics[0] if extraction.topics else None
     artifacts: list[MeetingArtifactDocument] = []
-    for task in extraction.tasks:
+    if getattr(extraction, "semanticUnits", None):
+        artifacts.extend(
+            _artifacts_from_semantic_units(extraction.semanticUnits, window, conversation_id, window_id, fallback_evidence, topic)
+        )
+    publishable = extraction
+    if not getattr(extraction, "isCheckpoint", False) and not getattr(extraction, "semanticUnits", None):
+        # Final user-facing conversion still uses the publish gate. Checkpoint
+        # and reconstruction artifacts stay on the ledger when evidence exists.
+        publishable = score_and_filter_result(extraction, window.text)
+    for task in publishable.tasks:
         artifacts.append(
             _task_artifact(task, window, conversation_id, window_id, fallback_evidence, topic)
         )
-    for note in extraction.notes:
+    for note in publishable.notes:
         artifacts.append(
             _note_artifact(note, ArtifactType.NOTE, window, conversation_id, window_id, fallback_evidence, topic)
         )
-    for decision in extraction.decisions:
+    for decision in publishable.decisions:
         artifacts.append(_decision_artifact(decision, window, conversation_id, window_id, fallback_evidence, topic))
-    for issue in extraction.issues:
+    for issue in publishable.issues:
         artifacts.append(_issue_artifact(issue, window, conversation_id, window_id, fallback_evidence, topic))
-    for fact in extraction.importantFacts:
-        artifacts.append(
-            _text_artifact(
-                ArtifactType.FACT,
-                fact,
-                fact,
-                window,
-                conversation_id,
-                window_id,
-                fallback_evidence,
-                topic,
-            )
-        )
-    for question in extraction.openQuestions:
-        artifacts.append(
-            _text_artifact(
-                ArtifactType.QUESTION,
-                question,
-                question,
-                window,
-                conversation_id,
-                window_id,
-                fallback_evidence,
-                topic,
-            )
-        )
-    return _dedupe_new_artifacts(artifacts)
+    return _dedupe_new_artifacts(
+        [artifact for artifact in artifacts if artifact.evidence]
+    )
 
 
 def artifacts_from_windows(windows: Iterable[ConversationWindowDocument]) -> list[MeetingArtifactDocument]:
@@ -111,11 +105,16 @@ def artifacts_from_windows(windows: Iterable[ConversationWindowDocument]) -> lis
 
 
 def compact_artifact(artifact: MeetingArtifactDocument, content_limit: int = 240) -> dict[str, Any]:
+    body_preview = (artifact.content or "")[:content_limit]
     return {
         "artifactId": str(artifact.id),
         "artifactType": artifact.artifactType.value,
         "title": artifact.title,
-        "content": (artifact.content or "")[:content_limit],
+        "content": body_preview,
+        # Kept as a derived presentation field so the persistence schema stays
+        # unchanged.  It can never accidentally repeat the title unless the
+        # validated body itself did so.
+        "bodyPreview": body_preview,
         "status": artifact.status.value,
         "resolution": artifact.resolution.value,
         "ownerText": artifact.ownerText,
@@ -210,6 +209,7 @@ def artifact_to_task(artifact: MeetingArtifactDocument, conversation_id: str, sp
         parentTitle=None,
         sourceWindowId=str(artifact.sourceWindowId) if artifact.sourceWindowId is not None else None,
         changes={"artifactType": artifact.artifactType.value, "parentArtifactId": artifact.parentArtifactId},
+        origin=artifact.reason if artifact.reason in {"explicit", "strongly_inferred"} else "unknown",
     )
     task.fingerprint = task.fingerprint or task_fingerprint(space_id, task)
     return task
@@ -228,6 +228,7 @@ def artifact_to_note(artifact: MeetingArtifactDocument, conversation_id: str, sp
         evidence=evidence,
         artifactId=str(artifact.id),
         sourceWindowId=str(artifact.sourceWindowId) if artifact.sourceWindowId is not None else None,
+        debug={"artifactType": artifact.artifactType.value, "relatedArtifactIds": artifact.relatedArtifactIds[:8]},
     )
     note.fingerprint = note.fingerprint or note_fingerprint(space_id, note)
     return note
@@ -300,10 +301,7 @@ def _task_artifact(
     topic: str | None,
 ) -> MeetingArtifactDocument:
     evidence = list(task.evidence) or [fallback_evidence]
-    artifact_type = ArtifactType.FOLLOW_UP if "follow" in task.title.lower() else ArtifactType.TASK
-    if task.dueDateText or task.dueDateResolved:
-        if "deadline" in (task.title + " " + task.body).lower() and not task.body:
-            artifact_type = ArtifactType.DEADLINE
+    artifact_type = ArtifactType.TASK
     return _base_artifact(
         conversation_id=conversation_id,
         user_id=window.userId,
@@ -326,6 +324,8 @@ def _task_artifact(
         fingerprint=task.fingerprint,
         topic=topic,
         status=_status_for_operation(task.operation),
+        reason=task.origin,
+        semantic_key=(task.changes or {}).get("semanticArtifactKey"),
     )
 
 
@@ -352,6 +352,7 @@ def _note_artifact(
         confidence=note.confidence,
         fingerprint=note.fingerprint,
         topic=topic,
+        semantic_key=(getattr(note, "debug", None) or {}).get("semanticArtifactKey"),
     )
 
 
@@ -463,16 +464,22 @@ def _base_artifact(
     fingerprint: str | None = None,
     topic: str | None = None,
     status: ArtifactLifecycleStatus = ArtifactLifecycleStatus.PROVISIONAL,
+    reason: str | None = None,
+    semantic_key: str | None = None,
 ) -> MeetingArtifactDocument:
     chunk_ids = source_chunk_ids(evidence)
     start_index = min((span.sequenceStart for span in evidence), default=window.sequenceStart)
     end_index = max((span.sequenceEnd for span in evidence), default=window.sequenceEnd)
-    identity = artifact_identity_key(conversation_id, artifact_type.value, title, owner_text)
+    artifact_id = new_id()
+    identity = artifact_identity_key(conversation_id, str(artifact_id))
+    hint = (semantic_key or "").strip() or None
     return MeetingArtifactDocument(
+        id=artifact_id,
         conversationId=window.conversationId,
         userId=user_id,
         spaceId=space_id,
         identityKey=identity,
+        semanticHint=hint,
         artifactType=artifact_type,
         title=title.strip(),
         content=content.strip(),
@@ -495,6 +502,7 @@ def _base_artifact(
         needsConfirmation=needs_confirmation,
         operation=operation,
         existingTaskId=existing_task_id,
+        reason=reason,
         createdAt=utc_now(),
         updatedAt=utc_now(),
     )
@@ -509,10 +517,10 @@ def _status_for_operation(operation: Operation | None) -> ArtifactLifecycleStatu
     if operation == "COMPLETE":
         return ArtifactLifecycleStatus.COMPLETED
     if operation == "CANCEL":
-        return ArtifactLifecycleStatus.REJECTED
+        return ArtifactLifecycleStatus.CANCELLED
     if operation == "UPDATE":
-        return ArtifactLifecycleStatus.ACTIVE
-    return ArtifactLifecycleStatus.PROVISIONAL
+        return ArtifactLifecycleStatus.MODIFIED
+    return ArtifactLifecycleStatus.PROPOSED
 
 
 def _task_operation(artifact: MeetingArtifactDocument) -> Operation:
@@ -520,13 +528,88 @@ def _task_operation(artifact: MeetingArtifactDocument) -> Operation:
         return artifact.operation
     if artifact.status == ArtifactLifecycleStatus.COMPLETED:
         return "COMPLETE"
-    if artifact.status == ArtifactLifecycleStatus.REJECTED:
+    if artifact.status in {ArtifactLifecycleStatus.REJECTED, ArtifactLifecycleStatus.CANCELLED}:
         return "CANCEL"
-    if artifact.resolution == ArtifactResolutionKind.UPDATE:
+    if artifact.resolution == ArtifactResolutionKind.UPDATE or artifact.status in {
+        ArtifactLifecycleStatus.MODIFIED,
+        ArtifactLifecycleStatus.ASSIGNED,
+        ArtifactLifecycleStatus.ACTIVE,
+    }:
         return "UPDATE"
     if artifact.needsConfirmation:
         return "NEEDS_CONFIRMATION"
     return "CREATE"
+
+
+def _artifacts_from_semantic_units(
+    units: list[SemanticUnit],
+    window: ConversationWindowDocument,
+    conversation_id: str,
+    window_id: str,
+    fallback_evidence: EvidenceSpan,
+    topic: str | None,
+) -> list[MeetingArtifactDocument]:
+    artifacts: list[MeetingArtifactDocument] = []
+    for unit in units:
+        if not (unit.meaning or "").strip():
+            continue
+        evidence = list(unit.evidence) or [fallback_evidence]
+        artifacts.append(
+            _base_artifact(
+                conversation_id=conversation_id,
+                user_id=window.userId,
+                space_id=window.spaceId,
+                artifact_type=_artifact_type_for_unit(unit.kind),
+                title=_unit_title(unit),
+                content=unit.meaning.strip(),
+                window=window,
+                window_id=window_id,
+                evidence=evidence,
+                owner_text=unit.ownerText,
+                due_date_text=unit.dueDateText,
+                confidence=0.72 if unit.quality.get("grounded") else 0.6,
+                topic=topic,
+                status=_status_from_label(unit.state),
+                reason=unit.kind,
+                semantic_key=unit.semanticKey or None,  # retrieval hint only; not identity
+            )
+        )
+    return artifacts
+
+
+def _artifact_type_for_unit(kind: str) -> ArtifactType:
+    mapping = {
+        "commitment": ArtifactType.COMMITMENT,
+        "action_candidate": ArtifactType.TASK,
+        "note_candidate": ArtifactType.NOTE,
+        "decision": ArtifactType.DECISION,
+        "fact": ArtifactType.FACT,
+        "assignment": ArtifactType.TASK,
+        "deadline": ArtifactType.DEADLINE,
+        "follow_up": ArtifactType.FOLLOW_UP,
+        "question": ArtifactType.QUESTION,
+        "thread": ArtifactType.QUESTION,
+        "dependency": ArtifactType.REQUIREMENT,
+        "blocker": ArtifactType.BLOCKER,
+        "change": ArtifactType.FACT,
+        "completion": ArtifactType.TASK,
+        "cancellation": ArtifactType.TASK,
+        "assumption": ArtifactType.FACT,
+        "narrative": ArtifactType.NOTE,
+    }
+    return mapping.get((kind or "").strip().lower(), ArtifactType.FACT)
+
+
+def _unit_title(unit: SemanticUnit) -> str:
+    meaning = " ".join((unit.meaning or "").split())
+    return meaning[:180] or unit.kind
+
+
+def _status_from_label(label: str | None) -> ArtifactLifecycleStatus:
+    try:
+        return ArtifactLifecycleStatus((label or "unresolved").strip().lower())
+    except ValueError:
+        return ArtifactLifecycleStatus.UNRESOLVED
 
 
 def _dedupe_new_artifacts(artifacts: list[MeetingArtifactDocument]) -> list[MeetingArtifactDocument]:

@@ -65,11 +65,18 @@ def test_windowing_closes_final_partial_window():
     assert windows[0].sequence_numbers == [0]
 
 
-def test_empty_substantial_window_uses_llm_recovery_pass():
+def test_empty_window_without_semantic_evidence_does_not_trigger_lexical_recovery():
+    result = WindowExtractionResult()
+    text = "[1] form delete kaise hoga\n[2] backend null bhej dega\n[3] form data mein same behavior chahiye"
+
+    assert _needs_window_recovery(result, text) is False
+
+
+def test_generic_large_empty_window_does_not_force_recovery_pass():
     result = WindowExtractionResult()
     text = " ".join(f"word{i}" for i in range(45))
 
-    assert _needs_window_recovery(result, text) is True
+    assert _needs_window_recovery(result, text) is False
 
 
 def test_facts_without_memory_objects_still_use_llm_recovery_pass():

@@ -1,25 +1,34 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from typing import Any
 
 from apps.api_gateway.config.setting import settings
 from services.conversation import agents
-from services.conversation.artifact_resolver import resolve_incoming_artifacts
+from services.conversation.artifact_resolver import reconcile_incoming_artifacts
 from services.conversation.artifacts import artifacts_from_window, compact_artifact
 from services.conversation.context import load_space_context
 from services.conversation.meeting_memory import build_meeting_memory, select_context_for_window
 from services.conversation.models import (
+    ExtractionOutcome,
     STTStatus,
     TranscriptExclusionReason,
     TranscriptProcessingStatus,
+    WindowExtractionResult,
     WindowProcessingStatus,
 )
 from services.conversation.repository import ConversationRepository
+from services.conversation.stt_failure import is_terminal_failed_chunk
 from services.conversation.windowing import (
+    CLOSE_REASON_FORCED_FINAL,
     build_ready_windows,
     is_useful_chunk,
     leading_skippable_sequences,
+)
+from services.conversation.semantic_input import (
+    as_sequence_number,
+    assemble_semantic_window_input,
 )
 from services.llm.router import LLMRouter, get_llm_router
 from services.queue.streams import EventEnvelope, RedisStreamProducer
@@ -50,8 +59,9 @@ class IncrementalMeetingProcessor:
             return []
         all_chunks = await self.repository.list_transcript_chunks(conversation_id)
         if through_sequence is not None:
-            all_chunks = [chunk for chunk in all_chunks if chunk.sequenceNumber <= through_sequence]
-        skippable = set(skippable_sequences or ())
+            through = as_sequence_number(through_sequence)
+            all_chunks = [chunk for chunk in all_chunks if as_sequence_number(chunk.sequenceNumber) <= through]
+        skippable = {as_sequence_number(item) for item in (skippable_sequences or ())}
         skippable.update(_derived_skippable_sequences(all_chunks))
         unwindowed = [
             chunk
@@ -62,15 +72,34 @@ class IncrementalMeetingProcessor:
         ]
         existing_windows = await self.repository.list_conversation_windows(conversation_id)
         start_index = len(existing_windows)
-        expected_start = existing_windows[-1].sequenceEnd + 1 if existing_windows else 0
-        unwindowed = [chunk for chunk in unwindowed if chunk.sequenceNumber >= expected_start]
+        expected_start = as_sequence_number(existing_windows[-1].sequenceEnd) + 1 if existing_windows else 0
+        unwindowed = [chunk for chunk in unwindowed if as_sequence_number(chunk.sequenceNumber) >= expected_start]
+        useful_sequences = {
+            as_sequence_number(chunk.sequenceNumber)
+            for chunk in all_chunks
+            if chunk.sttStatus == STTStatus.COMPLETED and is_useful_chunk(chunk)
+        }
+        covered = _sequences_covered_by_windows(existing_windows)
+        if force_final and useful_sequences and useful_sequences <= covered:
+            print(
+                "Duplicate final window skipped; durable membership already covers useful transcripts:",
+                {
+                    "conversationId": conversation_id,
+                    "usefulSequenceCount": len(useful_sequences),
+                    "coveredSequenceCount": len(covered),
+                    "existingWindowCount": len(existing_windows),
+                },
+            )
+            return [str(window.id) for window in existing_windows]
         if not unwindowed and not skippable:
             return []
 
         failed_terminal = [
-            chunk.sequenceNumber
+            as_sequence_number(chunk.sequenceNumber)
             for chunk in all_chunks
-            if chunk.sequenceNumber >= expected_start and chunk.sttStatus == STTStatus.FAILED and chunk.sequenceNumber in skippable
+            if as_sequence_number(chunk.sequenceNumber) >= expected_start
+            and chunk.sttStatus == STTStatus.FAILED
+            and as_sequence_number(chunk.sequenceNumber) in skippable
         ]
         if failed_terminal:
             await self.repository.mark_transcripts_excluded(
@@ -88,8 +117,8 @@ class IncrementalMeetingProcessor:
             )
             unwindowed = [chunk for chunk in unwindowed if chunk.sequenceNumber not in set(leading_empty)]
 
-        if unwindowed and unwindowed[0].sequenceNumber != expected_start:
-            hole = list(range(expected_start, unwindowed[0].sequenceNumber))
+        if unwindowed and as_sequence_number(unwindowed[0].sequenceNumber) != expected_start:
+            hole = list(range(expected_start, as_sequence_number(unwindowed[0].sequenceNumber)))
             if any(sequence not in skippable for sequence in hole):
                 return []
             present = {chunk.sequenceNumber for chunk in all_chunks}
@@ -133,7 +162,30 @@ class IncrementalMeetingProcessor:
                 skipped_sequence_numbers=built.skipped_sequence_numbers,
             )
             window_ids.append(str(saved.id))
-            if saved.status in {WindowProcessingStatus.PENDING, WindowProcessingStatus.FAILED} and saved.queuedAt is None:
+            retain_raw = saved.isFinalPartial or built.close_reason == CLOSE_REASON_FORCED_FINAL
+            if retain_raw:
+                await self.repository.complete_window(
+                    saved.id,
+                    WindowExtractionResult(isCheckpoint=False),
+                    provider="none",
+                    model="raw-passthrough",
+                    artifact_count=0,
+                    artifact_persistence_ok=True,
+                    extraction_skipped=True,
+                    checkpoint_kind="raw_final",
+                )
+                print(
+                    "Final partial window retained as raw transcript:",
+                    {
+                        "conversationId": conversation_id,
+                        "windowId": str(saved.id),
+                        "windowIndex": saved.windowIndex,
+                        "closeReason": saved.closeReason or built.close_reason,
+                        "usefulTokenCount": saved.usefulTokenCount,
+                        "meaningfulSpeechMs": saved.meaningfulSpeechMs,
+                    },
+                )
+            elif saved.status in {WindowProcessingStatus.PENDING, WindowProcessingStatus.FAILED, WindowProcessingStatus.RETRYING} and saved.queuedAt is None:
                 await self.repository.mark_window_queued(saved.id)
                 await self.producer.publish(
                     settings.REDIS_WINDOW_EXTRACTION_STREAM,
@@ -248,6 +300,7 @@ class IncrementalMeetingProcessor:
         try:
             context = await load_space_context(self.repository, window.userId, window.spaceId)
             meeting_context, existing_artifacts = await self._meeting_context_for_window(window)
+            window = await self._attach_semantic_window_input(window)
             result, provider, model = await agents.extract_window(
                 self.router,
                 window,
@@ -255,8 +308,15 @@ class IncrementalMeetingProcessor:
                 meeting_context=meeting_context,
                 recovery=recovery,
             )
+            if result.extractionOutcome in {
+                ExtractionOutcome.EXTRACTION_FAILED,
+                ExtractionOutcome.SEMANTIC_INPUT_ASSEMBLY_FAILED,
+            }:
+                message = result.extractionError or "window extraction failed after structured-output recovery"
+                await self.repository.fail_window(window.id, message)
+                raise RuntimeError(message)
             incoming = artifacts_from_window(window, result)
-            resolved = resolve_incoming_artifacts(existing_artifacts, incoming)
+            resolved = await reconcile_incoming_artifacts(self.router, existing_artifacts, incoming, window.text)
             await self.repository.upsert_meeting_artifacts(resolved)
             persisted = await self.repository.count_meeting_artifacts_for_window(str(window.conversationId), window.id)
             if incoming and persisted <= 0:
@@ -274,12 +334,25 @@ class IncrementalMeetingProcessor:
                 model,
                 artifact_count=len(incoming),
                 artifact_persistence_ok=True,
+                checkpoint_kind="semantic_checkpoint",
             )
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             metrics = {
                 "conversationId": str(window.conversationId),
                 "windowId": str(window.id),
                 "windowIndex": window.windowIndex,
+                "pipelineStages": [
+                    "context_reconstruction",
+                    "conversation_understanding",
+                    "candidate_extraction",
+                    "evidence_retrieval",
+                    "enrichment",
+                    "semantic_deduplication_merge",
+                    "critic_validator",
+                    "deterministic_confidence",
+                    "final_publish",
+                    "memory_update",
+                ],
                 "tokenCount": window.tokenCount,
                 "usefulTokenCount": window.usefulTokenCount,
                 "emptyChunkCount": window.emptyChunkCount,
@@ -324,6 +397,24 @@ class IncrementalMeetingProcessor:
             )
             raise
 
+    async def _attach_semantic_window_input(self, window):
+        chunks = await self.repository.list_transcript_chunks(str(window.conversationId))
+        assembly = assemble_semantic_window_input(
+            conversation_id=str(window.conversationId),
+            chunks=chunks,
+            windows=[window],
+            sequence_start=window.sequenceStart,
+            sequence_end=window.sequenceEnd,
+            mode="window_range",
+        )
+        text = assembly.text or window.text
+        attached = SimpleNamespace(**window.model_dump(by_alias=False), semanticInputDiagnostics=assembly.diagnostics)
+        attached.id = window.id
+        attached.text = text
+        attached.result = window.result
+        attached.status = window.status
+        return attached
+
     async def recover_windows(self, conversation_id: str, window_indexes: list[int]) -> int:
         if not window_indexes:
             return 0
@@ -351,6 +442,7 @@ class IncrementalMeetingProcessor:
     async def _recover_window(self, window) -> None:
         context = await load_space_context(self.repository, window.userId, window.spaceId)
         meeting_context, existing_artifacts = await self._meeting_context_for_window(window)
+        window = await self._attach_semantic_window_input(window)
         result, provider, model = await agents.extract_window(
             self.router,
             window,
@@ -358,8 +450,15 @@ class IncrementalMeetingProcessor:
             meeting_context=meeting_context,
             recovery=True,
         )
+        if result.extractionOutcome in {
+            ExtractionOutcome.EXTRACTION_FAILED,
+            ExtractionOutcome.SEMANTIC_INPUT_ASSEMBLY_FAILED,
+        }:
+            message = result.extractionError or "window recovery extraction failed after structured-output recovery"
+            await self.repository.fail_window(window.id, message)
+            raise RuntimeError(message)
         incoming = artifacts_from_window(window, result)
-        resolved = resolve_incoming_artifacts(existing_artifacts, incoming)
+        resolved = await reconcile_incoming_artifacts(self.router, existing_artifacts, incoming, window.text)
         await self.repository.upsert_meeting_artifacts(resolved)
         await self._refresh_meeting_memory(str(window.conversationId), window.userId, window.spaceId)
         if window.result is None:
@@ -374,6 +473,7 @@ class IncrementalMeetingProcessor:
                 model,
                 artifact_count=len(incoming),
                 artifact_persistence_ok=True,
+                checkpoint_kind="semantic_checkpoint",
             )
         print(
             "Selective window recovery completed:",
@@ -440,13 +540,30 @@ def compact_window_summary(window: Any) -> dict[str, Any]:
         "tokenCount": window.tokenCount,
         "usefulTokenCount": getattr(window, "usefulTokenCount", 0),
         "closeReason": getattr(window, "closeReason", None),
+        "isFinalPartial": bool(getattr(window, "isFinalPartial", False)),
+        "extractionSkipped": bool(getattr(window, "extractionSkipped", False)),
+        "checkpointKind": getattr(window, "checkpointKind", None),
+        "narrative": ((result.narrative if result else "") or (result.summary if result else ""))[:800],
         "summary": (result.summary if result else "")[:400],
         "topics": result.topics if result else [],
+        "semanticUnits": [unit.model_dump() for unit in getattr(result, "semanticUnits", [])] if result else [],
+        "importantFacts": result.importantFacts if result else [],
+        "openQuestions": result.openQuestions if result else [],
     }
 
 
 def compact_artifact_payload(artifacts: list) -> list[dict[str, Any]]:
     return [compact_artifact(artifact) for artifact in artifacts]
+
+
+def _sequences_covered_by_windows(windows) -> set[int]:
+    covered: set[int] = set()
+    for window in windows or []:
+        start = as_sequence_number(getattr(window, "sequenceStart", 0), 0)
+        end = as_sequence_number(getattr(window, "sequenceEnd", 0), 0)
+        if end >= start:
+            covered.update(range(start, end + 1))
+    return covered
 
 
 def _derived_skippable_sequences(chunks) -> set[int]:
@@ -458,23 +575,6 @@ def _derived_skippable_sequences(chunks) -> set[int]:
         if chunk.sttStatus == STTStatus.COMPLETED and not is_useful_chunk(chunk):
             skippable.add(chunk.sequenceNumber)
             continue
-        if chunk.sttStatus == STTStatus.FAILED and _is_terminal_failed_chunk(chunk):
+        if chunk.sttStatus == STTStatus.FAILED and is_terminal_failed_chunk(chunk):
             skippable.add(chunk.sequenceNumber)
     return skippable
-
-
-def _is_terminal_failed_chunk(chunk) -> bool:
-    error = str(chunk.lastError or "").lower()
-    permanent_markers = (
-        "audio duration exceeds",
-        "exceeds the maximum limit",
-        "failed to read the file",
-        "audio format",
-        "invalid audio",
-        "file too large",
-        "batch api",
-        "unsupported audio content type",
-    )
-    if any(marker in error for marker in permanent_markers):
-        return True
-    return int(chunk.sttAttempts or 0) >= settings.WORKER_MAX_RETRIES
