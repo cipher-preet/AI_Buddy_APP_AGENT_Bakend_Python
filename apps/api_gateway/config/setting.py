@@ -62,6 +62,21 @@ class Settings(BaseSettings):
     MISTRAL_BASE_URL: str = "https://api.mistral.ai/v1"
     MISTRAL_CHEAP_MODEL: str = "ministral-3b-2512"
 
+    # Krutrim Cloud OpenAI-compatible inference (https://cloud.olakrutrim.com/v1).
+    KRUTRIM_API_KEY: SecretStr | str = ""
+    KRUTRIM_BASE_URL: str = "https://cloud.olakrutrim.com/v1"
+
+    CONVERSATION_SEMANTIC_PROVIDER: str = "krutrim"
+    CONVERSATION_SEMANTIC_MODEL: str = "gemma-4-31b-it"
+    CONVERSATION_SYNTHESIS_PROVIDER: str = "krutrim"
+    CONVERSATION_SYNTHESIS_MODEL: str = "gpt-oss-120b"
+    CONVERSATION_SYNTHESIS_FALLBACK_PROVIDER: str = "krutrim"
+    CONVERSATION_SYNTHESIS_FALLBACK_MODEL: str = "gemma-4-31b-it"
+    CONVERSATION_VALIDATION_PROVIDER: str = "mistral"
+    CONVERSATION_VALIDATION_MODEL: str = "ministral-14b-latest"
+    CONVERSATION_VALIDATION_FALLBACK_PROVIDER: str = "krutrim"
+    CONVERSATION_VALIDATION_FALLBACK_MODEL: str = "gpt-oss-20b"
+
     QDRANT_API_KEY: SecretStr | str = ""
     QDRANT_URL: str = "http://localhost:6333"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
@@ -148,7 +163,9 @@ class Settings(BaseSettings):
     INCREMENTAL_WINDOW_MAX_DURATION_MS: int = Field(default=60 * 60 * 1000, ge=1000, le=8 * 60 * 60 * 1000)
     SPARSE_WINDOW_MAX_WALL_CLOCK_MS: int = Field(default=0, ge=0, le=8 * 60 * 60 * 1000)
     SPARSE_WINDOW_MIN_USEFUL_TOKENS: int = Field(default=4, ge=1, le=500)
-    LLM_PROVIDER_CONTEXT_TOKENS: str = "groq:8192,gemini:1048576,mistral:32768,sarvam:32768,openai:128000,anthropic:200000"
+    LLM_PROVIDER_CONTEXT_TOKENS: str = "groq:8192,gemini:1048576,mistral:262144,sarvam:32768,openai:128000,anthropic:200000,krutrim:65536"
+    # Model-specific context windows. Krutrim values come from GET /v1/models context_length.
+    LLM_MODEL_CONTEXT_TOKENS: str = "gemma-4-31b-it:131072,gpt-oss-120b:65536,gpt-oss-20b:131072,ministral-14b-latest:262144,ministral-14b-2512:262144"
     WINDOW_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=180, ge=15, le=3600)
     STT_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=300, ge=30, le=3600)
     FINALIZATION_MAX_RETRIES: int = Field(default=8, ge=1, le=50)
@@ -188,6 +205,8 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.1
     LLM_STRUCTURED_MAX_TOKENS: int = 4096
     LLM_EXTRACTION_OUTPUT_MAX_TOKENS: int = Field(default=4096, ge=512, le=16000)
+    LLM_SYNTHESIS_OUTPUT_START_TOKENS: int = Field(default=8192, ge=512, le=32768)
+    LLM_SYNTHESIS_OUTPUT_MAX_TOKENS: int = Field(default=16000, ge=512, le=32768)
 
     MAX_QUEUED_CONVERSATIONS_PER_USER: int = 50
     MAX_ACTIVE_PROCESSING_JOBS_PER_USER: int = 2
@@ -270,13 +289,21 @@ class Settings(BaseSettings):
 
     @property
     def provider_context_token_limits(self) -> dict[str, int]:
+        return self._token_limit_map(self.LLM_PROVIDER_CONTEXT_TOKENS)
+
+    @property
+    def model_context_token_limits(self) -> dict[str, int]:
+        return self._token_limit_map(self.LLM_MODEL_CONTEXT_TOKENS)
+
+    @staticmethod
+    def _token_limit_map(raw: str) -> dict[str, int]:
         limits: dict[str, int] = {}
-        for item in self.LLM_PROVIDER_CONTEXT_TOKENS.split(","):
+        for item in str(raw or "").split(","):
             if ":" not in item:
                 continue
-            name, raw = item.split(":", 1)
+            name, value = item.split(":", 1)
             try:
-                limits[name.strip().lower()] = int(raw.strip())
+                limits[name.strip().lower()] = int(value.strip())
             except ValueError:
                 continue
         return limits

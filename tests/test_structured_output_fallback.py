@@ -40,7 +40,15 @@ SCHEMA_ROOT_ECHO = {
 
 
 class _CannedProvider(OpenAICompatibleProvider):
-    def __init__(self, name: str, model: str, contents: list[str]):
+    def __init__(
+        self,
+        name: str,
+        model: str,
+        contents: list[str],
+        finish_reasons: list[str | None] | None = None,
+        completion_tokens: list[int] | None = None,
+        reasoning: list[str] | None = None,
+    ):
         super().__init__(
             name=name,
             api_key="test",
@@ -51,13 +59,31 @@ class _CannedProvider(OpenAICompatibleProvider):
             max_concurrency=1,
         )
         self.contents = list(contents)
+        self.finish_reasons = list(finish_reasons or [])
+        self.completion_tokens = list(completion_tokens or [])
+        self.reasoning = list(reasoning or [])
         self.seen_formats: list[dict | None] = []
+        self.seen_max_tokens: list[int | None] = []
 
     async def generate(self, request):
         extra = (request.metadata or {}).get("extra_body") or {}
         self.seen_formats.append(extra.get("response_format"))
+        self.seen_max_tokens.append(request.max_tokens)
         content = self.contents.pop(0) if self.contents else "{}"
-        return LLMResponse(content=content, provider=self.name, model=request.model or self.default_model, usage=LLMUsage())
+        finish = self.finish_reasons.pop(0) if self.finish_reasons else None
+        tokens = self.completion_tokens.pop(0) if self.completion_tokens else 0
+        reasoning = self.reasoning.pop(0) if self.reasoning else ""
+        if reasoning and not content:
+            from services.llm.openai_compatible import _assistant_message_text
+
+            content = _assistant_message_text({"content": content, "reasoning_content": reasoning})
+        return LLMResponse(
+            content=content,
+            provider=self.name,
+            model=request.model or self.default_model,
+            usage=LLMUsage(completionTokens=tokens, totalTokens=tokens),
+            finishReason=finish,
+        )
 
 
 def _structured_request(model: str) -> StructuredLLMRequest:

@@ -50,7 +50,9 @@ def test_unsupported_evidence_or_metadata_never_persists():
         confidence=1, sourceConversationId="conv_1", evidence=[_span("Please check the backend deployment before release.", 4)], origin="explicit",
     )
     wrong_sequence = unsupported.model_copy(update={"ownerText": None, "evidence": [_span("Please check the backend deployment before release.", 9)]})
-    assert validation_decision_for_task(unsupported, transcript) == (False, "invented_owner")
+    keep, reason = validation_decision_for_task(unsupported, transcript)
+    assert keep is True and reason == "accepted"
+    assert unsupported.ownerText is None
     assert validation_decision_for_task(wrong_sequence, transcript) == (False, "evidence_sequence_mismatch")
 
 

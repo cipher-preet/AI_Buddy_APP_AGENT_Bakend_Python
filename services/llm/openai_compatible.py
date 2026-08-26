@@ -84,7 +84,7 @@ class OpenAICompatibleProvider:
         message = choice.get("message") or {}
         usage = data.get("usage") or {}
         return LLMResponse(
-            content=str(message.get("content") or ""),
+            content=_assistant_message_text(message),
             provider=self.name,
             model=model,
             usage=LLMUsage(
@@ -107,23 +107,40 @@ class OpenAICompatibleProvider:
         last_error: Exception | None = None
         for index, attempt in enumerate(plan.attempts):
             structured_request = self._request_from_attempt(request, attempt)
-            try:
-                return await self._generate_structured_with_validation(
-                    structured_request,
-                    response_schema,
-                    requested_mode=attempt.mode,
-                    model=model,
-                )
-            except StructuredOutputError as error:
-                last_error = error
-                if index >= len(plan.attempts) - 1 or not provider_local_recovery_eligible(error):
-                    raise
-                continue
-            except LLMProviderError as error:
-                last_error = error
-                if index >= len(plan.attempts) - 1 or not provider_local_recovery_eligible(error):
-                    raise
-                continue
+            budgets = _output_budgets_for(schema_name, structured_request.max_tokens)
+            for budget_index, budget in enumerate(budgets):
+                structured_request.max_tokens = budget
+                try:
+                    return await self._generate_structured_with_validation(
+                        structured_request,
+                        response_schema,
+                        requested_mode=attempt.mode,
+                        model=model,
+                    )
+                except StructuredOutputError as error:
+                    last_error = error
+                    truncated = _output_truncated(self.last_structured_diagnostics, budget)
+                    if truncated and budget_index < len(budgets) - 1:
+                        print(
+                            "LLM output truncated; retrying same mode with higher max_tokens:",
+                            {
+                                "stage": schema_name,
+                                "provider": self.name,
+                                "model": model,
+                                "mode": attempt.mode,
+                                "fromMaxTokens": budget,
+                                "toMaxTokens": budgets[budget_index + 1],
+                            },
+                        )
+                        continue
+                    if truncated or index >= len(plan.attempts) - 1 or not provider_local_recovery_eligible(error):
+                        raise
+                    break
+                except LLMProviderError as error:
+                    last_error = error
+                    if index >= len(plan.attempts) - 1 or not provider_local_recovery_eligible(error):
+                        raise
+                    break
         raise last_error or LLMProviderError("structured output failed", retryable=True, status_code=422)
 
     def _request_from_attempt(self, request: StructuredLLMRequest, attempt) -> StructuredLLMRequest:
@@ -197,18 +214,23 @@ class OpenAICompatibleProvider:
         model: str,
     ) -> BaseModel:
         response = await self.generate(structured_request)
+        # json_schema, json_object, and plain JSON all pass through the same
+        # canonical pydantic validator. Valid JSON is not sufficient by itself.
         try:
             parsed, diagnostics = parse_structured_content(response_schema, response.content)
             diagnostics.update(
                 {
                     "provider": self.name,
                     "model": model,
+                    "stage": structured_request.schema_name or response_schema.__name__,
                     "requestedStructuredMode": requested_mode,
                     "actualResponseFormatMode": requested_mode,
                     "structuredModeUsed": requested_mode,
                     "finishReason": response.finishReason,
                     "completionTokens": int(response.usage.completionTokens or 0),
                     "promptTokens": int(response.usage.promptTokens or 0),
+                    "latencyMs": response.latencyMs,
+                    "structuredOutputSuccess": True,
                 }
             )
             self.last_structured_diagnostics = diagnostics
@@ -218,6 +240,7 @@ class OpenAICompatibleProvider:
             diagnostics = {
                 "provider": self.name,
                 "model": model,
+                "stage": structured_request.schema_name or response_schema.__name__,
                 "requestedStructuredMode": requested_mode,
                 "actualResponseFormatMode": requested_mode,
                 "structuredModeUsed": requested_mode,
@@ -225,6 +248,11 @@ class OpenAICompatibleProvider:
                 "schemaEchoDetected": error.outcome in {STRUCTURED_SCHEMA_ECHO, SCHEMA_ECHO},
                 "parsingOutcome": error.outcome,
                 "finishReason": response.finishReason,
+                "completionTokens": int(response.usage.completionTokens or 0),
+                "promptTokens": int(response.usage.promptTokens or 0),
+                "latencyMs": response.latencyMs,
+                "structuredOutputSuccess": False,
+                "retryReason": error.outcome,
             }
             self.last_structured_diagnostics = diagnostics
             _log_structured_attempt(diagnostics)
@@ -234,6 +262,7 @@ class OpenAICompatibleProvider:
             diagnostics = {
                 "provider": self.name,
                 "model": model,
+                "stage": structured_request.schema_name or response_schema.__name__,
                 "requestedStructuredMode": requested_mode,
                 "actualResponseFormatMode": requested_mode,
                 "structuredModeUsed": requested_mode,
@@ -241,6 +270,11 @@ class OpenAICompatibleProvider:
                 "schemaEchoDetected": False,
                 "parsingOutcome": reason,
                 "finishReason": response.finishReason,
+                "completionTokens": int(response.usage.completionTokens or 0),
+                "promptTokens": int(response.usage.promptTokens or 0),
+                "latencyMs": response.latencyMs,
+                "structuredOutputSuccess": False,
+                "retryReason": reason,
             }
             self.last_structured_diagnostics = diagnostics
             _log_structured_attempt(diagnostics)
@@ -402,7 +436,7 @@ def _load_json_payload(content: str) -> tuple[Any, list[str]]:
     try:
         payload = json.loads(content)
     except json.JSONDecodeError:
-        extracted = _extract_json_object(content)
+        extracted = _extract_json_object(content) or _close_truncated_json(content)
         if not extracted:
             return None, []
         try:
@@ -429,6 +463,7 @@ def _log_structured_attempt(diagnostics: dict[str, Any]) -> None:
     print(
         "Structured output attempt:",
         {
+            "stage": diagnostics.get("stage"),
             "provider": diagnostics.get("provider"),
             "model": diagnostics.get("model"),
             "requestedStructuredMode": diagnostics.get("requestedStructuredMode"),
@@ -436,6 +471,11 @@ def _log_structured_attempt(diagnostics: dict[str, Any]) -> None:
             "topLevelResponseKeys": diagnostics.get("topLevelResponseKeys") or [],
             "schemaEchoDetected": bool(diagnostics.get("schemaEchoDetected")),
             "parsingOutcome": diagnostics.get("parsingOutcome"),
+            "inputTokenEstimate": diagnostics.get("promptTokens"),
+            "outputTokens": diagnostics.get("completionTokens"),
+            "latencyMs": diagnostics.get("latencyMs"),
+            "structuredOutputSuccess": bool(diagnostics.get("structuredOutputSuccess")),
+            "retryReason": diagnostics.get("retryReason"),
         },
     )
 
@@ -475,3 +515,86 @@ def _extract_json_object(content: str) -> str | None:
             if depth == 0:
                 return content[start : index + 1]
     return None
+
+
+def _close_truncated_json(content: str) -> str | None:
+    start = content.find("{")
+    if start < 0:
+        return None
+    snippet = content[start:]
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in snippet:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]":
+            if not stack or stack[-1] != char:
+                return None
+            stack.pop()
+    repaired = snippet
+    if in_string:
+        if escaped:
+            repaired += "\\"
+        repaired += '"'
+    repaired = re.sub(r",\s*$", "", repaired)
+    while stack:
+        repaired += stack.pop()
+    try:
+        json.loads(repaired)
+    except json.JSONDecodeError:
+        return None
+    return repaired
+
+
+def _assistant_message_text(message: dict[str, Any]) -> str:
+    content = str(message.get("content") or "")
+    reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "")
+    candidates = [part for part in (_sanitize_json_text(content), _sanitize_json_text(reasoning)) if part]
+    for candidate in candidates:
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            extracted = _extract_json_object(candidate)
+            if extracted:
+                try:
+                    json.loads(extracted)
+                    return extracted
+                except json.JSONDecodeError:
+                    pass
+    for candidate in candidates:
+        repaired = _close_truncated_json(candidate)
+        if repaired:
+            return repaired
+    return content or reasoning
+
+
+def _output_truncated(diagnostics: dict[str, Any] | None, max_tokens: int | None) -> bool:
+    payload = diagnostics or {}
+    finish = str(payload.get("finishReason") or "").strip().casefold()
+    if finish in {"length", "max_tokens", "max_completion_tokens"}:
+        return True
+    completion = int(payload.get("completionTokens") or 0)
+    return bool(max_tokens and completion >= int(max_tokens))
+
+
+def _output_budgets_for(schema_name: str, requested: int | None) -> list[int]:
+    start = int(requested or settings.LLM_STRUCTURED_MAX_TOKENS)
+    if schema_name != "FinalSynthesisLLMResponse":
+        return [max(512, start)]
+    ceiling = max(512, int(settings.LLM_SYNTHESIS_OUTPUT_MAX_TOKENS))
+    start = max(512, min(start, ceiling))
+    if start >= ceiling:
+        return [ceiling]
+    return [start, ceiling]

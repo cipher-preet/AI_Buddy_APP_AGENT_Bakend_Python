@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from contextvars import ContextVar
 from typing import Any
 
@@ -25,6 +26,9 @@ _NOTE_ROLES = {
 }
 _MEANINGFUL_ROLES = _ACTION_ROLES | _NOTE_ROLES
 _HIGH_CONFIDENCE = 0.55
+CORE_EVIDENCE_INVALID = "CORE_EVIDENCE_INVALID"
+OPTIONAL_METADATA_INVALID = "OPTIONAL_METADATA_INVALID"
+EVIDENCE_VALID = "VALID"
 
 LAST_EXTRACTION_PARSE_TRACE: ContextVar[dict[str, Any] | None] = ContextVar(
     "last_extraction_parse_trace",
@@ -116,16 +120,20 @@ def coerce_extraction_lists(
     note_cls=None,
     decision_cls=None,
     issue_cls=None,
+    update_trace: bool = True,
 ) -> dict[str, Any]:
     """Keep valid items when a sibling item fails schema, instead of dropping the whole extraction."""
     payload = dict(payload)
     trace = LAST_EXTRACTION_PARSE_TRACE.get() or empty_parse_trace()
-    payload["semanticUnits"], unit_rejected, unit_reasons = _coerce_items(payload.get("semanticUnits"), unit_cls)
+    unit_rejected = 0
     task_rejected = 0
     note_rejected = 0
     decision_rejected = 0
     issue_rejected = 0
-    reasons = list(unit_reasons)
+    reasons: list[str] = []
+    if unit_cls is not None:
+        payload["semanticUnits"], unit_rejected, unit_reasons = _coerce_items(payload.get("semanticUnits"), unit_cls)
+        reasons.extend(unit_reasons)
     if task_cls is not None:
         payload["tasks"], task_rejected, task_reasons = _coerce_items(payload.get("tasks"), task_cls)
         reasons.extend(task_reasons)
@@ -148,28 +156,46 @@ def coerce_extraction_lists(
     trace["schemaRejectedIssueCount"] = issue_rejected
     trace["schemaRejectedReasons"] = reasons[:12]
     trace["supportedUnitVerdict"] = payload.get("supportedUnitVerdict")
-    LAST_EXTRACTION_PARSE_TRACE.set(trace)
+    if update_trace:
+        LAST_EXTRACTION_PARSE_TRACE.set(trace)
     return payload
 
 
 def hydrate_and_validate_unit_evidence(units: list[SemanticUnit], transcript: str) -> tuple[list[SemanticUnit], int]:
+    """Keep a unit when its core meaning is grounded by the union of cited chunks.
+
+    Optional owner/deadline/priority metadata is stripped when unsupported.
+    It must not discard the unit.
+    """
     lines = _sequence_map(transcript)
     kept: list[SemanticUnit] = []
     rejected = 0
+    rejected_records: list[dict[str, Any]] = []
     for unit in units:
-        evidence = list(unit.evidence or [])
-        if not evidence:
-            evidence = [
-                EvidenceSpan(sequenceStart=sequence, sequenceEnd=sequence, text=lines[sequence])
-                for sequence in getattr(unit, "evidenceIds", []) or []
-                if sequence in lines
-            ]
-            unit.evidence = evidence
-        unit.evidence = normalize_evidence_spans(unit.evidence, transcript)
-        if unit.evidence and _evidence_matches_transcript(unit.evidence, lines, transcript):
-            kept.append(unit)
-        else:
+        outcome = _validate_unit_core_evidence(unit, lines)
+        quality = dict(unit.quality or {})
+        quality["evidenceOutcome"] = outcome
+        quality["validatedEvidenceIds"] = list(unit.evidenceIds or [])
+        unit.quality = quality
+        if outcome == CORE_EVIDENCE_INVALID:
             rejected += 1
+            rejected_records.append(
+                {
+                    "semanticKey": unit.semanticKey,
+                    "kind": unit.kind,
+                    "citedIds": list(getattr(unit, "evidenceIds", None) or []),
+                    "spanRanges": [
+                        [span.sequenceStart, span.sequenceEnd] for span in (unit.evidence or [])
+                    ],
+                    "evidenceOutcome": outcome,
+                }
+            )
+            continue
+        kept.append(unit)
+    trace = LAST_EXTRACTION_PARSE_TRACE.get() or empty_parse_trace()
+    trace["evidenceRejectedUnitCount"] = rejected
+    trace["evidenceRejectedUnits"] = rejected_records
+    LAST_EXTRACTION_PARSE_TRACE.set(trace)
     return kept, rejected
 
 
@@ -198,14 +224,13 @@ def normalize_evidence_spans(evidence: list[EvidenceSpan] | None, transcript: st
     lines = _sequence_map(transcript)
     normalized: list[EvidenceSpan] = []
     for span in evidence or []:
-        sequences = list(range(span.sequenceStart, span.sequenceEnd + 1))
-        if sequences and all(sequence in lines for sequence in sequences):
-            text = " ".join(lines[sequence] for sequence in sequences).strip()
-            if text:
-                normalized.append(
-                    EvidenceSpan(sequenceStart=span.sequenceStart, sequenceEnd=span.sequenceEnd, text=text)
-                )
-                continue
+        sequences = _intersected_span_sequences(span, lines)
+        if sequences:
+            for sequence in sequences:
+                text = lines[sequence].strip()
+                if text:
+                    normalized.append(EvidenceSpan(sequenceStart=sequence, sequenceEnd=sequence, text=text))
+            continue
         if span.text:
             normalized.append(span)
     return _unique_spans(normalized)
@@ -320,6 +345,8 @@ def _alias_unit(item: Any) -> Any:
             if unit.get(key):
                 unit["semanticKey"] = unit[key]
                 break
+    if unit.get("evidenceIds") is not None:
+        unit["evidenceIds"] = _alias_evidence_ids(unit.get("evidenceIds"))
     if not unit.get("evidence") and unit.get("evidenceIds"):
         unit.setdefault("evidence", [])
     if isinstance(unit.get("evidence"), list):
@@ -330,7 +357,16 @@ def _alias_unit(item: Any) -> Any:
 def _alias_task(item: Any) -> Any:
     if not isinstance(item, dict):
         return item
-    task = dict(item)
+    task = _alias_title_body(dict(item))
+    if task.get("title") or task.get("body"):
+        if not task.get("operation"):
+            task["operation"] = "CREATE"
+        if task.get("confidence") is None:
+            task["confidence"] = 0.5
+        if not task.get("origin"):
+            task["origin"] = "unknown"
+        if task.get("evidence") is None:
+            task["evidence"] = []
     if isinstance(task.get("evidence"), list):
         task["evidence"] = [_alias_span(span) for span in task["evidence"]]
     return task
@@ -339,10 +375,43 @@ def _alias_task(item: Any) -> Any:
 def _alias_note(item: Any) -> Any:
     if not isinstance(item, dict):
         return item
-    note = dict(item)
+    note = _alias_title_body(dict(item))
+    if (note.get("title") or note.get("body")) and note.get("confidence") is None:
+        note["confidence"] = 0.5
     if isinstance(note.get("evidence"), list):
         note["evidence"] = [_alias_span(span) for span in note["evidence"]]
+    elif note.get("evidence") is None and (note.get("title") or note.get("body")):
+        note["evidence"] = []
     return note
+
+
+def _alias_title_body(item: dict[str, Any]) -> dict[str, Any]:
+    if not item.get("title"):
+        for key in ("heading", "name", "summary", "description", "text", "content"):
+            if str(item.get(key) or "").strip():
+                item["title"] = _first_line_title(str(item[key]))
+                break
+    if not item.get("body"):
+        for key in ("content", "description", "text", "summary", "details"):
+            if str(item.get(key) or "").strip():
+                item["body"] = str(item[key]).strip()
+                break
+    if not str(item.get("body") or "").strip() and str(item.get("title") or "").strip():
+        item["body"] = str(item["title"]).strip()
+    return item
+
+
+def _first_line_title(value: str, limit: int = 80) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    for separator in (". ", "? ", "! "):
+        if separator in text:
+            text = text.split(separator, 1)[0].strip()
+            break
+    if len(text) > limit:
+        return f"{text[: limit - 1].rstrip()}…"
+    return text
 
 
 _ISSUE_KIND_ALIASES = {
@@ -420,6 +489,8 @@ def alias_synthesis_payload(value: Any) -> Any:
 
 
 def _alias_span(item: Any) -> Any:
+    if isinstance(item, bool):
+        return item
     if isinstance(item, int):
         return {"sequenceStart": item, "sequenceEnd": item, "text": f"sequence:{item}"}
     if isinstance(item, str) and item.strip().isdigit():
@@ -429,14 +500,18 @@ def _alias_span(item: Any) -> Any:
         return item
     span = dict(item)
     if "sequenceStart" not in span:
-        if "id" in span:
-            sequence = int(span["id"])
-            span["sequenceStart"] = sequence
-            span["sequenceEnd"] = int(span.get("sequenceEnd") or sequence)
-        elif "sequenceId" in span:
-            sequence = int(span["sequenceId"])
-            span["sequenceStart"] = sequence
-            span["sequenceEnd"] = sequence
+        for key in ("id", "sequenceId", "sequence", "evidenceId", "start", "from"):
+            if key in span and _as_sequence(span[key]) is not None:
+                sequence = _as_sequence(span[key])
+                span["sequenceStart"] = sequence
+                break
+    if "sequenceEnd" not in span and span.get("sequenceStart") is not None:
+        for key in ("end", "to", "sequenceEnd"):
+            if key in span and _as_sequence(span[key]) is not None:
+                span["sequenceEnd"] = _as_sequence(span[key])
+                break
+        else:
+            span["sequenceEnd"] = span["sequenceStart"]
     if not str(span.get("text") or "").strip() and span.get("sequenceStart") is not None:
         span["text"] = f"sequence:{span['sequenceStart']}"
     return span
@@ -599,6 +674,191 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
     return [value]
+
+
+def _validate_unit_core_evidence(unit: SemanticUnit, lines: dict[int, str]) -> str:
+    ids = _cited_sequence_ids(unit, lines)
+    if not ids or not str(unit.meaning or "").strip():
+        return CORE_EVIDENCE_INVALID
+    union = " ".join(lines[sequence] for sequence in ids)
+    unit.evidenceIds = ids
+    unit.evidence = [
+        EvidenceSpan(sequenceStart=sequence, sequenceEnd=sequence, text=lines[sequence])
+        for sequence in ids
+        if lines.get(sequence, "").strip()
+    ]
+    if not unit.evidence:
+        return CORE_EVIDENCE_INVALID
+    optional_invalid = False
+    union_norm = _fold_ws(union)
+    if unit.ownerText and _fold_ws(unit.ownerText) not in union_norm:
+        unit.ownerText = None
+        optional_invalid = True
+    if unit.dueDateText and _fold_ws(unit.dueDateText) not in union_norm:
+        unit.dueDateText = None
+        optional_invalid = True
+    return OPTIONAL_METADATA_INVALID if optional_invalid else EVIDENCE_VALID
+
+
+def _cited_sequence_ids(unit: SemanticUnit, lines: dict[int, str]) -> list[int]:
+    ids: set[int] = set()
+    for value in getattr(unit, "evidenceIds", None) or []:
+        ids.update(_sequences_from_value(value, lines))
+    for span in unit.evidence or []:
+        span_ids = _intersected_span_sequences(span, lines)
+        ids.update(span_ids)
+        if span_ids:
+            continue
+        cited = _fold_ws(getattr(span, "text", "") or "")
+        if cited and not cited.startswith("sequence:"):
+            ids.update(_sequences_supported_by_text(cited, lines))
+    if not ids:
+        ids.update(_sequences_supported_by_text(_fold_ws(unit.meaning or ""), lines))
+    return sorted(sequence for sequence in ids if sequence in lines)
+
+
+def _intersected_span_sequences(span: EvidenceSpan, lines: dict[int, str]) -> list[int]:
+    try:
+        start = int(span.sequenceStart)
+        end = int(span.sequenceEnd)
+    except (TypeError, ValueError):
+        return []
+    if start > end:
+        start, end = end, start
+    if not lines or not _span_range_is_sequence_space(start, end, lines):
+        return []
+    return [sequence for sequence in range(start, end + 1) if sequence in lines]
+
+
+def _span_range_is_sequence_space(start: int, end: int, lines: dict[int, str]) -> bool:
+    min_seq = min(lines)
+    max_seq = max(lines)
+    if start > max_seq and end > max_seq:
+        return False
+    if start < min_seq and end < min_seq:
+        return False
+    return True
+
+
+def _sequences_from_value(value: Any, lines: dict[int, str]) -> list[int]:
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, dict):
+        collected: list[int] = []
+        for key in ("sequenceStart", "sequenceEnd", "sequenceId", "id", "sequence", "evidenceId", "start", "end"):
+            collected.extend(_sequences_from_value(value.get(key), lines))
+        return collected
+    if isinstance(value, (list, tuple)):
+        collected = []
+        for item in value:
+            collected.extend(_sequences_from_value(item, lines))
+        return collected
+    sequence = _as_sequence(value)
+    if sequence is not None:
+        return [sequence] if sequence in lines else []
+    text = str(value or "").strip()
+    match = re.fullmatch(r"\[?(\d+)\]?\s*[-–:]\s*\[?(\d+)\]?", text)
+    if match:
+        start, end = int(match.group(1)), int(match.group(2))
+        if start > end:
+            start, end = end, start
+        if _span_range_is_sequence_space(start, end, lines):
+            return [sequence for sequence in range(start, end + 1) if sequence in lines]
+    return []
+
+
+def _alias_evidence_ids(value: Any) -> list[int]:
+    ids: list[int] = []
+    seen: set[int] = set()
+    for item in _as_list(value):
+        sequence = _as_sequence(item)
+        candidates = [sequence] if sequence is not None else []
+        if sequence is None:
+            text = str(item or "").strip()
+            match = re.fullmatch(r"\[?(\d+)\]?\s*[-–:]\s*\[?(\d+)\]?", text)
+            if match:
+                start, end = int(match.group(1)), int(match.group(2))
+                if start > end:
+                    start, end = end, start
+                if 0 <= start and end - start <= 64:
+                    candidates = list(range(start, end + 1))
+        for candidate in candidates:
+            if candidate is None or candidate in seen:
+                continue
+            seen.add(candidate)
+            ids.append(candidate)
+    return ids
+
+
+def _sequences_supported_by_text(cited: str, lines: dict[int, str]) -> list[int]:
+    if not cited:
+        return []
+    supported: list[int] = []
+    for sequence, text in lines.items():
+        line = _fold_ws(text)
+        if not line:
+            continue
+        if cited in line or (len(line) >= 12 and line in cited) or _token_overlap_supports(line, cited):
+            supported.append(sequence)
+    return supported
+
+
+_FUNCTION_WORDS = {
+    "a", "an", "the", "to", "for", "of", "and", "or", "in", "on", "at", "by", "with",
+    "is", "are", "was", "were", "be", "been", "will", "would", "should", "shall",
+    "please", "also", "that", "this", "those", "these", "it", "we", "they", "i",
+    "you", "he", "she", "them", "us", "our", "before", "after", "from", "into",
+}
+
+
+def _token_overlap_supports(line: str, cited: str) -> bool:
+    line_tokens = _content_tokens(line)
+    cited_tokens = _content_tokens(cited)
+    if len(line_tokens) < 3 or len(cited_tokens) < 3:
+        return False
+    overlap = line_tokens & cited_tokens
+    needed = max(3, (len(line_tokens) * 3 + 4) // 5)
+    return len(overlap) >= needed
+
+
+def _content_tokens(value: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9\u0900-\u097f]+", value) if token not in _FUNCTION_WORDS and len(token) > 1}
+
+
+def _as_sequence(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        for key in ("sequenceStart", "sequenceId", "id", "sequence", "evidenceId"):
+            if key in value:
+                return _as_sequence(value[key])
+        return None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    match = re.fullmatch(r"\[(\d+)\]", text) or re.fullmatch(r"(?:seq|sequence)[:\-\s]+(\d+)", text, re.I)
+    if match:
+        return int(match.group(1))
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    if number.is_integer():
+        return int(number)
+    return None
+
+
+def _fold_ws(value: str) -> str:
+    return " ".join((value or "").casefold().split())
 
 
 def _sequence_map(transcript: str) -> dict[int, str]:

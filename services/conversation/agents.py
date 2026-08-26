@@ -23,6 +23,13 @@ from services.conversation.extraction_contract import (
     suspicious_empty_retry_instruction,
     upstream_has_grounded_evidence,
 )
+from services.conversation.task_coverage import (
+    TASK_COVERAGE_CONFLICT,
+    annotate_semantic_units,
+    coverage_repair_payload,
+    evaluate_task_coverage,
+    merge_uncovered_action_units,
+)
 from services.llm.schema_adapter import INCOMPLETE_STRUCTURED_OUTPUT, STRING_LIST_FIELDS
 from services.llm.structured_output import (
     drop_stage_for_structured_outcome,
@@ -371,7 +378,7 @@ async def extract_window(
     recovery: bool = False,
     mode: str = "checkpoint",
 ) -> tuple[WindowExtractionResult, str, str]:
-    from services.conversation.budget import expected_request_tokens, safe_input_budget
+    from services.conversation.budget import expected_request_tokens
 
     estimated_input = expected_request_tokens(str(context), str(meeting_context or {}), window.text)
     provider, model = _route_for_input(router, LLMCapability.HIGH_ACCURACY_REASONING, estimated_input)
@@ -546,6 +553,19 @@ async def extract_window(
                         "Suspicious empty extraction fallback provider failed:",
                         {"conversationId": str(window.conversationId), "error": str(error)[:500]},
                     )
+    evidence_rejected = int(parse_trace.get("evidenceRejectedUnitCount") or 0)
+    extractor_abstained = explicit_empty and not result.semanticUnits and evidence_rejected == 0
+    if not extractor_abstained:
+        before = len(result.semanticUnits)
+        result.semanticUnits = merge_uncovered_action_units(
+            result.semanticUnits, getattr(reconstruction, "threads", None), window.text
+        )
+        added = len(result.semanticUnits) - before
+        if added:
+            print(
+                "Merged uncovered action units:",
+                {"added": added, "validated": len(result.semanticUnits)},
+            )
     if mode != "checkpoint" and not recovery and not result.semanticUnits and _needs_window_recovery(result, window.text):
         reconstruction.diagnostics["fallbackTriggered"] = True
         try:
@@ -595,6 +615,21 @@ async def extract_window(
     result.extractionDiagnostics = _extraction_diagnostics(reconstruction.diagnostics, parse_trace)
     result.extractionDiagnostics.update(assembly_diagnostics)
     result.extractionDiagnostics["validatedSemanticUnitCount"] = len(result.semanticUnits)
+    annotate_semantic_units(result.semanticUnits, getattr(reconstruction, "threads", None))
+    result.extractionDiagnostics["unitEvidenceOutcomes"] = [
+        {
+            "semanticKey": unit.semanticKey,
+            "kind": unit.kind,
+            "evidenceIds": list(unit.evidenceIds or []),
+            "evidenceOutcome": (unit.quality or {}).get("evidenceOutcome"),
+            "actionable": (unit.quality or {}).get("actionable"),
+        }
+        for unit in [*result.semanticUnits]
+    ]
+    if result.extractionDiagnostics["unitEvidenceOutcomes"] or parse_trace.get("evidenceRejectedUnitCount"):
+        print("Semantic unit evidence outcomes:", result.extractionDiagnostics["unitEvidenceOutcomes"])
+        if parse_trace.get("evidenceRejectedUnits"):
+            print("Semantic unit evidence rejected:", parse_trace.get("evidenceRejectedUnits"))
     if mode == "checkpoint":
         result.extractionDiagnostics.update(
             empty_final_synthesis_diagnostics(
@@ -798,7 +833,7 @@ async def synthesize_final_from_semantic_units(
     )
     diagnostics["finalSynthesisInputUnitCount"] = len(unit_payload)
     estimated = _rough_token_count(json.dumps(unit_payload, default=str, ensure_ascii=True) + (transcript or leftover_raw))
-    provider, model = _route_for_input(router, LLMCapability.HIGH_ACCURACY_REASONING, estimated)
+    provider, model = _route_for_input(router, LLMCapability.FINAL_SYNTHESIS, estimated)
     diagnostics["finalSynthesisProvider"] = resolved_provider_name(provider)
     diagnostics["finalSynthesisModel"] = resolved_provider_model(provider, model) or model
     payload = {
@@ -852,7 +887,11 @@ async def synthesize_final_from_semantic_units(
     synthesized = _window_result_from_llm(response, conversation_id, space_id)
     diagnostics["finalSynthesisParsedTaskCount"] = len(synthesized.tasks)
     diagnostics["finalSynthesisParsedNoteCount"] = len(synthesized.notes)
-    if response.publishVerdict == "NO_PUBLISHABLE_ARTIFACTS" or (
+    if synthesized.tasks or synthesized.notes:
+        diagnostics["finalSynthesisVerdict"] = "PUBLISH"
+        if response.publishVerdict == "NO_PUBLISHABLE_ARTIFACTS":
+            diagnostics["publishVerdictOverridden"] = True
+    elif response.publishVerdict == "NO_PUBLISHABLE_ARTIFACTS" or (
         not synthesized.tasks and not synthesized.notes
     ):
         diagnostics["finalSynthesisVerdict"] = "NO_PUBLISHABLE_ARTIFACTS"
@@ -885,8 +924,20 @@ def _materialize_extraction_result(
     result.isCheckpoint = mode == "checkpoint"
     result.narrative = result.narrative or result.summary
     result.semanticUnits, evidence_rejected = hydrate_and_validate_unit_evidence(result.semanticUnits, window.text)
+    post_trace = LAST_EXTRACTION_PARSE_TRACE.get() or {}
     parse_trace["evidenceRejectedUnitCount"] = evidence_rejected
+    parse_trace["evidenceRejectedUnits"] = list(post_trace.get("evidenceRejectedUnits") or [])
     parse_trace["validatedSemanticUnitCount"] = len(result.semanticUnits)
+    parse_trace["unitEvidenceOutcomes"] = [
+        {
+            "semanticKey": unit.semanticKey,
+            "kind": unit.kind,
+            "evidenceIds": list(unit.evidenceIds or []),
+            "evidenceOutcome": (unit.quality or {}).get("evidenceOutcome"),
+            "actionable": (unit.quality or {}).get("actionable"),
+        }
+        for unit in result.semanticUnits
+    ]
     llm_empty = not _has_extracted_units(result)
     if mode != "checkpoint" and not result.semanticUnits:
         quality: dict[str, int] = {}
@@ -968,7 +1019,7 @@ def _log_window_intelligence(
             "extractionOutcome": result.extractionOutcome.value,
             "mode": mode,
             "estimatedInputTokens": estimated_input,
-            "providerBudget": safe_input_budget(provider_name),
+            "providerBudget": safe_input_budget(provider_name, model=model),
             "providerBudgetMeaning": "safe_input_token_budget",
             "structuredOutputMaxTokens": _provider_structured_max_tokens(provider_name, "WindowExtractionLLMResponse"),
             "finishReason": diagnostics.get("finishReason"),
@@ -1019,7 +1070,7 @@ async def reconcile_artifacts(router: LLMRouter, candidates, incoming, window_te
 
     provider, model = _route_for_input(
         router,
-        LLMCapability.HIGH_ACCURACY_REASONING,
+        LLMCapability.FINAL_SYNTHESIS,
         _rough_token_count(window_text) + 800,
     )
     payload = {
@@ -1175,7 +1226,7 @@ async def repair_missing_items(
             f"MISSING COVERAGE ITEMS:\n{json.dumps(missing_items, default=str, ensure_ascii=True)}\n\n"
             f"ALREADY EXTRACTED OUTPUTS:\n{json.dumps(outputs, default=str, ensure_ascii=True)}"
         ),
-        LLMCapability.HIGH_ACCURACY_REASONING,
+        LLMCapability.FINAL_SYNTHESIS,
     )
     repaired_tasks: list[ExtractedTask] = []
     for task in response.tasks:
@@ -1293,7 +1344,7 @@ async def reconcile_meeting(
         json.dumps(checkpoints or window_summaries, default=str),
         leftover_raw,
     )
-    provider, model = _route_for_input(router, LLMCapability.HIGH_ACCURACY_REASONING, estimated)
+    provider, model = _route_for_input(router, LLMCapability.FINAL_SYNTHESIS, estimated)
     payload = _trim_reconcile_payload(
         {
             "conversationId": conversation_id,
@@ -1305,6 +1356,7 @@ async def reconcile_meeting(
             "leftoverRawTranscript": leftover_raw,
         },
         provider.name,
+        model,
     )
     unit_count = sum(
         len(item.get("semanticUnits") or [])
@@ -1390,8 +1442,8 @@ async def finalize_from_window_results(
     context: dict[str, Any],
     processing_version: int,
 ) -> tuple[WindowExtractionResult, str, str]:
-    provider, model = router.route(LLMCapability.HIGH_ACCURACY_REASONING)
-    window_payload = _trim_payload_for_provider(window_payload, provider.name)
+    provider, model = router.route(LLMCapability.FINAL_SYNTHESIS)
+    window_payload = _trim_payload_for_provider(window_payload, provider.name, model)
     try:
         result, provider, model = await _structured_with_recovery(
             router,
@@ -1486,13 +1538,27 @@ async def apply_final_artifact_quality_gate(
     result = score_and_filter_result(result, transcript, diagnostics=quality)
     first_records = list(quality.get("qualityArtifactDiagnostics") or [])
     _merge_quality_diagnostics(diagnostics, quality, result)
+    coverage = evaluate_task_coverage(units, result)
+    missed_units = list(coverage.get("missedActionableUnits") or [])
+    diagnostics["validatedActionableUnitCount"] = coverage.get("validatedActionableUnitCount", 0)
+    diagnostics["taskCoverageConflict"] = bool(coverage.get("taskCoverageConflict"))
+    diagnostics["unitDispositions"] = coverage.get("unitDispositions") or []
+    diagnostics["undisposedActionableUnitCount"] = coverage.get("undisposedActionableUnitCount", 0)
+    if (result.tasks or result.notes) and diagnostics.get("finalSynthesisVerdict") == "NO_PUBLISHABLE_ARTIFACTS":
+        diagnostics["finalSynthesisVerdict"] = "PUBLISH"
+        diagnostics["publishVerdictOverridden"] = True
+    if coverage.get("taskCoverageConflict"):
+        diagnostics["finalSynthesisVerdict"] = TASK_COVERAGE_CONFLICT
     parsed_tasks = int(diagnostics.get("finalSynthesisParsedTaskCount") or 0)
     parsed_notes = int(diagnostics.get("finalSynthesisParsedNoteCount") or 0)
-    should_repair = (
-        diagnostics.get("finalSynthesisVerdict") == "PUBLISH"
+    quality_empty_after_publish = (
+        diagnostics.get("finalSynthesisVerdict") in {"PUBLISH", TASK_COVERAGE_CONFLICT}
         and (parsed_tasks or parsed_notes)
         and not result.tasks
         and not result.notes
+    )
+    should_repair = (
+        (quality_empty_after_publish or coverage.get("taskCoverageConflict"))
         and settings.MAX_QUALITY_REPAIR_ROUNDS >= 1
         and not diagnostics.get("qualityRepairAttempted")
     )
@@ -1511,15 +1577,26 @@ async def apply_final_artifact_quality_gate(
             context,
             conversation_id,
             space_id,
+            missed_actionable_units=missed_units,
+            current_tasks=list(result.tasks),
+            coverage_conflict=bool(coverage.get("taskCoverageConflict")),
         )
-        result.tasks = list(repaired.tasks)
-        result.notes = list(repaired.notes)
+        result.tasks = list(result.tasks) + list(repaired.tasks)
+        result.notes = list(result.notes) + list(repaired.notes)
         result = hydrate_synthesized_artifacts(result, units, transcript)
         quality_after: dict[str, Any] = {}
         result = score_and_filter_result(result, transcript, diagnostics=quality_after)
         diagnostics["qualityRepairAcceptedTaskCount"] = len(result.tasks)
         diagnostics["qualityRepairAcceptedNoteCount"] = len(result.notes)
         _merge_quality_diagnostics(diagnostics, quality_after, result)
+        coverage_after = evaluate_task_coverage(units, result)
+        diagnostics["validatedActionableUnitCount"] = coverage_after.get("validatedActionableUnitCount", 0)
+        diagnostics["taskCoverageConflict"] = bool(coverage_after.get("taskCoverageConflict"))
+        diagnostics["unitDispositions"] = coverage_after.get("unitDispositions") or []
+        if coverage_after.get("taskCoverageConflict"):
+            diagnostics["finalSynthesisVerdict"] = TASK_COVERAGE_CONFLICT
+        elif result.tasks or result.notes:
+            diagnostics["finalSynthesisVerdict"] = "PUBLISH"
         if not result.tasks and not result.notes and first_records:
             diagnostics["qualityArtifactDiagnostics"] = first_records
     except Exception as error:
@@ -1590,6 +1667,9 @@ async def repair_final_quality_failures(
     context: dict[str, Any],
     conversation_id: str,
     space_id: str,
+    missed_actionable_units: list | None = None,
+    current_tasks: list[ExtractedTask] | None = None,
+    coverage_conflict: bool = False,
 ) -> MissingItemRepairResponse:
     payload = {
         "rejectedTasks": [_repair_artifact_payload(item) for item in rejected_tasks],
@@ -1597,6 +1677,8 @@ async def repair_final_quality_failures(
         "qualityArtifactDiagnostics": artifact_diagnostics,
         "validatedSemanticUnits": [_repair_unit_payload(unit) for unit in units],
     }
+    if coverage_conflict:
+        payload["taskCoverage"] = coverage_repair_payload(list(missed_actionable_units or []), list(current_tasks or []))
     response = await _structured(
         router,
         "final-quality-repair-v1",
@@ -1900,8 +1982,8 @@ def _dedupe_items(items: list[Any]) -> list[Any]:
     return unique
 
 
-def _trim_reconcile_payload(payload: dict[str, Any], provider_name: str) -> dict[str, Any]:
-    limit = _provider_input_token_limit(provider_name)
+def _trim_reconcile_payload(payload: dict[str, Any], provider_name: str, model: str | None = None) -> dict[str, Any]:
+    limit = _provider_input_token_limit(provider_name, model)
     artifacts = list(payload.get("artifacts") or [])
     window_summaries = list(payload.get("windowSummaries") or [])
     checkpoints = list(payload.get("semanticCheckpoints") or window_summaries)
@@ -1941,8 +2023,8 @@ def _trim_reconcile_payload(payload: dict[str, Any], provider_name: str) -> dict
             ]
 
 
-def _trim_payload_for_provider(window_payload: list[dict[str, Any]], provider_name: str) -> list[dict[str, Any]]:
-    limit = _provider_input_token_limit(provider_name)
+def _trim_payload_for_provider(window_payload: list[dict[str, Any]], provider_name: str, model: str | None = None) -> list[dict[str, Any]]:
+    limit = _provider_input_token_limit(provider_name, model)
     if _rough_token_count(json.dumps(window_payload, default=str, ensure_ascii=True)) <= limit:
         return window_payload
 
@@ -1997,25 +2079,17 @@ def _compact_extracted_item(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _provider_input_token_limit(provider_name: str) -> int:
+def _provider_input_token_limit(provider_name: str, model: str | None = None) -> int:
     from services.conversation.budget import safe_input_budget
 
-    return min(settings.FINAL_MODEL_INPUT_TOKEN_LIMIT, safe_input_budget(provider_name))
+    return min(settings.FINAL_MODEL_INPUT_TOKEN_LIMIT, safe_input_budget(provider_name, model=model))
 
 
 def _route_for_input(router: LLMRouter, capability: LLMCapability, estimated_input_tokens: int):
-    from services.conversation.budget import safe_input_budget
-
-    provider, model = router.route(capability)
-    if isinstance(provider, FallbackLLMProvider):
-        return provider, model
-    if estimated_input_tokens <= safe_input_budget(getattr(provider, "name", "")):
-        return provider, model
-    for fallback_capability in (LLMCapability.HIGH_ACCURACY_REASONING, LLMCapability.FALLBACK):
-        candidate, candidate_model = router.route(fallback_capability)
-        if estimated_input_tokens <= safe_input_budget(getattr(candidate, "name", "")):
-            return candidate, candidate_model
-    return provider, model
+    # Role-based routing only. Long meetings keep existing window/checkpoint budgets
+    # instead of switching to a different conversation-intelligence role.
+    del estimated_input_tokens
+    return router.route(capability)
 
 
 def _rough_token_count(text: str) -> int:
@@ -2173,11 +2247,12 @@ def _same_structured_route(left_provider, left_model: str, right_provider, right
 
 
 def _provider_structured_max_tokens(provider_name: str, schema_name: str = "") -> int | None:
-    configured = (
-        settings.LLM_EXTRACTION_OUTPUT_MAX_TOKENS
-        if schema_name == "WindowExtractionLLMResponse"
-        else settings.LLM_STRUCTURED_MAX_TOKENS
-    )
+    if schema_name == "WindowExtractionLLMResponse":
+        configured = settings.LLM_EXTRACTION_OUTPUT_MAX_TOKENS
+    elif schema_name == "FinalSynthesisLLMResponse":
+        configured = min(settings.LLM_SYNTHESIS_OUTPUT_START_TOKENS, settings.LLM_SYNTHESIS_OUTPUT_MAX_TOKENS)
+    else:
+        configured = settings.LLM_STRUCTURED_MAX_TOKENS
     if provider_name == "groq":
         return max(512, min(configured, settings.GROQ_MAX_TPM // 2))
     return configured

@@ -349,7 +349,8 @@ def test_final_model_may_return_no_publishable_artifacts():
     assert result.extractionOutcome.value == "SUCCESS"
     assert result.semanticUnits
     assert result.extractionDiagnostics["finalSynthesisInvoked"] is True
-    assert result.extractionDiagnostics["finalSynthesisVerdict"] == "NO_PUBLISHABLE_ARTIFACTS"
+    assert result.extractionDiagnostics["finalSynthesisVerdict"] == "TASK_COVERAGE_CONFLICT"
+    assert result.extractionDiagnostics["taskCoverageConflict"] is True
     assert not result.tasks
     assert not result.notes
 

@@ -4,13 +4,20 @@ from apps.api_gateway.config.setting import settings
 from services.conversation.transcript import estimate_tokens
 
 
-def provider_context_limit(provider_name: str) -> int:
-    name = str(provider_name or "").strip().lower()
-    return settings.provider_context_token_limits.get(name, settings.FINAL_MODEL_INPUT_TOKEN_LIMIT)
+def provider_context_limit(provider_name: str, model: str | None = None) -> int:
+    model_key = str(model or "").strip().lower()
+    model_limits = settings.model_context_token_limits
+    if model_key and model_key in model_limits:
+        return model_limits[model_key]
+    provider_key = str(provider_name or "").strip().lower()
+    compound = f"{provider_key}/{model_key}" if provider_key and model_key else ""
+    if compound and compound in model_limits:
+        return model_limits[compound]
+    return settings.provider_context_token_limits.get(provider_key, settings.FINAL_MODEL_INPUT_TOKEN_LIMIT)
 
 
-def safe_input_budget(provider_name: str, output_reserve: int | None = None) -> int:
-    context = provider_context_limit(provider_name)
+def safe_input_budget(provider_name: str, output_reserve: int | None = None, model: str | None = None) -> int:
+    context = provider_context_limit(provider_name, model)
     reserved_output = output_reserve if output_reserve is not None else settings.LLM_STRUCTURED_MAX_TOKENS
     overhead = 1500
     usable = int(context * settings.SEMANTIC_WINDOW_SAFE_CONTEXT_RATIO) - reserved_output - overhead
@@ -43,8 +50,8 @@ def semantic_window_useful_duration_ms() -> int:
     return min(configured, incremental)
 
 
-def payload_fits(payload: str, provider_name: str) -> bool:
-    return estimate_tokens(payload) <= safe_input_budget(provider_name)
+def payload_fits(payload: str, provider_name: str, model: str | None = None) -> bool:
+    return estimate_tokens(payload) <= safe_input_budget(provider_name, model=model)
 
 
 def expected_request_tokens(*parts: str) -> int:

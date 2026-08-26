@@ -353,8 +353,8 @@ async def handle_window_extraction_event(event: EventEnvelope) -> None:
             "windowId": window_id,
             "provider": getattr(provider, "name", None),
             "model": model,
-            "geminiConfigured": _provider_configured("gemini"),
-            "groqConfigured": _provider_configured("groq"),
+            "krutrimConfigured": _provider_configured("krutrim"),
+            "mistralConfigured": _provider_configured("mistral"),
         },
     )
     await IncrementalMeetingProcessor(repository).extract_window(str(window_id))
@@ -370,8 +370,8 @@ async def handle_processing_event(event: EventEnvelope) -> None:
             "conversationId": event.conversationId,
             "provider": getattr(provider, "name", None),
             "model": model,
-            "geminiConfigured": _provider_configured("gemini"),
-            "groqConfigured": _provider_configured("groq"),
+            "krutrimConfigured": _provider_configured("krutrim"),
+            "mistralConfigured": _provider_configured("mistral"),
         },
     )
     try:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -115,6 +116,7 @@ class FallbackLLMProvider:
     ) -> BaseModel:
         last_error: Exception | None = None
         schema_name = request.schema_name or getattr(response_schema, "__name__", "schema")
+        request_id = str(uuid.uuid4())
         route = StructuredRouteResult(schema_name=schema_name)
         estimated_tokens = _estimate_request_tokens(request.messages, request.max_tokens)
         eligible = [candidate for candidate in self.candidates if _candidate_fits(candidate, estimated_tokens)]
@@ -123,7 +125,11 @@ class FallbackLLMProvider:
         for candidate in eligible:
             routed_request = request.model_copy(deep=True)
             routed_request.model = candidate.model
-            routed_request.max_tokens = _structured_max_tokens(candidate.provider.name, routed_request.max_tokens)
+            routed_request.max_tokens = _structured_max_tokens(
+                candidate.provider.name,
+                routed_request.max_tokens,
+                schema_name=schema_name,
+            )
             quota_key = f"{candidate.provider.name}:{candidate.model}"
             route.attempted_providers.append(candidate.provider.name)
             route.attempt_count += 1
@@ -131,8 +137,11 @@ class FallbackLLMProvider:
                 print(
                     "LLM provider attempt started:",
                     {
+                        "stage": schema_name,
                         "provider": candidate.provider.name,
                         "model": candidate.model,
+                        "requestId": request_id,
+                        "inputTokenEstimate": estimated_tokens,
                         "mode": "structured",
                         "schema": schema_name,
                     },
@@ -161,11 +170,18 @@ class FallbackLLMProvider:
                 print(
                     "LLM provider attempt succeeded:",
                     {
+                        "stage": schema_name,
                         "provider": candidate.provider.name,
                         "model": candidate.model,
+                        "requestId": request_id,
+                        "inputTokenEstimate": estimated_tokens,
+                        "outputTokens": diagnostics.get("completionTokens"),
+                        "latencyMs": diagnostics.get("latencyMs"),
                         "mode": "structured",
                         "schema": schema_name,
                         "structuredModeUsed": route.structured_mode_used,
+                        "structuredOutputSuccess": True,
+                        "fallbackReason": None if not route.failure_history else route.failure_history[-1].get("reason"),
                     },
                 )
                 _log_structured_route(self.last_structured_route)
@@ -174,14 +190,24 @@ class FallbackLLMProvider:
                 self.last_structured_diagnostics = getattr(candidate.provider, "last_structured_diagnostics", {}) or {}
                 last_error = error
                 reason = classify_llm_failure(error)
-                route.failure_history.append({"provider": candidate.provider.name, "reason": reason})
+                route.failure_history.append(
+                    {"provider": candidate.provider.name, "model": candidate.model, "reason": reason}
+                )
                 print(
                     "LLM provider attempt failed:",
                     {
+                        "stage": schema_name,
                         "provider": candidate.provider.name,
                         "model": candidate.model,
+                        "requestId": request_id,
+                        "inputTokenEstimate": estimated_tokens,
+                        "outputTokens": (self.last_structured_diagnostics or {}).get("completionTokens"),
+                        "latencyMs": (self.last_structured_diagnostics or {}).get("latencyMs"),
                         "mode": "structured",
                         "schema": schema_name,
+                        "structuredOutputSuccess": False,
+                        "retryReason": reason,
+                        "fallbackReason": reason if _should_try_next(error) else None,
                         "failureReason": reason,
                         "error": str(error)[:300],
                     },
@@ -241,14 +267,21 @@ def _should_try_next(error: Exception) -> bool:
 
 
 def _candidate_fits(candidate: LLMRouteCandidate, estimated_tokens: int) -> bool:
-    limits = settings.provider_context_token_limits
-    context = limits.get(candidate.provider.name, settings.FINAL_MODEL_INPUT_TOKEN_LIMIT)
-    usable = int(context * settings.SEMANTIC_WINDOW_SAFE_CONTEXT_RATIO) - settings.LLM_STRUCTURED_MAX_TOKENS - 1500
-    return estimated_tokens <= max(1000, usable)
+    from services.conversation.budget import safe_input_budget
+
+    usable = safe_input_budget(candidate.provider.name, model=candidate.model)
+    return estimated_tokens <= usable
 
 
-def _structured_max_tokens(provider_name: str, configured: int | None) -> int | None:
-    limit = configured or settings.LLM_STRUCTURED_MAX_TOKENS
+def _structured_max_tokens(provider_name: str, configured: int | None, schema_name: str = "") -> int | None:
+    if configured:
+        limit = configured
+    elif schema_name == "FinalSynthesisLLMResponse":
+        limit = min(settings.LLM_SYNTHESIS_OUTPUT_START_TOKENS, settings.LLM_SYNTHESIS_OUTPUT_MAX_TOKENS)
+    elif schema_name == "WindowExtractionLLMResponse":
+        limit = settings.LLM_EXTRACTION_OUTPUT_MAX_TOKENS
+    else:
+        limit = settings.LLM_STRUCTURED_MAX_TOKENS
     if provider_name == "groq":
         return max(512, min(limit, settings.GROQ_MAX_TPM // 2))
     return limit
@@ -261,4 +294,15 @@ def _estimate_request_tokens(messages: list[LLMMessage], max_tokens: int | None)
 
 
 def _log_structured_route(route: dict[str, Any]) -> None:
-    print("LLM structured route completed", route)
+    print(
+        "LLM structured route completed",
+        {
+            "stage": route.get("schema"),
+            "provider": route.get("providerUsed"),
+            "model": route.get("modelUsed"),
+            "structuredOutputSuccess": bool(route.get("providerUsed")),
+            "retryReason": None,
+            "fallbackReason": (route.get("failureHistory") or [{}])[-1].get("reason") if route.get("failureHistory") else None,
+            **route,
+        },
+    )

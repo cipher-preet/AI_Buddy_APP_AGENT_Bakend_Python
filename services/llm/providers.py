@@ -75,8 +75,25 @@ def build_mistral_provider() -> OpenAICompatibleProvider | NotConfiguredProvider
         name="mistral",
         api_key=settings.secret_value(settings.MISTRAL_API_KEY),
         base_url=settings.MISTRAL_BASE_URL,
-        default_model=settings.MISTRAL_CHEAP_MODEL,
+        default_model=settings.CONVERSATION_VALIDATION_MODEL,
         timeout_seconds=settings.LLM_TIMEOUT_SECONDS,
+        max_retries=settings.SARVAM_MAX_RETRIES,
+        max_concurrency=settings.LLM_MAX_CONCURRENCY,
+    )
+
+
+def build_krutrim_provider() -> OpenAICompatibleProvider | NotConfiguredProvider:
+    if not settings.secret_value(settings.KRUTRIM_API_KEY):
+        return NotConfiguredProvider("krutrim")
+    base_url = settings.KRUTRIM_BASE_URL.rstrip("/")
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+    return OpenAICompatibleProvider(
+        name="krutrim",
+        api_key=settings.secret_value(settings.KRUTRIM_API_KEY),
+        base_url=base_url,
+        default_model=settings.CONVERSATION_SEMANTIC_MODEL,
+        timeout_seconds=max(settings.LLM_TIMEOUT_SECONDS, 180),
         max_retries=settings.SARVAM_MAX_RETRIES,
         max_concurrency=settings.LLM_MAX_CONCURRENCY,
     )

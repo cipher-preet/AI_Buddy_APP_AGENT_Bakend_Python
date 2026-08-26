@@ -102,8 +102,10 @@ def test_matching_model_semantic_artifact_keys_merge_true_duplicates():
 
 def test_task_metadata_must_be_supported_even_when_the_action_is_valid():
     transcript = "[1] Prepare the atlas before sunset."
-    task = ExtractedTask(title="Atlas preparation", body="Prepare the atlas before sunset.", operation="CREATE", ownerText="Mira", confidence=1, sourceConversationId="conversation", evidence=[_span("Prepare the atlas before sunset.", 1)], origin="explicit")
-    assert validation_decision_for_task(task, transcript) == (False, "invented_owner")
+    task = ExtractedTask(title="Atlas preparation", body="Prepare the atlas before sunset with the current entries.", operation="CREATE", ownerText="Mira", confidence=1, sourceConversationId="conversation", evidence=[_span("Prepare the atlas before sunset.", 1)], origin="explicit")
+    keep, reason = validation_decision_for_task(task, transcript)
+    assert keep is True and reason == "accepted"
+    assert task.ownerText is None
 
 
 def test_model_marked_speculation_is_not_persisted_as_a_task():

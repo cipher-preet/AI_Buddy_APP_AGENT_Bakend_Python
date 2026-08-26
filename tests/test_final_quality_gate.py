@@ -398,7 +398,8 @@ def test_all_quality_failed_runs_one_repair_and_reports_no_publishable_artifacts
     )
     router, repo, run = _run_workflow("all_quality_failed")
     diagnostics = run.checkpoints["short_raw_transcript"]
-    assert diagnostics["finalSynthesisVerdict"] == "PUBLISH"
+    assert diagnostics["finalSynthesisVerdict"] == "TASK_COVERAGE_CONFLICT"
+    assert diagnostics["taskCoverageConflict"] is True
     assert diagnostics["qualityRepairAttempted"] is True
     assert diagnostics["qualityRepairRound"] == 1
     assert router.repair_calls == 1

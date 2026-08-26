@@ -113,7 +113,7 @@ class StructuredProviderPlan:
 
 def structured_capabilities(provider: str, model: str) -> StructuredOutputCapability:
     provider_name = str(provider or "").strip().casefold()
-    if provider_name == "openai":
+    if provider_name in {"openai", "krutrim"}:
         return StructuredOutputCapability(True, True, True, "high")
     if provider_name in {"mistral", "groq", "gemini", "sarvam"}:
         return StructuredOutputCapability(True, True, True, "medium")
@@ -246,6 +246,24 @@ class SarvamStructuredAdapter(StructuredSchemaAdapter):
         return StructuredProviderPlan(provider, model, schema_name, canonical_schema, attempts[:2])
 
 
+class KrutrimStructuredAdapter(StructuredSchemaAdapter):
+    def plan(self, provider: str, model: str, schema_name: str, canonical_schema: dict[str, Any]) -> StructuredProviderPlan:
+        # Transport may use json_schema, json_object, or a JSON prompt. Every
+        # attempt still carries the canonical schema and is pydantic-validated.
+        attempts = [
+            self._json_schema_attempt(schema_name, canonical_schema, strict=False),
+            self._json_object_attempt(schema_name, canonical_schema),
+            StructuredAttemptPlan(
+                mode="plain_json_prompt",
+                response_format=None,
+                schema=canonical_schema,
+                instruction=_schema_instruction(schema_name, canonical_schema, recovery=True),
+                temperature=0.0,
+            ),
+        ]
+        return StructuredProviderPlan(provider, model, schema_name, canonical_schema, attempts)
+
+
 class DefaultStructuredAdapter(StructuredSchemaAdapter):
     def plan(self, provider: str, model: str, schema_name: str, canonical_schema: dict[str, Any]) -> StructuredProviderPlan:
         capability = structured_capabilities(provider, model)
@@ -274,6 +292,8 @@ def _adapter_for(provider: str) -> StructuredSchemaAdapter:
         return MistralStructuredAdapter()
     if name == "sarvam":
         return SarvamStructuredAdapter()
+    if name == "krutrim":
+        return KrutrimStructuredAdapter()
     return DefaultStructuredAdapter()
 
 
@@ -445,7 +465,10 @@ def _schema_instruction(schema_name: str, schema: dict[str, Any], recovery: bool
         )
     if schema_name == "FinalSynthesisLLMResponse":
         extra = (
-            " tasks and notes are required arrays. A legitimate empty synthesis is "
+            " tasks and notes are required arrays of objects. Each task and note MUST have "
+            "string fields title and body. Do not use content, description, or text in place of "
+            "title/body. Keep the JSON compact and complete; do not emit chain-of-thought. "
+            "A legitimate empty synthesis is "
             '{"publishVerdict":"NO_PUBLISHABLE_ARTIFACTS","tasks":[],"notes":[]}.'
         )
     if schema_name == "WindowExtractionLLMResponse":

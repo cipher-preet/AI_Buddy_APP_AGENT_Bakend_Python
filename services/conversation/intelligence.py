@@ -240,9 +240,13 @@ def task_rejection_reasons(task: ExtractedTask, transcript: str, policy: Confide
         reasons.append("missing_evidence")
     elif not _all_evidence_has_matching_sequence(task.evidence, transcript):
         reasons.append("evidence_sequence_mismatch")
-    unsupported_metadata = _unsupported_task_metadata(task)
-    if unsupported_metadata:
-        reasons.append(unsupported_metadata)
+    stripped = _strip_unsupported_task_metadata(task)
+    if stripped:
+        task.changes = {
+            **(task.changes or {}),
+            "optionalMetadataInvalid": stripped,
+            "optionalMetadataOutcome": "OPTIONAL_METADATA_INVALID",
+        }
     if not _has_independent_content(task.title, task.body):
         reasons.append("generic_or_non_actionable_task")
     ungrounded = _ungrounded_quality_reason(task)
@@ -538,18 +542,43 @@ def _sequence_texts(transcript: str) -> dict[int, str]:
     return {int(match.group(1)): re.sub(r"\s+", " ", match.group(2)).strip() for match in pattern.finditer(transcript or "")}
 
 
-def _unsupported_task_metadata(task: ExtractedTask) -> str | None:
+def _strip_unsupported_task_metadata(task: ExtractedTask) -> list[str]:
     evidence_text = _evidence_blob(task.evidence)
+    stripped: list[str] = []
     if task.ownerText and _normalize(task.ownerText) not in _normalize(evidence_text):
-        return "invented_owner"
-    if task.ownerUserId and not task.ownerText:
-        return "invented_owner"
+        task.ownerText = None
+        task.ownerUserId = None
+        stripped.append("owner")
+    elif task.ownerUserId and not task.ownerText:
+        task.ownerUserId = None
+        stripped.append("owner")
     if task.dueDateText and _normalize(task.dueDateText) not in _normalize(evidence_text):
-        return "invented_deadline"
-    if task.dueDateResolved and not task.dueDateText and _normalize(task.dueDateResolved) not in _normalize(evidence_text):
-        return "invented_deadline"
+        task.dueDateText = None
+        task.dueDateResolved = None
+        if task.dueDateStatus != "none":
+            task.dueDateStatus = "none"
+        stripped.append("deadline")
+    elif task.dueDateResolved and not task.dueDateText and _normalize(task.dueDateResolved) not in _normalize(evidence_text):
+        task.dueDateResolved = None
+        stripped.append("deadline")
     priority = str((task.changes or {}).get("priority") or "").strip()
     if priority and _normalize(priority) not in _normalize(evidence_text):
+        changes = dict(task.changes or {})
+        changes.pop("priority", None)
+        task.changes = changes
+        stripped.append("priority")
+    return stripped
+
+
+def _unsupported_task_metadata(task: ExtractedTask) -> str | None:
+    # Compatibility wrapper: optional metadata is now stripped, not used as a
+    # unit-destroying rejection reason.
+    stripped = _strip_unsupported_task_metadata(task)
+    if "owner" in stripped:
+        return "invented_owner"
+    if "deadline" in stripped:
+        return "invented_deadline"
+    if "priority" in stripped:
         return "invented_priority"
     return None
 

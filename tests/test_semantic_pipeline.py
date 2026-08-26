@@ -798,23 +798,26 @@ def test_malformed_structured_output_uses_eligible_model_fallback():
     assert result.semanticUnits
 
 
-def test_configured_cost_optimized_primary_is_groq_not_xai_grok():
+def test_configured_cost_optimized_primary_is_not_xai_grok():
     from apps.api_gateway.config.setting import settings
     from services.llm.router import LLMCapability, LLMRouter
+    from services.llm.routing_policy import CONVERSATION_INTELLIGENCE_FREE_PROVIDERS
 
     assert "api.groq.com" in settings.GROQ_BASE_URL
     assert "x.ai" not in settings.GROQ_BASE_URL.lower()
     assert "grok" not in (settings.GROQ_FREE_MODEL or "").lower()
     router = LLMRouter(
         {
+            "krutrim": SimpleNamespace(name="krutrim", configured=True),
+            "mistral": SimpleNamespace(name="mistral", configured=True),
             "groq": SimpleNamespace(name="groq", configured=True),
             "gemini": SimpleNamespace(name="gemini", configured=True),
-            "mistral": SimpleNamespace(name="mistral", configured=True),
             "sarvam": SimpleNamespace(name="sarvam", configured=True),
         }
     )
     candidates = router._cost_optimized_candidates(LLMCapability.HIGH_ACCURACY_REASONING)
-    assert [item.provider.name for item in candidates] == ["groq", "gemini", "mistral", "sarvam"]
-    assert candidates[0].provider.name == "groq"
+    assert [item.provider.name for item in candidates] == ["krutrim"]
+    assert candidates[0].model == "gemma-4-31b-it"
+    assert all(item.provider.name not in CONVERSATION_INTELLIGENCE_FREE_PROVIDERS for item in candidates)
     assert all(item.provider.name != "xai" for item in candidates)
     assert "xai" not in router.providers
