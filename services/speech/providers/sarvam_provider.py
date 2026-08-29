@@ -5,11 +5,12 @@ from pathlib import Path
 
 import httpx
 from apps.api_gateway.config.setting import settings
+from services.llm.async_runtime import LoopBoundAsyncClient, LoopLocalSemaphore
 from services.speech.errors import STTProviderAuthError
 
 
-_client: httpx.AsyncClient | None = None
-_semaphore = asyncio.Semaphore(settings.SARVAM_MAX_CONCURRENCY)
+_transport: LoopBoundAsyncClient | None = None
+_semaphore = LoopLocalSemaphore(settings.SARVAM_MAX_CONCURRENCY)
 _AUDIO_EXTENSIONS_BY_TYPE = {
     "audio/aac": ".aac",
     "audio/aiff": ".aiff",
@@ -31,17 +32,23 @@ _AUDIO_EXTENSIONS_BY_TYPE = {
 }
 
 
-def get_sarvam_stt_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
+async def get_sarvam_stt_client() -> httpx.AsyncClient:
+    global _transport
+    if _transport is None:
         timeout = httpx.Timeout(
             connect=10,
             read=settings.SARVAM_TIMEOUT_SECONDS,
             write=settings.SARVAM_TIMEOUT_SECONDS,
             pool=settings.SARVAM_TIMEOUT_SECONDS,
         )
-        _client = httpx.AsyncClient(timeout=timeout)
-    return _client
+        _transport = LoopBoundAsyncClient(lambda: httpx.AsyncClient(timeout=timeout))
+    return await _transport.get()
+
+
+async def close_sarvam_stt_client() -> None:
+    global _transport
+    if _transport is not None:
+        await _transport.aclose()
 
 
 async def sarvam_transcribe_from_path(
@@ -81,7 +88,7 @@ async def sarvam_transcribe_from_path(
             )
         }
 
-        async with _semaphore:
+        async with _semaphore.get():
             response = await _post_with_retries(url, headers, data, files)
 
     if response.status_code >= 400:
@@ -107,7 +114,7 @@ async def _post_with_retries(url: str, headers: dict, data: dict, files: dict) -
     for attempt in range(settings.SARVAM_MAX_RETRIES + 1):
         try:
             _rewind_files(files)
-            response = await get_sarvam_stt_client().post(
+            response = await (await get_sarvam_stt_client()).post(
                 url,
                 headers=headers,
                 data=data,

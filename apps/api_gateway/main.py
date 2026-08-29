@@ -7,6 +7,7 @@ from apps.api_gateway.routes.conversation_routes import router as conversation_r
 from apps.api_gateway.routes.speech_routes import router as speech_router
 from apps.api_gateway.config.setting import settings
 from services.db.mongo import close_mongo_client, ensure_mongo_indexes
+from services.llm.router import close_llm_runtime
 
 app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION)
 
@@ -31,6 +32,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    await close_llm_runtime()
     await close_mongo_client()
 
 

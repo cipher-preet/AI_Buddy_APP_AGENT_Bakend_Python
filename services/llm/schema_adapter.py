@@ -15,6 +15,11 @@ SCHEMA_VALIDATION_FAILED = "SCHEMA_VALIDATION_FAILED"
 SCHEMA_ECHO = "SCHEMA_ECHO"
 INCOMPLETE_STRUCTURED_OUTPUT = "INCOMPLETE_STRUCTURED_OUTPUT"
 PROVIDER_TIMEOUT = "PROVIDER_TIMEOUT"
+ASYNC_LIFECYCLE_ERROR = "ASYNC_LIFECYCLE_ERROR"
+PROVIDER_FAILURE = "PROVIDER_FAILURE"
+RATE_LIMIT = "RATE_LIMIT"
+TIMEOUT = "TIMEOUT"
+STRUCTURED_OUTPUT_FAILURE = "STRUCTURED_OUTPUT_FAILURE"
 
 # Backward-compatible aliases used by extraction diagnostics and existing tests.
 STRUCTURED_SCHEMA_ECHO = "STRUCTURED_SCHEMA_ECHO"
@@ -44,6 +49,8 @@ STRING_LIST_FIELDS = (
 
 WIRE_REQUIRED_COLLECTIONS = {
     "FinalSynthesisLLMResponse": ("tasks", "notes"),
+    "MeetingCandidateExtractorResponse": ("candidates",),
+    "MeetingVerifierResponse": ("items",),
 }
 
 _INSTANCE_KEYS = {
@@ -392,9 +399,37 @@ def drop_stage_for_structured_outcome(outcome: str | None) -> str:
     return "provider_or_parser_failure"
 
 
+def classify_failure_class(error: Exception | None = None, reason: str | None = None) -> str:
+    from services.llm.async_runtime import is_async_lifecycle_error
+
+    if error is not None and is_async_lifecycle_error(error):
+        return ASYNC_LIFECYCLE_ERROR
+    value = normalize_failure_reason(reason or (classify_llm_failure(error) if error is not None else None))
+    if value == ASYNC_LIFECYCLE_ERROR:
+        return ASYNC_LIFECYCLE_ERROR
+    if value == RATE_LIMITED:
+        return RATE_LIMIT
+    if value == PROVIDER_TIMEOUT:
+        return TIMEOUT
+    if value in {
+        MALFORMED_JSON,
+        SCHEMA_VALIDATION_FAILED,
+        SCHEMA_ECHO,
+        STRUCTURED_SCHEMA_ECHO,
+        INCOMPLETE_STRUCTURED_OUTPUT,
+        MALFORMED_STRUCTURED_OUTPUT,
+        STRUCTURED_SCHEMA_UNSUPPORTED,
+    }:
+        return STRUCTURED_OUTPUT_FAILURE
+    return PROVIDER_FAILURE
+
+
 def classify_llm_failure(error: Exception) -> str:
+    from services.llm.async_runtime import is_async_lifecycle_error
     from services.llm.errors import LLMProviderError, StructuredOutputError
 
+    if is_async_lifecycle_error(error):
+        return ASYNC_LIFECYCLE_ERROR
     if isinstance(error, StructuredOutputError):
         return normalize_failure_reason(error.outcome)
     if isinstance(error, LLMProviderError):
@@ -415,6 +450,8 @@ def classify_llm_failure(error: Exception) -> str:
             return HTTP_ERROR
     name = type(error).__name__.casefold()
     message = str(error or "").casefold()
+    if is_async_lifecycle_error(error):
+        return ASYNC_LIFECYCLE_ERROR
     if "timeout" in name or "timeout" in message:
         return PROVIDER_TIMEOUT
     if INCOMPLETE_STRUCTURED_OUTPUT.casefold() in message:
@@ -477,6 +514,14 @@ def _schema_instruction(schema_name: str, schema: dict[str, Any], recovery: bool
             "confidence, and evidence spans with sequenceStart, sequenceEnd, and text. "
             "Do not use description in place of title. "
             "decisions items must include title, status, confidence, and evidence spans."
+        )
+    if schema_name == "ExtractionQualityReviewResponse":
+        extra = (
+            " decisions is an array of objects with kind (task|note), index (integer), keep (boolean), "
+            "and reason (string). Do not use strings in decisions. "
+            "missingActionable and missingNotes must be arrays of strings, not objects. "
+            'Correct: "missingActionable": ["Fix duplicate tasks today"]. '
+            'Incorrect: "missingActionable": [{"meaning": "..."}].'
         )
     recovery_text = " This is a recovery attempt. Follow the field types exactly." if recovery else ""
     return (
@@ -608,21 +653,32 @@ def _force_string_array_items(node: Any, field_name: str | None = None) -> None:
     properties = node.get("properties")
     if isinstance(properties, dict):
         for name, spec in properties.items():
-            if isinstance(spec, dict) and name in STRING_LIST_FIELDS:
+            if isinstance(spec, dict) and name in STRING_LIST_FIELDS and not _items_are_objects(spec):
                 spec["type"] = "array"
                 spec["items"] = {"type": "string"}
             _force_string_array_items(spec, name)
     if node.get("type") == "array" or "items" in node:
         items = node.get("items")
-        if field_name in STRING_LIST_FIELDS or not isinstance(items, dict):
-            if field_name in STRING_LIST_FIELDS:
-                node["items"] = {"type": "string"}
-        else:
+        if field_name in STRING_LIST_FIELDS and not _items_are_objects(node):
+            node["items"] = {"type": "string"}
+        elif isinstance(items, dict):
             _force_string_array_items(items)
     for key, value in list(node.items()):
         if key in {"properties", "items"}:
             continue
         _force_string_array_items(value)
+
+
+def _items_are_objects(spec: dict[str, Any]) -> bool:
+    items = spec.get("items")
+    if not isinstance(items, dict):
+        return False
+    if items.get("type") == "object" or isinstance(items.get("properties"), dict):
+        return True
+    for option in list(items.get("anyOf") or []) + list(items.get("oneOf") or []):
+        if isinstance(option, dict) and (option.get("type") == "object" or isinstance(option.get("properties"), dict)):
+            return True
+    return False
 
 
 def _apply_groq_strict(node: Any) -> None:

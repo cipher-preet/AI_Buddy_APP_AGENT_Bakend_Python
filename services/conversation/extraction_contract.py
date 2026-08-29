@@ -488,6 +488,79 @@ def alias_synthesis_payload(value: Any) -> Any:
     return payload
 
 
+def alias_quality_review_payload(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    payload = dict(value)
+    payload["decisions"] = [_alias_quality_decision(item) for item in _as_list(payload.get("decisions"))]
+    payload["missingActionable"] = _string_meanings(payload.get("missingActionable"))
+    payload["missingNotes"] = _string_meanings(payload.get("missingNotes"))
+    if payload.get("failed") in {"true", "True", 1, "1"}:
+        payload["failed"] = True
+    elif payload.get("failed") in {"false", "False", 0, "0"}:
+        payload["failed"] = False
+    return payload
+
+
+def _alias_quality_decision(item: Any) -> Any:
+    if isinstance(item, str):
+        text = item.strip()
+        kind = "task" if "task" in text.casefold() else "note" if "note" in text.casefold() else ""
+        if not kind:
+            return item
+        return {"kind": kind, "index": 0, "keep": "reject" not in text.casefold() and "drop" not in text.casefold(), "reason": text}
+    if not isinstance(item, dict):
+        return item
+    decision = dict(item)
+    if not decision.get("kind"):
+        raw = str(decision.get("type") or decision.get("itemKind") or decision.get("category") or "").strip().casefold()
+        if raw in {"task", "note"}:
+            decision["kind"] = raw
+    if decision.get("index") is None:
+        for key in ("itemIndex", "taskIndex", "noteIndex", "id"):
+            if key in decision and _as_sequence(decision[key]) is not None:
+                decision["index"] = _as_sequence(decision[key])
+                break
+    if decision.get("keep") is None:
+        raw = decision.get("accept") if "accept" in decision else decision.get("valid") if "valid" in decision else decision.get("include")
+        if isinstance(raw, bool):
+            decision["keep"] = raw
+        elif str(raw or "").strip().casefold() in {"true", "1", "yes", "keep"}:
+            decision["keep"] = True
+        elif str(raw or "").strip().casefold() in {"false", "0", "no", "drop", "reject"}:
+            decision["keep"] = False
+        else:
+            decision["keep"] = True
+    if not decision.get("reason"):
+        for key in ("explanation", "comment", "message", "text"):
+            if str(decision.get(key) or "").strip():
+                decision["reason"] = str(decision[key]).strip()
+                break
+        else:
+            decision["reason"] = "reviewed"
+    if not decision.get("revisedBody"):
+        for key in ("body", "revised", "revision"):
+            if str(decision.get(key) or "").strip():
+                decision["revisedBody"] = str(decision[key]).strip()
+                break
+    return decision
+
+
+def _string_meanings(value: Any) -> list[str]:
+    meanings: list[str] = []
+    for item in _as_list(value):
+        if isinstance(item, str) and item.strip():
+            meanings.append(item.strip())
+            continue
+        if not isinstance(item, dict):
+            continue
+        for key in ("meaning", "text", "description", "reason", "content", "summary", "title"):
+            if str(item.get(key) or "").strip():
+                meanings.append(str(item[key]).strip())
+                break
+    return meanings
+
+
 def _alias_span(item: Any) -> Any:
     if isinstance(item, bool):
         return item

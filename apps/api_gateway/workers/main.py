@@ -13,8 +13,8 @@ from apps.api_gateway.workers.conversation_workers import (
     run_inactivity_scanner,
     run_retry_relay,
 )
-from services.db.mongo import ensure_mongo_indexes
-from services.llm.router import log_llm_provider_status
+from services.db.mongo import close_mongo_client, ensure_mongo_indexes
+from services.llm.router import close_llm_runtime, log_llm_provider_status
 
 
 async def main():
@@ -40,13 +40,17 @@ async def main():
 
     await asyncio.gather(*(consumer.ensure_group() for consumer in stream_consumers))
 
-    await asyncio.gather(
-        start_speech_consumer(),
-        start_vector_consumer(),
-        *(consumer.run_forever() for consumer in stream_consumers),
-        run_inactivity_scanner(),
-        run_retry_relay(),
-    )
+    try:
+        await asyncio.gather(
+            start_speech_consumer(),
+            start_vector_consumer(),
+            *(consumer.run_forever() for consumer in stream_consumers),
+            run_inactivity_scanner(),
+            run_retry_relay(),
+        )
+    finally:
+        await close_llm_runtime()
+        await close_mongo_client()
 
 
 if __name__ == "__main__":

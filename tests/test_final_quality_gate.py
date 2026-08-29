@@ -1,6 +1,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from services.conversation import agents
 from services.conversation.extraction_contract import hydrate_synthesized_artifacts
 from services.conversation.intelligence import (
@@ -24,6 +26,14 @@ from services.conversation.models import (
 from services.conversation.workflow import ConversationProcessingWorkflow
 from services.llm.router import LLMCapability
 from tests.test_final_synthesis_persistence import FakeRepository, PipelineRouter, _window
+from apps.api_gateway.config.setting import settings
+
+
+@pytest.fixture(autouse=True)
+def _keep_legacy_short_session_path(monkeypatch):
+    monkeypatch.setattr(settings, "ENABLE_EVENT_PIPELINE", False)
+    monkeypatch.setattr(settings, "ENABLE_MEETING_PIPELINE", False)
+
 
 TRANSCRIPT_LINES = {
     1: "Mira will write the ulari drain notes before Thursday.",

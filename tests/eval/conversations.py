@@ -1,3 +1,5 @@
+from tests.fixtures.lenskart_hrms_meeting import lenskart_hrms_case
+
 REQUIRED_CATEGORIES = {
     "casual_speech",
     "technical_meeting",
@@ -29,7 +31,7 @@ BENCHMARK_CASES: list[dict] = [
         ),
         "goldTasks": [],
         "goldNotes": [
-            {"id": "n1", "kind": "note", "meaning": "Saturday was spent walking around the lake and getting chai.", "evidenceSequences": [1]},
+            {"id": "n1", "kind": "note", "meaning": "Saturday was spent walking around the lake and getting chai.", "evidenceSequences": [1], "reviewStatus": "OPTIONAL"},
         ],
         "nonTaskSequences": [0, 2, 3],
     },
@@ -378,7 +380,7 @@ BENCHMARK_CASES: list[dict] = [
             }
         ],
         "goldNotes": [
-            {"id": "n1", "kind": "note", "meaning": "The speaker was interrupted by the door and a barking dog.", "evidenceSequences": [1, 4]},
+            {"id": "n1", "kind": "note", "meaning": "The speaker was interrupted by the door and a barking dog.", "evidenceSequences": [1, 4], "reviewStatus": "OPTIONAL"},
         ],
         "nonTaskSequences": [0, 1, 2, 4],
     },
@@ -400,7 +402,7 @@ BENCHMARK_CASES: list[dict] = [
             }
         ],
         "goldNotes": [
-            {"id": "n1", "kind": "note", "meaning": "Rahul is not on call.", "evidenceSequences": [1]},
+            {"id": "n1", "kind": "note", "meaning": "Rahul is not on call.", "evidenceSequences": [1], "reviewStatus": "OPTIONAL"},
         ],
         "nonTaskSequences": [0],
     },
@@ -525,4 +527,5 @@ BENCHMARK_CASES: list[dict] = [
         "goldNotes": [],
         "expectedArtifactCount": 1,
     },
+    lenskart_hrms_case(),
 ]

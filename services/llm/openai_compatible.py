@@ -11,7 +11,8 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from apps.api_gateway.config.setting import settings
-from services.llm.errors import LLMProviderError, StructuredOutputError, is_retryable_status
+from services.llm.async_runtime import LoopBoundAsyncClient, LoopLocalSemaphore, is_async_lifecycle_error
+from services.llm.errors import AsyncLifecycleError, LLMProviderError, StructuredOutputError, is_retryable_status
 from services.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StructuredLLMRequest
 from services.llm.schema_adapter import (
     HTTP_ERROR,
@@ -54,14 +55,29 @@ class OpenAICompatibleProvider:
         self.last_structured_diagnostics: dict[str, Any] = {}
         self._auth_header = auth_header
         self._auth_value = f"{auth_prefix}{api_key}" if auth_prefix else api_key
-        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._timeout_seconds = timeout_seconds
+        self._base_url = base_url.rstrip("/")
+        self._semaphore = LoopLocalSemaphore(max_concurrency)
         timeout = httpx.Timeout(
             connect=min(10, timeout_seconds),
             read=timeout_seconds,
             write=timeout_seconds,
             pool=timeout_seconds,
         )
-        self._client = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=timeout)
+        self._timeout = timeout
+        # Loop-bound: created on first use under the worker/request loop, never at import.
+        self._transport = LoopBoundAsyncClient(
+            lambda: httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
+        )
+
+    def transport_debug(self) -> dict[str, Any]:
+        return {"provider": self.name, **self._transport.debug()}
+
+    async def _http_client(self) -> httpx.AsyncClient:
+        return await self._transport.get()
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         model = request.model or self.default_model
@@ -76,7 +92,7 @@ class OpenAICompatibleProvider:
         if max_tokens:
             payload["max_tokens"] = max_tokens
         started = time.perf_counter()
-        async with self._semaphore:
+        async with self._semaphore.get():
             response = await self._post_with_retries("/chat/completions", payload)
         latency_ms = int((time.perf_counter() - started) * 1000)
         data = response.json()
@@ -231,6 +247,7 @@ class OpenAICompatibleProvider:
                     "promptTokens": int(response.usage.promptTokens or 0),
                     "latencyMs": response.latencyMs,
                     "structuredOutputSuccess": True,
+                    "rawContent": (response.content or "")[:8000],
                 }
             )
             self.last_structured_diagnostics = diagnostics
@@ -253,6 +270,7 @@ class OpenAICompatibleProvider:
                 "latencyMs": response.latencyMs,
                 "structuredOutputSuccess": False,
                 "retryReason": error.outcome,
+                "rawContent": (response.content or "")[:8000],
             }
             self.last_structured_diagnostics = diagnostics
             _log_structured_attempt(diagnostics)
@@ -283,7 +301,8 @@ class OpenAICompatibleProvider:
     async def health_check(self) -> ProviderHealth:
         started = time.perf_counter()
         try:
-            await self._client.get("/")
+            client = await self._http_client()
+            await client.get("/")
             return ProviderHealth(
                 provider=self.name,
                 healthy=True,
@@ -294,9 +313,11 @@ class OpenAICompatibleProvider:
 
     async def _post_with_retries(self, path: str, payload: dict[str, Any]) -> httpx.Response:
         last_error: Exception | None = None
+        lifecycle_refreshed = False
         for attempt in range(self.max_retries + 1):
             try:
-                response = await self._client.post(
+                client = await self._http_client()
+                response = await client.post(
                     path,
                     headers={self._auth_header: self._auth_value},
                     json=payload,
@@ -344,11 +365,41 @@ class OpenAICompatibleProvider:
                     failure_reason=failure_reason,
                 )
                 await asyncio.sleep(_retry_delay(attempt, retry_after))
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.PoolTimeout) as error:
+            except LLMProviderError:
+                raise
+            except RuntimeError as error:
+                if not is_async_lifecycle_error(error):
+                    raise
+                if lifecycle_refreshed:
+                    raise AsyncLifecycleError(
+                        f"{self.name} async client is bound to a closed or foreign event loop"
+                    ) from error
+                lifecycle_refreshed = True
+                print(
+                    "LLM async lifecycle stale transport; recreating for current loop:",
+                    {
+                        "provider": self.name,
+                        "model": payload.get("model"),
+                        "attempt": attempt + 1,
+                        **self.transport_debug(),
+                    },
+                )
+                await self._transport.replace()
+                last_error = AsyncLifecycleError(
+                    f"{self.name} async client was bound to a closed or foreign event loop"
+                )
+                continue
+            except (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                ConnectionResetError,
+                ConnectionError,
+            ) as error:
+                timeout_like = isinstance(error, httpx.TimeoutException) or "timeout" in type(error).__name__.casefold()
                 last_error = LLMProviderError(
                     f"{self.name} request failed: {error}",
                     retryable=True,
-                    failure_reason=PROVIDER_TIMEOUT,
+                    failure_reason=PROVIDER_TIMEOUT if timeout_like else HTTP_ERROR,
                 )
                 print(
                     "LLM HTTP call failed:",
@@ -360,6 +411,8 @@ class OpenAICompatibleProvider:
                     },
                 )
                 await asyncio.sleep(_retry_delay(attempt, None))
+        if last_error is not None and is_async_lifecycle_error(last_error):
+            raise last_error
         raise last_error or LLMProviderError(f"{self.name} request failed", retryable=True, failure_reason=HTTP_ERROR)
 
     def _bounded_max_tokens(self, max_tokens: int | None) -> int | None:

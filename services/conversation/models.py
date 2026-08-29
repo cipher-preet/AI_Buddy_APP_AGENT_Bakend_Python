@@ -379,6 +379,7 @@ class WindowExtractionResult(BaseModel):
     topics: list[str] = Field(default_factory=list)
     importantFacts: list[str] = Field(default_factory=list)
     semanticUnits: list[SemanticUnit] = Field(default_factory=list)
+    atomicEvents: list[dict[str, Any]] = Field(default_factory=list)
     tasks: list[ExtractedTask] = Field(default_factory=list)
     notes: list[ExtractedNote] = Field(default_factory=list)
     decisions: list[ExtractedDecision] = Field(default_factory=list)

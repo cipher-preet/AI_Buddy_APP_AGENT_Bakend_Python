@@ -815,7 +815,7 @@ def test_configured_cost_optimized_primary_is_not_xai_grok():
             "sarvam": SimpleNamespace(name="sarvam", configured=True),
         }
     )
-    candidates = router._cost_optimized_candidates(LLMCapability.HIGH_ACCURACY_REASONING)
+    candidates = router._cost_optimized_candidates(LLMCapability.SEMANTIC_EXTRACTION)
     assert [item.provider.name for item in candidates] == ["krutrim"]
     assert candidates[0].model == "gemma-4-31b-it"
     assert all(item.provider.name not in CONVERSATION_INTELLIGENCE_FREE_PROVIDERS for item in candidates)

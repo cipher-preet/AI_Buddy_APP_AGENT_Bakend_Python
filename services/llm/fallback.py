@@ -10,7 +10,7 @@ from apps.api_gateway.config.setting import settings
 from services.llm.errors import LLMProviderError
 from services.llm.models import LLMMessage, LLMProvider, LLMRequest, LLMResponse, ProviderHealth, StructuredLLMRequest
 from services.llm.quota import ProviderQuota, quota_guard
-from services.llm.schema_adapter import classify_llm_failure
+from services.llm.schema_adapter import ASYNC_LIFECYCLE_ERROR, classify_failure_class, classify_llm_failure
 
 
 @dataclass(frozen=True)
@@ -261,6 +261,10 @@ def resolved_provider_model(provider, fallback: str | None = None) -> str | None
 
 
 def _should_try_next(error: Exception) -> bool:
+    from services.llm.async_runtime import is_async_lifecycle_error
+
+    if is_async_lifecycle_error(error) or classify_failure_class(error) == ASYNC_LIFECYCLE_ERROR:
+        return False
     if isinstance(error, LLMProviderError):
         return error.retryable or error.status_code in {400, 413, 422, 429}
     return True

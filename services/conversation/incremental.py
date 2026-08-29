@@ -30,6 +30,13 @@ from services.conversation.semantic_input import (
     as_sequence_number,
     assemble_semantic_window_input,
 )
+from services.conversation.event_pipeline import (
+    event_pipeline_selected_for,
+    event_pipeline_shadow,
+    extract_window_events,
+)
+from services.conversation.event_pipeline.store import ConversationEventStore
+from services.conversation.meeting_pipeline import meeting_pipeline_enabled
 from services.llm.router import LLMRouter, get_llm_router
 from services.queue.streams import EventEnvelope, RedisStreamProducer
 
@@ -298,16 +305,56 @@ class IncrementalMeetingProcessor:
                 return
             return
         try:
+            if meeting_pipeline_enabled():
+                result = WindowExtractionResult(
+                    extractionOutcome=ExtractionOutcome.SUCCESS,
+                    extractionDiagnostics={
+                        "meetingPipelineDeferredToFinalization": True,
+                        "pipelineMode": "meeting_pipeline",
+                    },
+                )
+                await self.repository.complete_window(
+                    window.id,
+                    result,
+                    "meeting-pipeline",
+                    "deferred-to-finalization",
+                    artifact_count=0,
+                    artifact_persistence_ok=True,
+                    extraction_skipped=True,
+                    checkpoint_kind="deferred_meeting_pipeline",
+                )
+                print(
+                    "Window extraction deferred to meeting pipeline finalization:",
+                    {
+                        "conversationId": str(window.conversationId),
+                        "windowId": str(window.id),
+                        "windowIndex": window.windowIndex,
+                    },
+                )
+                return
             context = await load_space_context(self.repository, window.userId, window.spaceId)
             meeting_context, existing_artifacts = await self._meeting_context_for_window(window)
             window = await self._attach_semantic_window_input(window)
-            result, provider, model = await agents.extract_window(
-                self.router,
-                window,
-                context,
-                meeting_context=meeting_context,
-                recovery=recovery,
-            )
+            shadow_events = None
+            selected = event_pipeline_selected_for(str(window.userId), str(window.conversationId))
+            if selected:
+                result, provider, model = await self._extract_window_events(window)
+            else:
+                if event_pipeline_shadow():
+                    try:
+                        shadow_events, _, _ = await self._extract_window_events(window)
+                    except Exception as error:
+                        print(
+                            "Event pipeline shadow window extraction failed; legacy continues:",
+                            {"windowId": str(window.id), "error": str(error)[:300]},
+                        )
+                result, provider, model = await agents.extract_window(
+                    self.router,
+                    window,
+                    context,
+                    meeting_context=meeting_context,
+                    recovery=recovery,
+                )
             if result.extractionOutcome in {
                 ExtractionOutcome.EXTRACTION_FAILED,
                 ExtractionOutcome.SEMANTIC_INPUT_ASSEMBLY_FAILED,
@@ -315,10 +362,12 @@ class IncrementalMeetingProcessor:
                 message = result.extractionError or "window extraction failed after structured-output recovery"
                 await self.repository.fail_window(window.id, message)
                 raise RuntimeError(message)
-            incoming = artifacts_from_window(window, result)
-            resolved = await reconcile_incoming_artifacts(self.router, existing_artifacts, incoming, window.text)
-            await self.repository.upsert_meeting_artifacts(resolved)
-            persisted = await self.repository.count_meeting_artifacts_for_window(str(window.conversationId), window.id)
+            incoming = [] if selected else artifacts_from_window(window, result)
+            resolved = existing_artifacts
+            if incoming:
+                resolved = await reconcile_incoming_artifacts(self.router, existing_artifacts, incoming, window.text)
+                await self.repository.upsert_meeting_artifacts(resolved)
+            persisted = await self.repository.count_meeting_artifacts_for_window(str(window.conversationId), window.id) if incoming else 0
             if incoming and persisted <= 0:
                 await self.repository.fail_window(window.id, "artifact persistence failed")
                 print(
@@ -326,7 +375,16 @@ class IncrementalMeetingProcessor:
                     {"conversationId": str(window.conversationId), "windowId": str(window.id), "incoming": len(incoming)},
                 )
                 return
-            await self._refresh_meeting_memory(str(window.conversationId), window.userId, window.spaceId)
+            if incoming:
+                await self._refresh_meeting_memory(str(window.conversationId), window.userId, window.spaceId)
+            if shadow_events is not None:
+                diagnostics = dict(getattr(result, "extractionDiagnostics", None) or {})
+                diagnostics["eventPipelineShadow"] = {
+                    "atomicEventCount": len(getattr(shadow_events, "atomicEvents", None) or []),
+                    "checkpointKind": "atomic_events",
+                    "publishedFrom": "legacy",
+                }
+                result.extractionDiagnostics = diagnostics
             await self.repository.complete_window(
                 window.id,
                 result,
@@ -334,7 +392,7 @@ class IncrementalMeetingProcessor:
                 model,
                 artifact_count=len(incoming),
                 artifact_persistence_ok=True,
-                checkpoint_kind="semantic_checkpoint",
+                checkpoint_kind="atomic_events" if selected else "semantic_checkpoint",
             )
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             metrics = {
@@ -396,6 +454,30 @@ class IncrementalMeetingProcessor:
                 },
             )
             raise
+
+    async def _extract_window_events(self, window):
+        chunks = await self.repository.list_transcript_chunks_in_range(
+            str(window.conversationId),
+            window.sequenceStart,
+            window.sequenceEnd,
+        )
+        store = ConversationEventStore(self.repository)
+        result, provider, model = await extract_window_events(
+            chunks,
+            str(window.conversationId),
+            str(window.userId),
+            str(window.spaceId),
+            router=self.router,
+            event_store=store,
+            repository=self.repository,
+        )
+        result.extractionDiagnostics = {
+            **(result.extractionDiagnostics or {}),
+            "checkpointKind": "atomic_events",
+            "windowId": str(window.id),
+            "windowIndex": window.windowIndex,
+        }
+        return result, provider, model
 
     async def _attach_semantic_window_input(self, window):
         chunks = await self.repository.list_transcript_chunks(str(window.conversationId))

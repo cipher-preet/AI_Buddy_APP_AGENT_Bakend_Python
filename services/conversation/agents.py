@@ -19,6 +19,7 @@ from services.conversation.extraction_contract import (
     hydrate_synthesized_artifacts,
     alias_extraction_payload,
     alias_synthesis_payload,
+    alias_quality_review_payload,
     coerce_extraction_lists,
     suspicious_empty_retry_instruction,
     upstream_has_grounded_evidence,
@@ -65,6 +66,7 @@ from services.conversation.semantic_input import (
 )
 from services.llm.models import LLMMessage, StructuredLLMRequest
 from services.llm.router import LLMCapability, LLMRouter
+from services.llm.async_runtime import is_async_lifecycle_error
 from services.prompts.loader import load_prompt
 
 
@@ -283,6 +285,24 @@ class ExtractionQualityReviewResponse(BaseModel):
     missingActionable: list[str] = Field(default_factory=list)
     missingNotes: list[str] = Field(default_factory=list)
     failed: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_payload(cls, value):
+        payload = alias_quality_review_payload(value)
+        if not isinstance(payload, dict):
+            return payload
+        payload = coerce_extraction_lists(
+            payload,
+            unit_cls=None,
+            decision_cls=ExtractionQualityDecision,
+            update_trace=False,
+        )
+        payload["decisions"] = [
+            item.model_dump() if hasattr(item, "model_dump") else item
+            for item in payload.get("decisions") or []
+        ]
+        return payload
 
 
 class DecisionExtractionResponse(BaseModel):
@@ -2228,6 +2248,8 @@ async def _structured_with_recovery(
             return response, candidate_provider, used_model
         except Exception as error:
             last_error = error
+            if is_async_lifecycle_error(error):
+                raise
             print(
                 "Structured LLM attempt failed; trying eligible-model fallback if available:",
                 {
@@ -2247,9 +2269,9 @@ def _same_structured_route(left_provider, left_model: str, right_provider, right
 
 
 def _provider_structured_max_tokens(provider_name: str, schema_name: str = "") -> int | None:
-    if schema_name == "WindowExtractionLLMResponse":
+    if schema_name in {"WindowExtractionLLMResponse", "MeetingCandidateExtractorResponse"}:
         configured = settings.LLM_EXTRACTION_OUTPUT_MAX_TOKENS
-    elif schema_name == "FinalSynthesisLLMResponse":
+    elif schema_name in {"FinalSynthesisLLMResponse", "MeetingConsolidatorResponse"}:
         configured = min(settings.LLM_SYNTHESIS_OUTPUT_START_TOKENS, settings.LLM_SYNTHESIS_OUTPUT_MAX_TOKENS)
     else:
         configured = settings.LLM_STRUCTURED_MAX_TOKENS

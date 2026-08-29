@@ -22,6 +22,15 @@ from services.conversation.models import (
 )
 from services.conversation.workflow import ConversationProcessingWorkflow
 from services.llm.router import LLMCapability
+from apps.api_gateway.config.setting import settings
+
+
+@pytest.fixture(autouse=True)
+def _keep_legacy_short_session_path(monkeypatch):
+    monkeypatch.setattr(settings, "ENABLE_EVENT_PIPELINE", False)
+    monkeypatch.setattr(settings, "ENABLE_MEETING_PIPELINE", False)
+
+
 TRANSCRIPT_LINES = {
     1: "Mira will write the ulari drain notes before Thursday.",
     2: "Rahul will open the sequence-wait ticket today.",

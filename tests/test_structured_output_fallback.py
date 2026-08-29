@@ -29,6 +29,14 @@ from tests.test_zero_output_extraction import (
     _router,
     _synthesis_from_grounded,
 )
+from apps.api_gateway.config.setting import settings
+
+
+@pytest.fixture(autouse=True)
+def _keep_legacy_short_session_path(monkeypatch):
+    monkeypatch.setattr(settings, "ENABLE_EVENT_PIPELINE", False)
+    monkeypatch.setattr(settings, "ENABLE_MEETING_PIPELINE", False)
+
 
 
 DEFS_ECHO = {"$defs": {"EvidenceSpan": {"type": "object", "properties": {"text": {"type": "string"}}}}}

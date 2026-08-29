@@ -13,6 +13,7 @@ from services.llm.openai_compatible import parse_structured_content
 from services.llm.quota import ProviderQuota, quota_guard
 from services.llm.router import LLMCapability, LLMRouter
 from services.llm.routing_policy import CONVERSATION_INTELLIGENCE_FREE_PROVIDERS, conversation_route_spec
+from apps.api_gateway.config.setting import settings
 from services.llm.schema_adapter import (
     INCOMPLETE_STRUCTURED_OUTPUT,
     QUOTA_UNAVAILABLE,
@@ -115,14 +116,16 @@ def _candidate_models(router: LLMRouter, capability: LLMCapability) -> list[str]
 
 def test_semantic_extraction_selects_krutrim_gemma():
     router = _ci_router()
-    names = _candidate_names(router, LLMCapability.HIGH_ACCURACY_REASONING)
-    models = _candidate_models(router, LLMCapability.HIGH_ACCURACY_REASONING)
-    provider, model = router.route(LLMCapability.HIGH_ACCURACY_REASONING)
-    assert names == ["krutrim"]
-    assert models == ["gemma-4-31b-it"]
-    assert getattr(provider, "name", None) == "krutrim"
-    assert model == "gemma-4-31b-it"
+    for capability in (LLMCapability.HIGH_ACCURACY_REASONING, LLMCapability.SEMANTIC_EXTRACTION):
+        names = _candidate_names(router, capability)
+        models = _candidate_models(router, capability)
+        provider, model = router.route(capability)
+        assert names == ["krutrim"]
+        assert models == ["gemma-4-31b-it"]
+        assert getattr(provider, "name", None) == "krutrim"
+        assert model == "gemma-4-31b-it"
     assert conversation_route_spec(LLMCapability.SIMPLE_SUMMARY) == [("krutrim", "gemma-4-31b-it")]
+    assert conversation_route_spec(LLMCapability.SEMANTIC_EXTRACTION) == [("krutrim", "gemma-4-31b-it")]
 
 
 def test_final_synthesis_selects_krutrim_gpt_oss_120b():
@@ -140,15 +143,23 @@ def test_final_synthesis_selects_krutrim_gpt_oss_120b():
     ]
 
 
-def test_default_validation_selects_mistral_ministral_14b():
+def test_default_validation_selects_krutrim_gpt_oss_20b():
     router = _ci_router()
     names = _candidate_names(router, LLMCapability.VALIDATION)
     models = _candidate_models(router, LLMCapability.VALIDATION)
     provider, model = router.route(LLMCapability.VALIDATION)
-    assert names[0] == "mistral"
-    assert models[0] == "ministral-14b-latest"
-    assert getattr(provider, "name", None) == "mistral"
-    assert model == "ministral-14b-latest"
+    assert names[0] == "krutrim"
+    assert models[0] == "gpt-oss-20b"
+    assert getattr(provider, "name", None) == "krutrim"
+    assert model == "gpt-oss-20b"
+    assert conversation_route_spec(LLMCapability.VALIDATION)[0] == (
+        settings.CONVERSATION_VALIDATION_FALLBACK_PROVIDER,
+        settings.CONVERSATION_VALIDATION_FALLBACK_MODEL,
+    )
+    assert conversation_route_spec(LLMCapability.VALIDATION)[-1] == (
+        settings.CONVERSATION_VALIDATION_PROVIDER,
+        settings.CONVERSATION_VALIDATION_MODEL,
+    )
 
 
 def test_hard_validation_fallback_selects_krutrim_gpt_oss_20b():
@@ -156,8 +167,8 @@ def test_hard_validation_fallback_selects_krutrim_gpt_oss_20b():
     validation = router._cost_optimized_candidates(LLMCapability.VALIDATION)
     fallback = router._cost_optimized_candidates(LLMCapability.FALLBACK)
     assert [(item.provider.name, item.model) for item in validation] == [
-        ("mistral", "ministral-14b-latest"),
         ("krutrim", "gpt-oss-20b"),
+        ("mistral", "ministral-14b-latest"),
     ]
     assert [(item.provider.name, item.model) for item in fallback] == [("krutrim", "gpt-oss-20b")]
     provider, model = router.route(LLMCapability.FALLBACK)
@@ -169,6 +180,7 @@ def test_conversation_intelligence_never_selects_free_providers():
     router = _ci_router()
     for capability in (
         LLMCapability.HIGH_ACCURACY_REASONING,
+        LLMCapability.SEMANTIC_EXTRACTION,
         LLMCapability.SIMPLE_SUMMARY,
         LLMCapability.FINAL_SYNTHESIS,
         LLMCapability.VALIDATION,
@@ -188,26 +200,39 @@ def test_short_and_long_meeting_keep_role_based_routing():
 
     router = _ci_router()
     for estimated in (200, 80_000):
-        semantic_provider, semantic_model = _route_for_input(router, LLMCapability.HIGH_ACCURACY_REASONING, estimated)
+        semantic_provider, semantic_model = _route_for_input(router, LLMCapability.SEMANTIC_EXTRACTION, estimated)
+        reasoning_provider, reasoning_model = _route_for_input(router, LLMCapability.HIGH_ACCURACY_REASONING, estimated)
         synthesis_provider, synthesis_model = _route_for_input(router, LLMCapability.FINAL_SYNTHESIS, estimated)
         assert getattr(semantic_provider, "name", None) == "krutrim"
         assert semantic_model == "gemma-4-31b-it"
+        assert getattr(reasoning_provider, "name", None) == "krutrim"
+        assert reasoning_model == "gemma-4-31b-it"
         assert getattr(synthesis_provider, "name", None) == "krutrim"
         assert synthesis_model == "gpt-oss-120b"
         assert semantic_model != synthesis_model
 
 
 def test_canonical_task_note_schemas_unchanged():
-    from services.conversation.agents import FinalSynthesisLLMResponse, WindowExtractionLLMResponse
+    from services.conversation.agents import (
+        ExtractionQualityReviewResponse,
+        FinalSynthesisLLMResponse,
+        WindowExtractionLLMResponse,
+    )
 
     synthesis = canonical_json_schema(FinalSynthesisLLMResponse, "FinalSynthesisLLMResponse")
     extraction = canonical_json_schema(WindowExtractionLLMResponse, "WindowExtractionLLMResponse")
+    review = canonical_json_schema(ExtractionQualityReviewResponse, "ExtractionQualityReviewResponse")
+    understanding = canonical_json_schema(ConversationUnderstandingResponse, "ConversationUnderstandingResponse")
     assert set(WIRE_REQUIRED_COLLECTIONS["FinalSynthesisLLMResponse"]) <= set(synthesis["properties"])
     assert "tasks" in synthesis["properties"]
     assert "notes" in synthesis["properties"]
     assert "semanticUnits" in extraction["properties"]
     assert "tasks" in extraction["properties"]
     assert "notes" in extraction["properties"]
+    assert extraction["properties"]["decisions"]["items"].get("properties")
+    assert review["properties"]["decisions"]["items"]["properties"]["kind"]
+    assert review["properties"]["missingActionable"]["items"]["type"] == "string"
+    assert understanding["properties"]["decisions"]["items"]["type"] == "string"
     plan = build_structured_plan("mistral", "ministral-14b-latest", FinalSynthesisLLMResponse, "FinalSynthesisLLMResponse")
     assert plan.attempts[0].mode == "json_schema"
     krutrim_plan = build_structured_plan("krutrim", "gpt-oss-120b", FinalSynthesisLLMResponse, "FinalSynthesisLLMResponse")
@@ -247,8 +272,8 @@ def test_validator_failure_uses_gpt_oss_20b_not_obsolete_provider():
     assert groq.calls == 0
     assert gemini.calls == 0
     assert sarvam.calls == 0
-    assert mistral.calls == 1
     assert krutrim.calls == 1
+    assert mistral.calls == 0
 
 
 def test_provider_error_is_not_valid_empty_extraction():
@@ -315,6 +340,7 @@ def test_unconfigured_krutrim_does_not_fall_back_to_free_models():
     assert getattr(provider, "name", None) == "krutrim"
     assert model == "gemma-4-31b-it"
     assert _candidate_names(router, LLMCapability.HIGH_ACCURACY_REASONING) == []
+    assert _candidate_names(router, LLMCapability.SEMANTIC_EXTRACTION) == []
     assert _candidate_names(router, LLMCapability.FINAL_SYNTHESIS) == []
     assert "groq" not in _candidate_names(router, LLMCapability.VALIDATION)
     assert "gemini" not in _candidate_names(router, LLMCapability.VALIDATION)
@@ -328,9 +354,10 @@ def test_conversation_intelligence_order_includes_gemini():
     router = _ci_router()
     expected = {
         LLMCapability.HIGH_ACCURACY_REASONING: ["krutrim"],
+        LLMCapability.SEMANTIC_EXTRACTION: ["krutrim"],
         LLMCapability.SIMPLE_SUMMARY: ["krutrim"],
         LLMCapability.FINAL_SYNTHESIS: ["krutrim", "krutrim"],
-        LLMCapability.VALIDATION: ["mistral", "krutrim"],
+        LLMCapability.VALIDATION: ["krutrim", "mistral"],
         LLMCapability.FALLBACK: ["krutrim"],
     }
     for capability, names in expected.items():
@@ -402,6 +429,48 @@ def test_mistral_recovery_can_accept_corrected_schema():
     assert parsed.problems == ["Duplicate outlet appeared twice"]
     assert len(provider.seen_formats) == 2
     assert provider.seen_formats[1]["type"] == "json_object"
+
+
+def test_extraction_quality_review_accepts_mistral_object_aliases():
+    from services.conversation.agents import ExtractionQualityReviewResponse
+
+    payload = {
+        "decisions": [
+            {
+                "type": "task",
+                "itemIndex": 0,
+                "accept": True,
+                "explanation": "Grounded and independently useful.",
+                "quality": {"grounded": True, "independentlyUseful": True},
+            }
+        ],
+        "missingActionable": [{"meaning": "Run another long-meeting transcription test."}],
+        "missingNotes": [{"description": "Internal testing will use 1-hour and 2-4 hour recordings."}],
+        "failed": "true",
+    }
+    parsed, diagnostics = parse_structured_content(ExtractionQualityReviewResponse, json.dumps(payload))
+    assert diagnostics["parsingOutcome"] == "PARSED_INSTANCE"
+    assert parsed.decisions[0].kind == "task"
+    assert parsed.decisions[0].index == 0
+    assert parsed.decisions[0].keep is True
+    assert parsed.missingActionable == ["Run another long-meeting transcription test."]
+    assert "1-hour" in parsed.missingNotes[0]
+    assert parsed.failed is True
+
+
+def test_mistral_quality_review_schema_keeps_object_decisions():
+    from services.conversation.agents import ExtractionQualityReviewResponse
+
+    plan = build_structured_plan(
+        "mistral",
+        "ministral-14b-latest",
+        ExtractionQualityReviewResponse,
+        "ExtractionQualityReviewResponse",
+    )
+    schema = plan.attempts[0].response_format["json_schema"]["schema"]
+    assert schema["properties"]["decisions"]["items"]["type"] == "object"
+    assert "kind" in schema["properties"]["decisions"]["items"]["properties"]
+    assert schema["properties"]["missingActionable"]["items"]["type"] == "string"
 
 
 def test_final_synthesis_accepts_two_tasks_and_one_note():

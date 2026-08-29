@@ -24,6 +24,14 @@ from services.conversation.workflow import ConversationProcessingWorkflow
 from services.llm.router import LLMCapability
 from tests.test_final_synthesis_persistence import FakeRepository, _chunks
 from tests.test_zero_output_extraction import _grounded_payload, _run, _router
+from apps.api_gateway.config.setting import settings
+
+
+@pytest.fixture(autouse=True)
+def _keep_legacy_short_session_path(monkeypatch):
+    monkeypatch.setattr(settings, "ENABLE_EVENT_PIPELINE", False)
+    monkeypatch.setattr(settings, "ENABLE_MEETING_PIPELINE", False)
+
 
 
 def _chunk(sequence, text="", **kwargs):

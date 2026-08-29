@@ -614,6 +614,32 @@ class ConversationRepository:
         )
         return MeetingMemoryDocument.model_validate(result)
 
+    async def upsert_conversation_events(self, conversation_id: str, events: list[dict[str, Any]]) -> None:
+        if not events:
+            return
+        conversation_key = to_mongo_id(conversation_id)
+        for event in events:
+            event_id = str(event.get("eventId") or "")
+            if not event_id:
+                continue
+            payload = dict(event)
+            payload["conversationId"] = conversation_key
+            payload["updatedAt"] = utc_now()
+            await self.db.conversation_events.find_one_and_update(
+                {"conversationId": conversation_key, "eventId": event_id},
+                {"$set": payload, "$setOnInsert": {"createdAt": utc_now()}},
+                upsert=True,
+            )
+
+    async def replace_conversation_events(self, conversation_id: str, events: list[dict[str, Any]]) -> None:
+        conversation_key = to_mongo_id(conversation_id)
+        await self.db.conversation_events.delete_many({"conversationId": conversation_key})
+        await self.upsert_conversation_events(conversation_id, events)
+
+    async def list_conversation_events(self, conversation_id: str) -> list[dict[str, Any]]:
+        cursor = self.db.conversation_events.find({"conversationId": to_mongo_id(conversation_id)})
+        return [doc async for doc in cursor]
+
     async def append_meeting_debug_trace(
         self,
         conversation_id: str,

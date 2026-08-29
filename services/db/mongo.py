@@ -4,15 +4,26 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo import ASCENDING, DESCENDING, IndexModel
 
 from apps.api_gateway.config.setting import settings
+from services.llm.async_runtime import current_loop_id
 
 
 _client: AsyncIOMotorClient | None = None
+_client_loop_id: str | None = None
 
 
 def get_mongo_client() -> AsyncIOMotorClient:
-    global _client
+    global _client, _client_loop_id
+    loop_id = current_loop_id()
+    if _client is not None and _client_loop_id is not None and loop_id is not None and _client_loop_id != loop_id:
+        try:
+            _client.close()
+        except Exception:
+            pass
+        _client = None
+        _client_loop_id = None
     if _client is None:
         _client = AsyncIOMotorClient(settings.MONGODB_URL, uuidRepresentation="standard")
+        _client_loop_id = loop_id
     return _client
 
 
@@ -21,10 +32,11 @@ def get_database() -> AsyncIOMotorDatabase:
 
 
 async def close_mongo_client() -> None:
-    global _client
+    global _client, _client_loop_id
     if _client is not None:
         _client.close()
         _client = None
+        _client_loop_id = None
 
 
 async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:

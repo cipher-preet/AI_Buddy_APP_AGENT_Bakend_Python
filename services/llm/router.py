@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from enum import Enum
 
 from apps.api_gateway.config.setting import settings
@@ -15,6 +17,7 @@ from services.llm.providers import (
     build_sarvam_provider,
     NotConfiguredProvider,
 )
+from services.llm.quota import ProviderQuota
 from services.llm.routing_policy import (
     CHAT_PROVIDER_ORDER,
     NORMALIZATION_PROVIDER_ORDER,
@@ -27,6 +30,7 @@ from services.llm.routing_policy import (
 
 class LLMCapability(str, Enum):
     HIGH_ACCURACY_REASONING = "high_accuracy_reasoning"
+    SEMANTIC_EXTRACTION = "semantic_extraction"
     CHAT_ANSWER = "chat_answer"
     VALIDATION = "validation"
     COMPLEX_TASK_MATCHING = "complex_task_matching"
@@ -57,6 +61,7 @@ class LLMRouter:
         if capability in {
             LLMCapability.VALIDATION,
             LLMCapability.HIGH_ACCURACY_REASONING,
+            LLMCapability.SEMANTIC_EXTRACTION,
             LLMCapability.COMPLEX_TASK_MATCHING,
             LLMCapability.FINAL_SYNTHESIS,
         }:
@@ -109,6 +114,15 @@ class LLMRouter:
             return None
         return LLMRouteCandidate(provider=provider, model=model, quota=quota)
 
+    async def aclose_transports(self) -> None:
+        for provider in self.providers.values():
+            closer = getattr(provider, "aclose", None)
+            if closer is None:
+                continue
+            result = closer()
+            if asyncio.iscoroutine(result):
+                await result
+
 
 _router: LLMRouter | None = None
 
@@ -128,6 +142,24 @@ def get_llm_router() -> LLMRouter:
             }
         )
     return _router
+
+
+async def close_llm_runtime() -> None:
+    """Dispose loop-bound HTTP transports. Router configuration is kept."""
+    if _router is not None:
+        await _router.aclose_transports()
+    try:
+        from services.vector.embedding_service import close_embedding_client
+
+        await close_embedding_client()
+    except Exception:
+        pass
+    try:
+        from services.speech.providers.sarvam_provider import close_sarvam_stt_client
+
+        await close_sarvam_stt_client()
+    except Exception:
+        pass
 
 
 def llm_provider_status() -> list[dict]:

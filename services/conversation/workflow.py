@@ -16,6 +16,17 @@ from services.conversation.semantic_input import (
     SEMANTIC_INPUT_ASSEMBLY_FAILED,
     assemble_semantic_window_input,
 )
+from services.conversation.event_pipeline import (
+    event_pipeline_selected_for,
+    event_pipeline_shadow,
+    run_event_pipeline,
+)
+from services.conversation.event_pipeline.pipeline import events_from_windows, to_window_result
+from services.conversation.event_pipeline.publish_gate import EventPipelineHardFailure, require_publication_ready
+from services.conversation.event_pipeline.versions import ARTIFACT_PIPELINE_VERSION, LEGACY_PIPELINE_VERSION, stamp_artifact_provenance, version_metadata
+from services.conversation.meeting_pipeline import meeting_pipeline_enabled, run_meeting_pipeline
+from services.conversation.meeting_pipeline.pipeline import to_window_result as meeting_to_window_result
+from services.llm.async_runtime import is_async_lifecycle_error
 from services.conversation.workflow_state import ConversationGraphState
 from services.llm.router import LLMCapability, LLMRouter, get_llm_router
 from services.queue.streams import EventEnvelope, RedisStreamProducer
@@ -235,6 +246,12 @@ class ConversationProcessingWorkflow:
         return await asyncio.gather(*(run_segment(segment) for segment in state.segments))
 
     async def _run_short_session_finalization(self, conversation, run, windows) -> None:
+        if meeting_pipeline_enabled():
+            await self._run_meeting_pipeline_finalization(conversation, run, windows, path="short_raw_transcript")
+            return
+        if event_pipeline_selected_for(str(conversation.userId), str(conversation.id)):
+            if await self._try_event_pipeline_finalization(conversation, run, windows, path="short_raw_transcript"):
+                return
         started = utc_ms()
         conversation_id = str(conversation.id)
         context = await load_space_context(self.repository, conversation.userId, conversation.spaceId)
@@ -271,6 +288,8 @@ class ConversationProcessingWorkflow:
         diagnostics["qualityAcceptedTaskCount"] = len(result.tasks)
         diagnostics["qualityAcceptedNoteCount"] = len(result.notes)
         result.extractionDiagnostics = diagnostics
+        if event_pipeline_shadow():
+            await self._run_event_pipeline_shadow(conversation, run, windows, result, path="short_raw_transcript")
         await self._publish_final_result(
             conversation,
             run,
@@ -283,6 +302,12 @@ class ConversationProcessingWorkflow:
         )
 
     async def _run_incremental_finalization(self, conversation, run, windows, context: dict | None = None) -> None:
+        if meeting_pipeline_enabled():
+            await self._run_meeting_pipeline_finalization(conversation, run, windows, path="long_checkpoint_synthesis")
+            return
+        if event_pipeline_selected_for(str(conversation.userId), str(conversation.id)):
+            if await self._try_event_pipeline_finalization(conversation, run, windows, path="long_checkpoint_synthesis"):
+                return
         started = utc_ms()
         conversation_id = str(conversation.id)
         context = context or await load_space_context(self.repository, conversation.userId, conversation.spaceId)
@@ -414,6 +439,8 @@ class ConversationProcessingWorkflow:
             "reconciliation",
             run.checkpoints["incremental_window_finalization"],
         )
+        if event_pipeline_shadow():
+            await self._run_event_pipeline_shadow(conversation, run, ordered_windows, result, path="long_checkpoint_synthesis")
         await self._publish_final_result(
             conversation,
             run,
@@ -425,6 +452,219 @@ class ConversationProcessingWorkflow:
             path="long_checkpoint_synthesis",
             coverage=coverage,
             accounting=accounting,
+        )
+
+    async def _run_meeting_pipeline_finalization(self, conversation, run, windows, path: str) -> None:
+        started = utc_ms()
+        conversation_id = str(conversation.id)
+        chunks = await self.repository.list_transcript_chunks(conversation_id)
+        result = await run_meeting_pipeline(
+            chunks,
+            conversation_id,
+            str(conversation.userId),
+            str(conversation.spaceId),
+            router=self.router,
+            meeting_at=getattr(conversation, "startedAt", None),
+        )
+        window_result = meeting_to_window_result(result)
+        diagnostics = dict(window_result.extractionDiagnostics or {})
+        diagnostics["qualityAcceptedTaskCount"] = len(window_result.tasks)
+        diagnostics["qualityAcceptedNoteCount"] = len(window_result.notes)
+        diagnostics["tasksReturnedByApi"] = len(window_result.tasks)
+        diagnostics["meetingPipeline"] = True
+        diagnostics["pipelineMode"] = "meeting_pipeline"
+        window_result.extractionDiagnostics = diagnostics
+        run.checkpoints[path] = {
+            "path": path,
+            "windowCount": len(windows or []),
+            "extractionWindowCount": result.observability.get("window_count"),
+            "durationMs": utc_ms() - started,
+            **{key: result.observability.get(key) for key in (
+                "total_candidate_count",
+                "consolidated_task_count",
+                "consolidated_note_count",
+                "verified_supported_count",
+                "verified_partial_count",
+                "verified_unsupported_count",
+                "rejected_artifact_count",
+                "retry_count",
+                "extractor_calls",
+                "consolidator_calls",
+                "verifier_calls",
+            )},
+            **diagnostics,
+        }
+        print("Meeting pipeline completed:", {key: run.checkpoints[path].get(key) for key in ("path", "qualityAcceptedTaskCount", "qualityAcceptedNoteCount", "total_candidate_count")})
+        await self._publish_final_result(
+            conversation,
+            run,
+            window_result,
+            result.provider,
+            result.model,
+            windows or [],
+            started,
+            path=path,
+            accounting=conversation.lastAccounting or {},
+        )
+
+    async def _try_event_pipeline_finalization(self, conversation, run, windows, path: str) -> bool:
+        from services.conversation.event_pipeline.alerts import log_pipeline_fallback
+
+        try:
+            await self._run_event_pipeline_finalization(conversation, run, windows, path=path)
+            return True
+        except EventPipelineHardFailure as error:
+            reason = error.reason
+            payload = {
+                "mode": "event_pipeline",
+                "publishedFrom": "legacy",
+                "pipelineFallback": True,
+                "fallbackReason": reason,
+                "error": str(error)[:500],
+            }
+            run.checkpoints[f"{path}_event_pipeline_failed"] = payload
+            run.checkpoints["pipelineFallback"] = True
+            run.checkpoints["fallbackReason"] = reason
+            log_pipeline_fallback(reason=reason, path=path, error=str(error))
+            return False
+        except Exception as error:
+            if not (is_async_lifecycle_error(error) or type(error).__name__ == "PipelineBudgetExceeded"):
+                raise
+            reason = getattr(error, "failure_reason", None) or type(error).__name__
+            payload = {
+                "mode": "event_pipeline",
+                "publishedFrom": "legacy",
+                "pipelineFallback": True,
+                "fallbackReason": reason,
+                "error": str(error)[:500],
+            }
+            run.checkpoints[f"{path}_event_pipeline_failed"] = payload
+            run.checkpoints["pipelineFallback"] = True
+            run.checkpoints["fallbackReason"] = reason
+            log_pipeline_fallback(reason=reason, path=path, error=str(error))
+            return False
+
+    async def _run_event_pipeline_shadow(self, conversation, run, windows, legacy_result, path: str) -> None:
+        from services.conversation.event_pipeline.shadow import compare_pipeline_outputs
+
+        conversation_id = str(conversation.id)
+        try:
+            chunks = await self.repository.list_transcript_chunks(conversation_id)
+            checkpoint_events = events_from_windows(windows or [])
+            result = await run_event_pipeline(
+                chunks,
+                conversation_id,
+                str(conversation.userId),
+                str(conversation.spaceId),
+                checkpoint_events=checkpoint_events,
+                router=self.router,
+                repository=self.repository,
+                polish_with_llm=True,
+            )
+            comparison = compare_pipeline_outputs(
+                legacy_tasks=getattr(legacy_result, "tasks", []) or [],
+                legacy_notes=getattr(legacy_result, "notes", []) or [],
+                new_tasks=result.tasks,
+                new_notes=result.notes,
+                new_events=result.events,
+            )
+            run.checkpoints[f"{path}_shadow"] = {
+                "mode": "shadow",
+                "publishedFrom": "legacy",
+                "eventCount": len(result.events),
+                "threadCount": len(result.threads),
+                "newTaskCount": len(result.tasks),
+                "newNoteCount": len(result.notes),
+                "coverage": result.coverage.as_metrics() if result.coverage else {},
+                "cost": result.cost,
+                **comparison,
+            }
+            print("Event pipeline shadow comparison:", run.checkpoints[f"{path}_shadow"])
+            await self.repository.append_meeting_debug_trace(
+                conversation_id,
+                conversation.userId,
+                conversation.spaceId,
+                "event_pipeline_shadow",
+                run.checkpoints[f"{path}_shadow"],
+            )
+        except Exception as error:
+            run.checkpoints[f"{path}_shadow"] = {
+                "mode": "shadow",
+                "publishedFrom": "legacy",
+                "error": str(error)[:500],
+            }
+            print("Event pipeline shadow failed; legacy publish continues:", run.checkpoints[f"{path}_shadow"])
+
+    async def _run_event_pipeline_finalization(self, conversation, run, windows, path: str) -> None:
+        started = utc_ms()
+        conversation_id = str(conversation.id)
+        chunks = await self.repository.list_transcript_chunks(conversation_id)
+        checkpoint_events = events_from_windows(windows or [])
+        result = await run_event_pipeline(
+            chunks,
+            conversation_id,
+            str(conversation.userId),
+            str(conversation.spaceId),
+            checkpoint_events=checkpoint_events,
+            router=self.router,
+            repository=self.repository,
+            polish_with_llm=True,
+        )
+        require_publication_ready(result)
+        window_result = to_window_result(result, checkpoint=False)
+        transcript = "\n".join(
+            f"[{record.sequenceId}] {record.rawText}" for record in (result.cleaning.useful if result.cleaning else [])
+        )
+        diagnostics = dict(window_result.extractionDiagnostics or {})
+        window_result = score_and_filter_result(window_result, transcript, diagnostics=diagnostics)
+        diagnostics["qualityAcceptedTaskCount"] = len(window_result.tasks)
+        diagnostics["qualityAcceptedNoteCount"] = len(window_result.notes)
+        diagnostics["tasksReturnedByApi"] = len(window_result.tasks)
+        if result.observability is not None:
+            result.observability.tasksReturnedByApi = len(window_result.tasks)
+            from services.conversation.event_pipeline.observability import _task_pipeline_trace_line
+
+            print(_task_pipeline_trace_line(result.observability))
+            if (
+                result.observability.groundedActionObjects > 0
+                and len(window_result.tasks) == 0
+                and "SUSPICIOUS_ZERO_TASK_OUTPUT" not in (result.coverage.suspicious if result.coverage else [])
+            ):
+                print("[SUSPICIOUS_ZERO_TASK_OUTPUT] grounded explicit actions produced zero API tasks")
+        diagnostics["eventPipeline"] = True
+        diagnostics["artifactPipelineVersion"] = ARTIFACT_PIPELINE_VERSION
+        diagnostics["pipelineMode"] = "event_pipeline"
+        versions = version_metadata()
+        diagnostics["eventSchemaVersion"] = versions["eventSchemaVersion"]
+        diagnostics["promptVersion"] = versions["promptVersion"]
+        diagnostics["coverage"] = result.coverage.as_metrics() if result.coverage else {}
+        stamp_artifact_provenance(window_result.tasks, window_result.notes, pipeline_mode="event_pipeline")
+        window_result.extractionDiagnostics = diagnostics
+        run.checkpoints[path] = {
+            "path": path,
+            "windowCount": len(windows or []),
+            "checkpointEventCount": len(checkpoint_events),
+            "microBlockCount": len(result.microBlocks),
+            "topicCount": len(result.topics),
+            "eventCount": len(result.events),
+            "threadCount": len(result.threads),
+            "durationMs": utc_ms() - started,
+            "llmCalls": result.observability.llm_calls(),
+            "embeddingCalls": result.observability.embedding_calls(),
+            "comparisonCount": result.observability.comparisonCount,
+            **diagnostics,
+        }
+        print("Event pipeline completed:", {key: run.checkpoints[path].get(key) for key in ("path", "eventCount", "threadCount", "qualityAcceptedTaskCount", "qualityAcceptedNoteCount")})
+        await self._publish_final_result(
+            conversation,
+            run,
+            window_result,
+            result.provider,
+            result.model,
+            windows or [],
+            started,
+            path=path,
+            accounting=conversation.lastAccounting or {},
         )
 
     async def _publish_final_result(
@@ -491,6 +731,11 @@ class ConversationProcessingWorkflow:
             "persistedNoteIds": [],
         }
         result.extractionDiagnostics = {**(result.extractionDiagnostics or {}), **persistence}
+        result.extractionDiagnostics.setdefault("artifactPipelineVersion", LEGACY_PIPELINE_VERSION)
+        result.extractionDiagnostics.setdefault("pipelineMode", "legacy" if not result.extractionDiagnostics.get("eventPipeline") else "event_pipeline")
+        if run.checkpoints.get("pipelineFallback"):
+            result.extractionDiagnostics["pipelineFallback"] = True
+            result.extractionDiagnostics["fallbackReason"] = run.checkpoints.get("fallbackReason")
         try:
             published = await self.repository.publish_outputs(run, summary, memory_update)
         except Exception as error:

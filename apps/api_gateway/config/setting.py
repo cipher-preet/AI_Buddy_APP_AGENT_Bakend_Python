@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     CONVERSATION_SYNTHESIS_MODEL: str = "gpt-oss-120b"
     CONVERSATION_SYNTHESIS_FALLBACK_PROVIDER: str = "krutrim"
     CONVERSATION_SYNTHESIS_FALLBACK_MODEL: str = "gemma-4-31b-it"
+    # VALIDATION capability prefers gpt-oss-20b (FALLBACK_* below), then this pair.
     CONVERSATION_VALIDATION_PROVIDER: str = "mistral"
     CONVERSATION_VALIDATION_MODEL: str = "ministral-14b-latest"
     CONVERSATION_VALIDATION_FALLBACK_PROVIDER: str = "krutrim"
@@ -153,6 +154,70 @@ class Settings(BaseSettings):
     MAX_TRANSCRIPT_SEGMENTS: int = 80
     MAX_REPAIR_ROUNDS: int = 2
     ENABLE_INCREMENTAL_MEETING_PROCESSING: bool = True
+    # Single semantic path: mechanical windows → recall extraction → ledger →
+    # consolidate → verify → invariant gate. Instant rollback:
+    #   ENABLE_MEETING_PIPELINE=false
+    ENABLE_MEETING_PIPELINE: bool = True
+    EXTRACTION_WINDOW_TARGET_TOKENS: int = Field(default=5000, ge=200, le=100000)
+    EXTRACTION_WINDOW_MAX_TOKENS: int = Field(default=7000, ge=200, le=120000)
+    EXTRACTION_WINDOW_OVERLAP_RATIO: float = Field(default=0.12, ge=0, le=0.5)
+    MAX_EXTRACTION_CONCURRENCY: int = Field(default=4, ge=1, le=16)
+    ENABLE_EVENT_PIPELINE: bool = True
+    # Previous hierarchical event pipeline. Kept for rollback when
+    # ENABLE_MEETING_PIPELINE=false. Instant event-pipeline rollback:
+    #   EVENT_PIPELINE_MODE=legacy  or  EVENT_PIPELINE_ROLLOUT_PERCENT=0
+    # Empty/unset mode resolves to event_pipeline. Invalid values fail safe to legacy.
+    # ENABLE_EVENT_PIPELINE=false is a hard off-switch regardless of mode.
+    EVENT_PIPELINE_MODE: str = "event_pipeline"
+    ENABLE_SEMANTIC_MICROBLOCKS: bool = True
+    ENABLE_GLOBAL_THREAD_GRAPH: bool = True
+    ENABLE_FACTUAL_VALIDATION: bool = False
+    ENABLE_COVERAGE_LEDGER: bool = True
+    ENABLE_EVENT_PIPELINE_DEBUG_SNAPSHOTS: bool = False
+    EVENT_PIPELINE_DEBUG_SNAPSHOT_DIR: str = ""
+    # Tuned from real text-embedding-3-small SAME/DIFFERENT pairs (F1-optimal 0.331).
+    MICROBLOCK_SIMILARITY_THRESHOLD: float = Field(default=0.34, ge=0.0, le=1.0)
+    TOPIC_CONTINUE_SIMILARITY_THRESHOLD: float = Field(default=0.56, ge=0.0, le=1.0)
+    TOPIC_COHERENCE_DROP_THRESHOLD: float = Field(default=0.10, ge=0.0, le=1.0)
+    TOPIC_OBJECT_DISCONTINUITY_MAX_OVERLAP: float = Field(default=0.12, ge=0.0, le=1.0)
+    TOPIC_OBJECT_DISCONTINUITY_MAX_SIMILARITY: float = Field(default=0.66, ge=0.0, le=1.0)
+    TOPIC_SAFETY_MAX_MICRO_BLOCKS: int = Field(default=6, ge=2, le=32)
+    TOPIC_SAFETY_MAX_TOKENS: int = Field(default=1600, ge=200, le=8000)
+    TOPIC_SAFETY_CONTINUE_SIMILARITY: float = Field(default=0.78, ge=0.0, le=1.0)
+    TOPIC_FILLER_DENSITY_THRESHOLD: float = Field(default=0.40, ge=0.0, le=1.0)
+    # Candidate retrieval floor: keep below the observed same-thread FN (0.318).
+    THREAD_CANDIDATE_SIMILARITY_THRESHOLD: float = Field(default=0.15, ge=0.0, le=1.0)
+    THREAD_ENTITYLESS_MIN_SIMILARITY: float = Field(default=0.72, ge=0.0, le=1.0)
+    EVENT_PIPELINE_MICROBLOCK_MIN_TURNS: int = Field(default=2, ge=1, le=8)
+    EVENT_PIPELINE_MICROBLOCK_MAX_TURNS: int = Field(default=5, ge=2, le=12)
+    EVENT_PIPELINE_MICROBLOCK_MIN_TOKENS: int = Field(default=250, ge=40, le=2000)
+    EVENT_PIPELINE_MICROBLOCK_MAX_TOKENS: int = Field(default=500, ge=80, le=4000)
+    EVENT_PIPELINE_THREAD_TOP_K: int = Field(default=8, ge=2, le=32)
+    EVENT_PIPELINE_EMBEDDING_BATCH_SIZE: int = Field(default=32, ge=1, le=256)
+    EVENT_PIPELINE_MAX_REPAIR_ROUNDS: int = Field(default=1, ge=0, le=3)
+    EVENT_PIPELINE_PREFER_PROVIDER_EMBEDDINGS: bool = True
+    EVENT_PIPELINE_THREAD_HARD_MAX_ESCALATIONS: int = Field(default=3, ge=0, le=32)
+    EVENT_PIPELINE_ATOMIC_EVENT_MAX_INPUT_TOKENS: int = Field(default=2500, ge=200, le=12000)
+    EVENT_PIPELINE_TOPIC_LABEL_MAX_INPUT_TOKENS: int = Field(default=800, ge=100, le=4000)
+    EVENT_PIPELINE_THREAD_VERIFY_MAX_INPUT_TOKENS: int = Field(default=1200, ge=200, le=4000)
+    EVENT_PIPELINE_THREAD_HARD_MAX_INPUT_TOKENS: int = Field(default=1800, ge=200, le=6000)
+    EVENT_PIPELINE_SYNTHESIS_MAX_INPUT_TOKENS: int = Field(default=1800, ge=200, le=8000)
+    EVENT_PIPELINE_VALIDATION_MAX_INPUT_TOKENS: int = Field(default=1800, ge=200, le=8000)
+    EVENT_PIPELINE_ROLLOUT_PERCENT: int = Field(default=100, ge=0, le=100)
+    EVENT_PIPELINE_PHASE: str = ""
+    EVENT_PIPELINE_MAX_TOTAL_RUNTIME: float = Field(default=1800, ge=30, le=14400)
+    EVENT_PIPELINE_MAX_MODEL_CALLS: int = Field(default=800, ge=10, le=20000)
+    EVENT_PIPELINE_MAX_RETRIES: int = Field(default=12, ge=0, le=100)
+    EVENT_PIPELINE_STAGE_TIMEOUT_SECONDS: float = Field(default=240, ge=5, le=1800)
+    EVENT_PIPELINE_EMBEDDING_TIMEOUT_SECONDS: float = Field(default=60, ge=5, le=600)
+    EVENT_PIPELINE_EMBEDDING_MAX_CONCURRENCY: int = Field(default=8, ge=1, le=64)
+    LLM_COST_GEMMA_INPUT_PER_MILLION: float | None = None
+    LLM_COST_GEMMA_OUTPUT_PER_MILLION: float | None = None
+    LLM_COST_GPT_OSS_120B_INPUT_PER_MILLION: float | None = None
+    LLM_COST_GPT_OSS_120B_OUTPUT_PER_MILLION: float | None = None
+    LLM_COST_GPT_OSS_20B_INPUT_PER_MILLION: float | None = None
+    LLM_COST_GPT_OSS_20B_OUTPUT_PER_MILLION: float | None = None
+    LLM_COST_EMBEDDING_PER_MILLION: float | None = None
     SEMANTIC_WINDOW_MAX_USEFUL_MINUTES: int = Field(default=60, ge=1, le=480)
     SEMANTIC_WINDOW_MAX_TRANSCRIPT_TOKENS: int = Field(default=22000, ge=200, le=100000)
     SEMANTIC_WINDOW_SAFE_CONTEXT_RATIO: float = Field(default=0.72, ge=0.3, le=0.95)

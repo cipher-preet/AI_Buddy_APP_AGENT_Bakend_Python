@@ -12,6 +12,7 @@ CONVERSATION_INTELLIGENCE_FREE_PROVIDERS = ("groq", "gemini", "sarvam")
 
 CONVERSATION_INTELLIGENCE_CAPABILITY_VALUES = {
     "high_accuracy_reasoning",
+    "semantic_extraction",
     "validation",
     "simple_summary",
     "complex_task_matching",
@@ -21,6 +22,7 @@ CONVERSATION_INTELLIGENCE_CAPABILITY_VALUES = {
 
 _SEMANTIC_CAPABILITIES = {
     "high_accuracy_reasoning",
+    "semantic_extraction",
     "simple_summary",
     "complex_task_matching",
 }
@@ -64,13 +66,20 @@ def conversation_route_spec(capability) -> list[tuple[str, str]]:
             pairs.append(fallback)
         return pairs
     if role == "validation":
-        return [
-            (settings.CONVERSATION_VALIDATION_PROVIDER, settings.CONVERSATION_VALIDATION_MODEL),
-            (
-                settings.CONVERSATION_VALIDATION_FALLBACK_PROVIDER,
-                settings.CONVERSATION_VALIDATION_FALLBACK_MODEL,
-            ),
-        ]
+        preferred = (
+            settings.CONVERSATION_VALIDATION_FALLBACK_PROVIDER,
+            settings.CONVERSATION_VALIDATION_FALLBACK_MODEL,
+        )
+        existing = (
+            settings.CONVERSATION_VALIDATION_PROVIDER,
+            settings.CONVERSATION_VALIDATION_MODEL,
+        )
+        pairs: list[tuple[str, str]] = []
+        if preferred[0] and preferred[1]:
+            pairs.append(preferred)
+        if existing[0] and existing[1] and existing not in pairs:
+            pairs.append(existing)
+        return pairs or [existing]
     if role == "validation_fallback":
         return [
             (
