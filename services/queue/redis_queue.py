@@ -22,9 +22,9 @@ redis_client = redis.from_url(
 async def test_redis_connection():
     try:
         pong = await redis_client.ping()
-        print("Redis connected:", pong)
+        print("Conversation Redis connected:", pong)
     except Exception as error:
-        print("Redis connection failed:", str(error))
+        print("Conversation Redis connection failed:", str(error))
 
 
 async def push_speech_job(job: dict):

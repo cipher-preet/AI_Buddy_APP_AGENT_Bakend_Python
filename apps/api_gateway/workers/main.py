@@ -13,6 +13,7 @@ from apps.api_gateway.workers.conversation_workers import (
     run_inactivity_scanner,
     run_retry_relay,
 )
+from apps.api_gateway.workers.reminder_worker import start_reminder_worker
 from services.db.mongo import close_mongo_client, ensure_mongo_indexes
 from services.llm.router import close_llm_runtime, log_llm_provider_status
 
@@ -47,6 +48,7 @@ async def main():
             *(consumer.run_forever() for consumer in stream_consumers),
             run_inactivity_scanner(),
             run_retry_relay(),
+            start_reminder_worker(),
         )
     finally:
         await close_llm_runtime()

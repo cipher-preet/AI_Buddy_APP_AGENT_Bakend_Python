@@ -176,3 +176,17 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
             IndexModel([("fingerprint", ASCENDING)], unique=True, sparse=True),
         ]
     )
+    await database.reminders.create_indexes(
+        [
+            IndexModel([("userId", ASCENDING), ("_id", DESCENDING)]),
+            IndexModel([("deliveryStatus", ASCENDING), ("nextTriggerAtUtc", ASCENDING)]),
+            IndexModel([("nextTriggerAtUtc", ASCENDING)]),
+            IndexModel([("scheduledOccurrenceId", ASCENDING)], sparse=True),
+        ]
+    )
+    await database.device_tokens.create_indexes(
+        [
+            IndexModel([("token", ASCENDING)], unique=True),
+            IndexModel([("userId", ASCENDING), ("updatedAt", DESCENDING)]),
+        ]
+    )

@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     DEBUG: bool = True
 
     REDIS_URL: str = "redis://localhost:6379"
+    REMINDER_REDIS_URL: str = ""
     REDIS_MAX_RETRIES: int | None = None
     REDIS_EVENT_RETENTION: int = Field(default=86400, ge=60)
     MONGODB_URI: str = ""
@@ -39,6 +40,10 @@ class Settings(BaseSettings):
     DEEPGRAM_LANGUAGE: str = "multi"
     DEEPGRAM_SMART_FORMAT: bool = True
     DEEPGRAM_DETECT_LANGUAGE: bool = False
+    DEEPGRAM_TTS_MODEL: str = "aura-asteria-en"
+    DEEPGRAM_TTS_TIMEOUT_SECONDS: float = 12
+    SARVAM_TTS_MODEL: str = "bulbul:v2"
+    SARVAM_TTS_SPEAKER: str = "meera"
 
     OPENAI_API_KEY: SecretStr | str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
@@ -103,6 +108,18 @@ class Settings(BaseSettings):
     REDIS_CLAIM_IDLE_MS: int = 60000
     REDIS_BLOCK_MS: int = 5000
     REDIS_BATCH_SIZE: int = 10
+    ENABLE_REMINDER_WORKER: bool = True
+    REMINDER_SCHEDULE_KEY: str = "buddy:reminder:schedule"
+    REMINDER_PROCESSING_KEY: str = "buddy:reminder:processing"
+    REMINDER_RETRY_KEY: str = "buddy:reminder:retry"
+    REMINDER_DEAD_LETTER_KEY: str = "buddy:reminder:dead-letter"
+    REMINDER_LOOKAHEAD_SECONDS: int = Field(default=3600, ge=60, le=86400)
+    REMINDER_TRIGGER_POLL_MS: int = Field(default=1000, ge=200, le=60000)
+    REMINDER_LATE_GRACE_SECONDS: int = Field(default=300, ge=0, le=86400)
+    REMINDER_MAX_RETRIES: int = Field(default=4, ge=1, le=10)
+    FCM_ENABLED: bool = False
+    FIREBASE_SERVICE_ACCOUNT_JSON: str = ""
+    GOOGLE_APPLICATION_CREDENTIALS: str = ""
     WORKER_CONCURRENCY: int = Field(default=4, ge=1, le=64)
     AUDIO_WORKER_CONCURRENCY: int | None = Field(default=None, ge=1, le=64)
     STT_WORKER_CONCURRENCY: int | None = Field(default=None, ge=1, le=64)
@@ -322,6 +339,9 @@ class Settings(BaseSettings):
 
         if self.SERVICE_ROLE in {"worker", "queue_api", "all"} and not self.REDIS_URL.strip():
             raise ValueError("REDIS_URL is required for worker and queue_api roles")
+
+        if self.ENABLE_REMINDER_WORKER and self.SERVICE_ROLE in {"worker", "all"} and not self.REMINDER_REDIS_URL.strip():
+            raise ValueError("REMINDER_REDIS_URL is required when ENABLE_REMINDER_WORKER=true")
 
         if self.SERVICE_ROLE in {"worker", "all"}:
             if not self.MONGODB_URL.strip() or self.MONGODB_URL == "mongodb://localhost:27017":

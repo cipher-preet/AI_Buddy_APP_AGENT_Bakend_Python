@@ -18,3 +18,5 @@ langchain-core>=0.2.0
 langchain-mongodb>=0.3.0
 langgraph>=0.1.0
 pytest>=8.0.0
+tzdata>=2024.1
+firebase-admin>=6.5.0

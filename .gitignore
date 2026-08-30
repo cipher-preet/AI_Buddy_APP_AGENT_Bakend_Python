@@ -58,3 +58,13 @@ resources/
 
 cloud-run-api.env
 cloud-run-worker.env
+
+# Secrets & credentials
+apps/secrets/
+**/secrets/
+firebase-admin.json
+*-credentials.json
+serviceAccountKey.json
+*.pem
+*.key
+
