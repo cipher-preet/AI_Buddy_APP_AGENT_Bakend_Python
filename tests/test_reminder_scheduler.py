@@ -93,6 +93,7 @@ def test_normal_notification_routing():
         TriggerEvent(1, "e", "r", "u", NOW, "Asia/Kolkata", "NORMAL_NOTIFICATION", "T", "M", "t")
     )
     assert payload["type"] == "reminder_notification"
+    assert payload["channelId"] == "buddy_reminders"
 
 
 def test_alarm_notification_routing():
@@ -100,6 +101,7 @@ def test_alarm_notification_routing():
     worker, store, schedule, sender, member = _worker(reminder)
     asyncio.run(worker.tick())
     assert sender.sent[0]["payload"]["type"] == "reminder_alarm"
+    assert sender.sent[0]["payload"]["channelId"] == "buddy_reminder_alarms_v2"
     assert sender.sent[0]["payload"]["sound"] == "true"
     assert sender.sent[0]["high_priority"] is True
 
@@ -110,6 +112,7 @@ def test_ai_call_routing():
     asyncio.run(worker.tick())
     payload = sender.sent[0]["payload"]
     assert payload["type"] == "ai_reminder_call"
+    assert payload["channelId"] == "buddy_reminder_calls_v2"
     assert "callId" in payload
     assert "expiresAt" in payload
     assert sender.sent[0]["high_priority"] is True

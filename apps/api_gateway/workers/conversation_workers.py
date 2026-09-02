@@ -6,6 +6,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from redis.exceptions import ConnectionError, RedisError, TimeoutError as RedisTimeoutError
+
 from apps.api_gateway.config.setting import settings
 from services.conversation.finalization import ConversationFinalizationCoordinator
 from services.conversation.inactivity import ConversationInactivityScanner
@@ -457,40 +459,55 @@ def build_processing_consumer() -> RedisStreamConsumer:
 
 
 async def run_inactivity_scanner() -> None:
-    import asyncio
-
     repository = ConversationRepository(get_database())
     scanner = ConversationInactivityScanner(repository)
     interval = max(30, settings.CONVERSATION_INACTIVITY_TIMEOUT_SECONDS // 3)
     while True:
-        await scanner.scan_once()
+        try:
+            await scanner.scan_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"Inactivity scanner failed: {error}", flush=True)
         await asyncio.sleep(interval)
 
 
 async def run_retry_relay() -> None:
-    import asyncio
     import time
 
     producer = RedisStreamProducer()
     while True:
-        entries = await redis_client.xrange(settings.REDIS_RETRY_STREAM, min="-", max="+", count=50)
-        now = time.time()
-        for message_id, fields in entries:
-            not_before = float(fields.get("notBefore") or 0)
-            if not_before > now:
-                continue
-            target_stream = fields.get("targetStream")
-            raw_event = fields.get("event")
-            if target_stream and raw_event:
-                event = EventEnvelope.model_validate_json(raw_event)
-                retry_event = event.model_copy(
-                    update={
-                        "eventId": str(uuid4()),
-                        "causationId": event.eventId,
-                    }
-                )
-                await producer.publish(target_stream, retry_event)
-            await redis_client.xdel(settings.REDIS_RETRY_STREAM, message_id)
+        try:
+            entries = await redis_client.xrange(
+                settings.REDIS_RETRY_STREAM, min="-", max="+", count=50
+            )
+            now = time.time()
+            for message_id, fields in entries:
+                not_before = float(fields.get("notBefore") or 0)
+                if not_before > now:
+                    continue
+                target_stream = fields.get("targetStream")
+                raw_event = fields.get("event")
+                if target_stream and raw_event:
+                    event = EventEnvelope.model_validate_json(raw_event)
+                    retry_event = event.model_copy(
+                        update={
+                            "eventId": str(uuid4()),
+                            "causationId": event.eventId,
+                        }
+                    )
+                    await producer.publish(target_stream, retry_event)
+                await redis_client.xdel(settings.REDIS_RETRY_STREAM, message_id)
+        except asyncio.CancelledError:
+            raise
+        except (RedisTimeoutError, ConnectionError, RedisError) as error:
+            print(f"Retry relay Redis error: {error}", flush=True)
+            await asyncio.sleep(2)
+            continue
+        except Exception as error:
+            print(f"Retry relay failed: {error}", flush=True)
+            await asyncio.sleep(2)
+            continue
         await asyncio.sleep(1)
 
 

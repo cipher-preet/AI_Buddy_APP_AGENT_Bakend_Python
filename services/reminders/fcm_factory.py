@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
 
-from services.reminders.fcm import FcmPermanentError, FcmTransientError
+from services.reminders.fcm import FcmPermanentError, FcmTransientError, raise_for_fcm_result
 
 
 class ReminderFcmConfigError(RuntimeError):
@@ -23,8 +24,9 @@ class DryRunFcmSender:
 
 
 class FirebaseAdminFcmSender:
-    def __init__(self, app):
+    def __init__(self, app, on_invalid_token=None):
         self.app = app
+        self.on_invalid_token = on_invalid_token
 
     async def send(self, tokens: list[str], payload: dict[str, str], high_priority: bool) -> None:
         if not tokens:
@@ -34,40 +36,66 @@ class FirebaseAdminFcmSender:
         except ImportError as error:
             raise FcmPermanentError("firebase-admin is not installed") from error
 
-        android_config = messaging.AndroidConfig(
-            priority="high" if high_priority else "normal",
-        )
+        channel_id = payload.get("channelId") or "buddy_reminders"
+        data_only = payload.get("type") in {"reminder_alarm", "ai_reminder_call"}
+        android_kwargs: dict[str, Any] = {
+            "priority": "high" if high_priority else "normal",
+        }
+        if not data_only:
+            android_kwargs["notification"] = messaging.AndroidNotification(
+                channel_id=channel_id,
+                icon="ic_stat_buddy_mic",
+                sound="default",
+                default_sound=True,
+                default_vibrate_timings=True,
+            )
+        android_config = messaging.AndroidConfig(**android_kwargs)
         errors = 0
         transient = 0
         sent = 0
+        invalid_tokens: list[str] = []
         for token in tokens:
-            message = messaging.Message(
-                notification=messaging.Notification(
+            message_kwargs: dict[str, Any] = {
+                "data": {key: str(value) for key, value in payload.items() if value is not None},
+                "token": token,
+                "android": android_config,
+            }
+            if not data_only:
+                message_kwargs["notification"] = messaging.Notification(
                     title=payload.get("title") or "Buddy",
                     body=payload.get("message") or "",
-                ),
-                data={key: str(value) for key, value in payload.items() if value is not None},
-                token=token,
-                android=android_config,
-            )
+                )
+            message = messaging.Message(**message_kwargs)
             try:
-                messaging.send(message, app=self.app)
+                message_id = await asyncio.to_thread(
+                    lambda msg=message: messaging.send(msg, app=self.app)
+                )
                 sent += 1
+                print(
+                    f"Reminder FCM accepted: messageId={message_id} channelId={channel_id}",
+                    flush=True,
+                )
             except Exception as error:  # noqa: BLE001
                 text = str(error).lower()
-                if "not found" in text or "invalid" in text or "unregistered" in text:
+                print(f"Reminder FCM send failed: {error}", flush=True)
+                if "not found" in text or "unregistered" in text or "invalid" in text:
                     errors += 1
+                    invalid_tokens.append(token)
                 else:
                     transient += 1
+        if self.on_invalid_token:
+            for token in invalid_tokens:
+                try:
+                    await self.on_invalid_token(token)
+                    print("Reminder FCM pruned stale token", flush=True)
+                except Exception as error:  # noqa: BLE001
+                    print(f"Reminder FCM token prune failed: {error}", flush=True)
         print(
             f"Reminder FCM sent: tokenCount={len(tokens)} delivered={sent} "
             f"rejected={errors} type={payload.get('type')}",
             flush=True,
         )
-        if transient:
-            raise FcmTransientError("fcm transient failure")
-        if errors == len(tokens):
-            raise FcmPermanentError("all device tokens rejected")
+        raise_for_fcm_result(sent, transient, errors)
 
 
 def fcm_sender_mode(sender: Any) -> str:
@@ -88,14 +116,29 @@ def _credential_from_settings(settings: Any):
     path_value = json_blob or cred_path
     if not path_value:
         raise ReminderFcmConfigError("FCM_ENABLED but no Firebase credentials")
-    resolved = Path(path_value)
-    if not resolved.is_file():
-        raise ReminderFcmConfigError(f"Firebase credential file not found: {resolved}")
+    resolved = _resolve_credential_file(path_value)
     return credentials.Certificate(str(resolved))
 
 
-def build_fcm_sender(settings: Any):
+def _resolve_credential_file(path_value: str) -> Path:
+    raw = Path(path_value)
+    candidates = [raw]
+    if not raw.is_absolute():
+        repo_root = Path(__file__).resolve().parents[2]
+        candidates.extend([Path.cwd() / raw, repo_root / raw])
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise ReminderFcmConfigError(f"Firebase credential file not found: {path_value}")
+
+
+def build_fcm_sender(settings: Any, on_invalid_token=None):
     if not getattr(settings, "FCM_ENABLED", False):
+        print(
+            "Reminder FCM: FCM_ENABLED=false, using dry-run. "
+            "Reminders will be marked delivered without reaching the phone.",
+            flush=True,
+        )
         return DryRunFcmSender()
 
     try:
@@ -104,12 +147,12 @@ def build_fcm_sender(settings: Any):
         raise ReminderFcmConfigError("firebase-admin is not installed") from error
 
     if firebase_admin._apps:
-        return FirebaseAdminFcmSender(firebase_admin.get_app())
+        return FirebaseAdminFcmSender(firebase_admin.get_app(), on_invalid_token)
 
     try:
         cred = _credential_from_settings(settings)
         app = firebase_admin.initialize_app(cred)
-        return FirebaseAdminFcmSender(app)
+        return FirebaseAdminFcmSender(app, on_invalid_token)
     except ReminderFcmConfigError:
         raise
     except Exception as error:  # noqa: BLE001

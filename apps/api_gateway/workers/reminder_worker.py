@@ -29,7 +29,7 @@ def build_reminder_worker() -> ReminderWorker:
         dead_letter=settings.REMINDER_DEAD_LETTER_KEY,
     )
     reminder_store = MongoReminderStore(get_database())
-    fcm = build_fcm_sender(settings)
+    fcm = build_fcm_sender(settings, on_invalid_token=reminder_store.delete_token)
     print(
         f"Reminder FCM: enabled={'true' if settings.FCM_ENABLED else 'false'} mode={fcm_sender_mode(fcm)}",
         flush=True,

@@ -26,6 +26,7 @@ def android_payload(event: TriggerEvent, now: datetime | None = None) -> dict[st
             "title": event.title,
             "message": event.message,
             "sound": "true",
+            "channelId": "buddy_reminder_alarms_v2",
         }
     if event.type == "AI_CALL":
         expires = now + timedelta(seconds=AI_CALL_TTL_SECONDS)
@@ -36,12 +37,14 @@ def android_payload(event: TriggerEvent, now: datetime | None = None) -> dict[st
             "title": event.title or "Buddy AI Reminder",
             "message": event.message,
             "expiresAt": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "channelId": "buddy_reminder_calls_v2",
         }
     return {
         "type": "reminder_notification",
         "reminderId": event.reminder_id,
         "title": event.title,
         "message": event.message,
+        "channelId": "buddy_reminders",
     }
 
 

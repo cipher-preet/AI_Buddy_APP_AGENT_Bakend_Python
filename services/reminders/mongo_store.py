@@ -82,6 +82,10 @@ class InMemoryReminderStore:
     async def tokens_for_user(self, user_id: str) -> list[str]:
         return list(self.tokens.get(str(user_id), []))
 
+    async def delete_token(self, token: str) -> None:
+        for user_id, tokens in self.tokens.items():
+            self.tokens[user_id] = [item for item in tokens if item != token]
+
 
 class MongoReminderStore:
     def __init__(self, database):
@@ -168,6 +172,11 @@ class MongoReminderStore:
         cursor = self.database.device_tokens.find(query, {"token": 1})
         docs = await cursor.to_list(length=50)
         return [str(doc["token"]) for doc in docs if doc.get("token")]
+
+    async def delete_token(self, token: str) -> None:
+        if not token:
+            return
+        await self.database.device_tokens.delete_one({"token": token})
 
     async def upsert_token(self, user_id: str, token: str, platform: str | None = None) -> None:
         now = datetime.now(UTC)

@@ -16,6 +16,23 @@ from apps.api_gateway.workers.conversation_workers import (
 from apps.api_gateway.workers.reminder_worker import start_reminder_worker
 from services.db.mongo import close_mongo_client, ensure_mongo_indexes
 from services.llm.router import close_llm_runtime, log_llm_provider_status
+from services.reminders.redis_client import redact_redis_secrets
+
+
+async def _run_supervised(name: str, factory) -> None:
+    """Keep one worker crash from cancelling reminders and other loops."""
+    while True:
+        try:
+            await factory()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(
+                f"{name} failed: {redact_redis_secrets(str(error))}; restarting in 2s",
+                flush=True,
+            )
+            await asyncio.sleep(2)
 
 
 async def main():
@@ -43,12 +60,15 @@ async def main():
 
     try:
         await asyncio.gather(
-            start_speech_consumer(),
-            start_vector_consumer(),
-            *(consumer.run_forever() for consumer in stream_consumers),
-            run_inactivity_scanner(),
-            run_retry_relay(),
-            start_reminder_worker(),
+            _run_supervised("speech", start_speech_consumer),
+            _run_supervised("vector", start_vector_consumer),
+            *(
+                _run_supervised(consumer.stream, consumer.run_forever)
+                for consumer in stream_consumers
+            ),
+            _run_supervised("inactivity-scanner", run_inactivity_scanner),
+            _run_supervised("retry-relay", run_retry_relay),
+            _run_supervised("reminder-worker", start_reminder_worker),
         )
     finally:
         await close_llm_runtime()

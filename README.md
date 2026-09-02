@@ -4,6 +4,9 @@ Buddy keeps the public FastAPI API on Google Cloud Run and runs background proce
 
 ## Runtime Entry Points
 
+# For activating Enviroment 
+PS D:\AI_Personal_Buddy\AI_Orchestration> (Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned) ; (& d:\AI_Personal_Buddy\AI_Orchestration\venv\Scripts\Activate.ps1)
+
 Public API:
 
 ```powershell

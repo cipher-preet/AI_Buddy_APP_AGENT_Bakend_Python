@@ -87,3 +87,52 @@ def test_node_and_python_occurrence_member_format_matches():
     assert keys.payload("67abc:2026-08-30T10:00:00Z") == (
         "buddy:reminder:payload:67abc:2026-08-30T10:00:00Z"
     )
+
+
+def test_retry_relay_survives_conversation_redis_timeout(monkeypatch):
+    import asyncio
+
+    from redis.exceptions import TimeoutError as RedisTimeoutError
+
+    from apps.api_gateway.workers import conversation_workers
+
+    calls = {"n": 0}
+
+    async def fake_xrange(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RedisTimeoutError("Timeout reading from 127.0.0.1:6379")
+        raise asyncio.CancelledError()
+
+    async def instant_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(conversation_workers.redis_client, "xrange", fake_xrange)
+    monkeypatch.setattr(conversation_workers.asyncio, "sleep", instant_sleep)
+
+    async def run():
+        with pytest.raises(asyncio.CancelledError):
+            await conversation_workers.run_retry_relay()
+
+    asyncio.run(run())
+    assert calls["n"] >= 2
+
+
+def test_supervised_worker_restarts_after_timeout(monkeypatch):
+    import asyncio
+
+    from apps.api_gateway.workers.main import _run_supervised
+
+    calls = {"n": 0}
+
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("Timeout reading from 127.0.0.1:6379")
+
+    async def instant_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+    asyncio.run(_run_supervised("retry-relay", flaky))
+    assert calls["n"] == 2

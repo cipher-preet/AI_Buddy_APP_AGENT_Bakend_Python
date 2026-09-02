@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
-from redis.exceptions import ResponseError
+from redis.exceptions import ConnectionError, ResponseError, TimeoutError as RedisTimeoutError
 
 from apps.api_gateway.config.setting import settings
 from services.queue.factory import use_queue_api
@@ -108,8 +108,8 @@ class RedisStreamConsumer:
             },
         )
         while not self._shutdown.is_set():
-            await self.claim_stale()
             try:
+                await self.claim_stale()
                 messages = await redis_client.xreadgroup(
                     groupname=self.group,
                     consumername=self.consumer_name,
@@ -121,6 +121,18 @@ class RedisStreamConsumer:
                 if "NOGROUP" not in str(error):
                     raise
                 await self.ensure_group()
+                continue
+            except (RedisTimeoutError, ConnectionError) as error:
+                print(
+                    "Redis stream consumer read failed:",
+                    {
+                        "stream": self.stream,
+                        "group": self.group,
+                        "error": str(error),
+                    },
+                    flush=True,
+                )
+                await asyncio.sleep(1)
                 continue
             tasks: list[asyncio.Task[None]] = []
             for _, entries in messages or []:
@@ -142,7 +154,7 @@ class RedisStreamConsumer:
                 start_id="0-0",
                 count=settings.REDIS_BATCH_SIZE,
             )
-        except ResponseError:
+        except (ResponseError, RedisTimeoutError, ConnectionError):
             return
         entries = claimed[1] if len(claimed) > 1 else []
         for message_id, fields in entries:

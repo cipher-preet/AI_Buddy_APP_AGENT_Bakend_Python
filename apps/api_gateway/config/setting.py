@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     SERVICE_ROLE: str = "api"
     DEBUG: bool = True
 
-    REDIS_URL: str = "redis://localhost:6379"
+    REDIS_URL: str = "redis://127.0.0.1:6379"
     REMINDER_REDIS_URL: str = ""
     REDIS_MAX_RETRIES: int | None = None
     REDIS_EVENT_RETENTION: int = Field(default=86400, ge=60)

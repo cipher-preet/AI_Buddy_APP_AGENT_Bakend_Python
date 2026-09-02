@@ -1,5 +1,7 @@
 import asyncio
 import json
+import re
+from urllib.parse import urlparse, urlunparse
 
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError, RedisError, TimeoutError
@@ -10,8 +12,28 @@ SPEECH_QUEUE = "speech_transcribe_queue"
 COMPLETED_SPEECH_QUEUE = "completed_speech_queue"
 
 
+def prefer_ipv4_loopback_url(url: str) -> str:
+    """Rewrite localhost to 127.0.0.1 so Windows does not try IPv6 first."""
+    parsed = urlparse(url)
+    if (parsed.hostname or "").lower() != "localhost":
+        return url
+    userinfo = ""
+    if parsed.password is not None:
+        userinfo = f"{parsed.username or ''}:{parsed.password}@"
+    elif parsed.username:
+        userinfo = f"{parsed.username}@"
+    hostport = "127.0.0.1"
+    if parsed.port is not None:
+        hostport = f"{hostport}:{parsed.port}"
+    return urlunparse(parsed._replace(netloc=f"{userinfo}{hostport}"))
+
+
+def _redact_redis_secrets(message: str) -> str:
+    return re.sub(r"redis(?:s)?://[^\s\"']+", "redis://<redacted>", message, flags=re.I)
+
+
 redis_client = redis.from_url(
-    settings.REDIS_URL,
+    prefer_ipv4_loopback_url(settings.REDIS_URL),
     decode_responses=True,
     socket_connect_timeout=10,
     socket_timeout=30,
@@ -19,12 +41,25 @@ redis_client = redis.from_url(
 )
 
 
-async def test_redis_connection():
-    try:
-        pong = await redis_client.ping()
-        print("Conversation Redis connected:", pong)
-    except Exception as error:
-        print("Conversation Redis connection failed:", str(error))
+async def test_redis_connection(*, attempts: int = 5, delay_seconds: float = 2.0) -> bool:
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            pong = await redis_client.ping()
+            print("Conversation Redis connected:", pong)
+            return bool(pong)
+        except Exception as error:
+            last_error = error
+            print(
+                "Conversation Redis connection failed "
+                f"(attempt {attempt}/{attempts}): {_redact_redis_secrets(str(error))}"
+            )
+            if attempt < attempts:
+                await asyncio.sleep(delay_seconds)
+    raise ConnectionError(
+        "Conversation workers require Redis at REDIS_URL. "
+        "Start local Redis, then retry: docker compose -f docker-compose.local.yml up -d"
+    ) from last_error
 
 
 async def push_speech_job(job: dict):
