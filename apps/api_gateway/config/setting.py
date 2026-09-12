@@ -117,6 +117,8 @@ class Settings(BaseSettings):
     DAILY_BRIEFING_SCAN_INTERVAL_SECONDS: int = Field(default=20, ge=5, le=3600)
     DAILY_BRIEFING_WINDOW_TARGET_TOKENS: int = Field(default=5000, ge=200, le=100000)
     DAILY_BRIEFING_WINDOW_MAX_TOKENS: int = Field(default=7000, ge=200, le=120000)
+    # Temporary test hook for the mobile "Generate now" button. Disable in real prod.
+    DAILY_BRIEFING_ALLOW_FORCE_GENERATE: bool = True
 
     REDIS_CLAIM_IDLE_MS: int = 60000
     REDIS_BLOCK_MS: int = 5000

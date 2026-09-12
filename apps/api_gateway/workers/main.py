@@ -27,7 +27,11 @@ from services.observability.diagnostics import (
     run_worker_heartbeat,
     supervisor_restarts,
 )
-from services.reminders.redis_client import redact_redis_secrets
+from services.reminders.fcm_factory import ReminderFcmConfigError
+from services.reminders.redis_client import ReminderRedisConfigError, redact_redis_secrets
+
+# Misconfiguration will not heal on restart; keep other workers alive instead of storming.
+_FATAL_WORKER_ERRORS = (ReminderFcmConfigError, ReminderRedisConfigError)
 
 
 async def _run_supervised(name: str, factory) -> None:
@@ -38,6 +42,19 @@ async def _run_supervised(name: str, factory) -> None:
             return
         except asyncio.CancelledError:
             raise
+        except _FATAL_WORKER_ERRORS as error:
+            diag_log(
+                "worker_fatal_config",
+                worker_name=name,
+                exception_type=type(error).__name__,
+                error=redact_redis_secrets(str(error)),
+            )
+            print(
+                f"{name} fatal config error: {redact_redis_secrets(str(error))}; "
+                "not restarting (fix config / rebuild image)",
+                flush=True,
+            )
+            await asyncio.Event().wait()
         except Exception as error:
             details = supervisor_restarts.record(name, type(error).__name__)
             diag_log(

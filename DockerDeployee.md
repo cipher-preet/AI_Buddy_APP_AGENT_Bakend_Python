@@ -21,12 +21,29 @@ Cloud Run uses `cloud-run-api.env`. Set production secrets through a secure runt
 
 ## AWS Worker Stack
 
-On the AWS host, create `.env.aws` from `.env.example`, then run:
+On the AWS host, create `.env.aws` from `.env.aws.example`, then run:
 
 ```bash
 docker compose -f docker-compose.aws.yml --env-file .env.aws build
 docker compose -f docker-compose.aws.yml --env-file .env.aws up -d
 ```
+
+After pulling new code, always rebuild the worker image so Python deps (including `firebase-admin`) are installed:
+
+```bash
+docker compose -f docker-compose.aws.yml --env-file .env.aws build --no-cache buddy-worker
+docker compose -f docker-compose.aws.yml --env-file .env.aws up -d buddy-worker
+```
+
+### Reminder / FCM (required when `FCM_ENABLED=true`)
+
+1. Put the Firebase service-account JSON on the host at `apps/secrets/firebase-admin.json` (gitignored; not baked into the image).
+2. In `.env.aws` set:
+   - `FCM_ENABLED=true`
+   - `FIREBASE_SERVICE_ACCOUNT_JSON=apps/secrets/firebase-admin.json`
+3. Compose mounts `./apps/secrets` into the worker as `/app/apps/secrets`.
+
+If `firebase-admin` is missing or credentials are wrong, the reminder worker logs a fatal config error and stops retrying (other workers keep running).
 
 The AWS stack contains:
 

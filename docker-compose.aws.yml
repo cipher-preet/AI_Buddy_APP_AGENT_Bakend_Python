@@ -57,6 +57,10 @@ services:
       QUEUE_PROVIDER: redis
       REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
       WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-1}"
+    # Place firebase-admin.json on the host at ./apps/secrets/ (gitignored).
+    # Required when FCM_ENABLED=true.
+    volumes:
+      - ./apps/secrets:/app/apps/secrets:ro
     read_only: true
     tmpfs:
       - /tmp:size=1g,mode=1777

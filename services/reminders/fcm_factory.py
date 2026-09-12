@@ -144,7 +144,11 @@ def build_fcm_sender(settings: Any, on_invalid_token=None):
     try:
         import firebase_admin
     except ImportError as error:
-        raise ReminderFcmConfigError("firebase-admin is not installed") from error
+        raise ReminderFcmConfigError(
+            "firebase-admin is not installed in this image. "
+            "Rebuild buddy-worker with current requirements.txt "
+            "(docker compose -f docker-compose.aws.yml --env-file .env.aws build --no-cache buddy-worker)."
+        ) from error
 
     if firebase_admin._apps:
         return FirebaseAdminFcmSender(firebase_admin.get_app(), on_invalid_token)

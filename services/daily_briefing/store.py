@@ -97,6 +97,10 @@ class DailyBriefingStore:
         )
         return updated is not None
 
+    async def delete(self, user_id: str, date_key: str) -> bool:
+        result = await self.collection.delete_one({"userId": user_id, "dateKey": date_key})
+        return bool(getattr(result, "deleted_count", 0))
+
     async def get(self, user_id: str, date_key: str) -> dict[str, Any] | None:
         return await self.collection.find_one(
             {"userId": user_id, "dateKey": date_key},

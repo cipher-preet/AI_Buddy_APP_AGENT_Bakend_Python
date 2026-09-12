@@ -60,8 +60,10 @@ cloud-run-api.env
 cloud-run-worker.env
 
 # Secrets & credentials
-apps/secrets/
+apps/secrets/*
+!apps/secrets/.gitkeep
 **/secrets/
+!**/secrets/.gitkeep
 firebase-admin.json
 *-credentials.json
 serviceAccountKey.json

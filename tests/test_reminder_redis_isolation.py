@@ -136,3 +136,33 @@ def test_supervised_worker_restarts_after_timeout(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", instant_sleep)
     asyncio.run(_run_supervised("retry-relay", flaky))
     assert calls["n"] == 2
+
+
+def test_supervised_worker_does_not_restart_on_fcm_config_error(monkeypatch):
+    import asyncio
+
+    from apps.api_gateway.workers.main import _run_supervised
+    from services.reminders.fcm_factory import ReminderFcmConfigError
+
+    calls = {"n": 0}
+
+    async def broken():
+        calls["n"] += 1
+        raise ReminderFcmConfigError("firebase-admin is not installed")
+
+    async def stop_soon():
+        await asyncio.sleep(0)
+        raise asyncio.CancelledError()
+
+    class _Gate(asyncio.Event):
+        async def wait(self):
+            await stop_soon()
+
+    monkeypatch.setattr(asyncio, "Event", _Gate)
+
+    async def run():
+        with pytest.raises(asyncio.CancelledError):
+            await _run_supervised("reminder-worker", broken)
+
+    asyncio.run(run())
+    assert calls["n"] == 1
