@@ -4,6 +4,7 @@ import time
 from typing import Awaitable, Callable
 
 from apps.api_gateway.config.setting import settings
+from services.observability.diagnostics import diag_log
 from services.speech.errors import STTPermanentAudioError, STTProviderError, STTProviderTemporaryError
 from services.speech.providers.deepgram_provider import deepgram_transcribe_from_path
 from services.speech.providers.sarvam_provider import sarvam_transcribe_from_path
@@ -23,6 +24,8 @@ async def transcribe_from_path_with_fallback(
     content_type: str,
     keyterms: list[str] | None = None,
     context: dict | None = None,
+    job_id: str | None = None,
+    stream_attempt: int | None = None,
 ) -> dict:
     attempts: list[dict] = []
     last_error: Exception | None = None
@@ -93,6 +96,14 @@ async def transcribe_from_path_with_fallback(
             except STTPermanentAudioError as error:
                 attempts.append(_attempt_error(provider_name, "permanent_audio_error", error, started))
                 _log_attempt(provider_name, "permanent_audio_error", attempts[-1])
+                _log_provider_retry(
+                    provider_name,
+                    retry_index,
+                    attempts[-1],
+                    job_id=job_id,
+                    stream_attempt=stream_attempt,
+                    immediate_retry=False,
+                )
                 raise ValueError(str(error)) from error
             except STTProviderTemporaryError as error:
                 last_error = error
@@ -100,12 +111,36 @@ async def transcribe_from_path_with_fallback(
                 attempts.append(_attempt_error(provider_name, status, error, started))
                 _log_attempt(provider_name, status, attempts[-1])
                 if status == "retry":
+                    _log_provider_retry(
+                        provider_name,
+                        retry_index,
+                        attempts[-1],
+                        job_id=job_id,
+                        stream_attempt=stream_attempt,
+                        immediate_retry=True,
+                    )
                     continue
+                _log_provider_retry(
+                    provider_name,
+                    retry_index,
+                    attempts[-1],
+                    job_id=job_id,
+                    stream_attempt=stream_attempt,
+                    immediate_retry=False,
+                )
                 break
             except STTProviderError as error:
                 last_error = error
                 attempts.append(_attempt_error(provider_name, "fallback", error, started))
                 _log_attempt(provider_name, "fallback", attempts[-1])
+                _log_provider_retry(
+                    provider_name,
+                    retry_index,
+                    attempts[-1],
+                    job_id=job_id,
+                    stream_attempt=stream_attempt,
+                    immediate_retry=False,
+                )
                 break
             except ValueError:
                 raise
@@ -119,7 +154,23 @@ async def transcribe_from_path_with_fallback(
                 attempts.append(_attempt_error(provider_name, status, wrapped, started))
                 _log_attempt(provider_name, status, attempts[-1])
                 if status == "retry":
+                    _log_provider_retry(
+                        provider_name,
+                        retry_index,
+                        attempts[-1],
+                        job_id=job_id,
+                        stream_attempt=stream_attempt,
+                        immediate_retry=True,
+                    )
                     continue
+                _log_provider_retry(
+                    provider_name,
+                    retry_index,
+                    attempts[-1],
+                    job_id=job_id,
+                    stream_attempt=stream_attempt,
+                    immediate_retry=False,
+                )
                 break
 
     message = "All speech-to-text providers failed"
@@ -167,6 +218,27 @@ def _attempt_error(provider_name: str, status: str, error: Exception, started: f
 
 def _elapsed_ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
+
+
+def _log_provider_retry(
+    provider_name: str,
+    retry_index: int,
+    data: dict,
+    *,
+    job_id: str | None,
+    stream_attempt: int | None,
+    immediate_retry: bool,
+) -> None:
+    diag_log(
+        "stt_provider_retry",
+        job_id=job_id,
+        provider=provider_name,
+        provider_attempt=retry_index + 1,
+        stream_attempt=stream_attempt,
+        error_type=data.get("error_type"),
+        immediate_retry=immediate_retry,
+        provider_duration_ms=data.get("duration_ms"),
+    )
 
 
 def _log_attempt(provider_name: str, status: str, data: dict) -> None:

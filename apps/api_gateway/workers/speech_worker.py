@@ -65,6 +65,7 @@ async def _process_local_speech_job(job: dict) -> None:
         keyterms = _job_keyterms(job)
         if keyterms:
             stt_kwargs["keyterms"] = keyterms
+        stt_kwargs["job_id"] = job_id
         result = await transcribe_from_path_with_fallback(**stt_kwargs)
         print(
             "Speech job STT provider selected:",

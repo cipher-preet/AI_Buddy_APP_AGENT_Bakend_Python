@@ -201,7 +201,7 @@ def test_s3_speech_job_downloads_and_injects_file_path(monkeypatch, tmp_path):
 
     injected_paths = []
 
-    async def transcribe(file_path, filename, content_type):
+    async def transcribe(file_path, filename, content_type, **kwargs):
         injected_paths.append(file_path)
         assert filename == "audio.wav"
         assert content_type == "audio/wav"

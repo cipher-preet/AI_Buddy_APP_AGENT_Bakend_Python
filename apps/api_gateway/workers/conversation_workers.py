@@ -21,6 +21,7 @@ from services.conversation.stt_failure import (
 )
 from services.conversation.workflow import ConversationProcessingWorkflow
 from services.db.mongo import get_database
+from services.observability.diagnostics import RetryRelayWindow, active_jobs, diag_log
 from services.queue.streams import EventEnvelope, NonRetryableQueueError, RedisStreamConsumer
 from services.queue.streams import RedisStreamProducer
 from services.queue.redis_queue import redis_client
@@ -131,6 +132,8 @@ async def handle_stt_event(event: EventEnvelope) -> None:
                 keyterm_context[field] = value
         if keyterm_context:
             stt_kwargs["context"] = keyterm_context
+        stt_kwargs["job_id"] = payload.get("jobId") or payload.get("chunkId") or event.eventId
+        stt_kwargs["stream_attempt"] = event.attempt
         result = await transcribe_from_path_with_fallback(**stt_kwargs)
         print(
             "Conversation chunk STT provider selected:",
@@ -397,12 +400,21 @@ def _provider_configured(name: str) -> bool:
     return bool(provider) and getattr(provider, "configured", True) is not False
 
 
+def _tracked_handler(name: str, handler):
+    async def wrapped(event: EventEnvelope) -> None:
+        with active_jobs.track(name):
+            await handler(event)
+
+    wrapped.__name__ = getattr(handler, "__name__", name)
+    return wrapped
+
+
 def build_stt_consumer() -> RedisStreamConsumer:
     return RedisStreamConsumer(
         stream=settings.REDIS_STT_STREAM,
         group=settings.REDIS_STT_GROUP,
         consumer_name=f"stt-{uuid4().hex[:8]}",
-        handler=handle_stt_event,
+        handler=_tracked_handler("stt", handle_stt_event),
         concurrency=settings.STT_WORKER_CONCURRENCY or min(settings.WORKER_CONCURRENCY, settings.SARVAM_MAX_CONCURRENCY),
         on_dead_letter=handle_stt_dead_letter,
     )
@@ -413,7 +425,7 @@ def build_audio_consumer() -> RedisStreamConsumer:
         stream=settings.REDIS_AUDIO_STREAM,
         group=settings.REDIS_AUDIO_GROUP,
         consumer_name=f"audio-{uuid4().hex[:8]}",
-        handler=handle_audio_event,
+        handler=_tracked_handler("audio", handle_audio_event),
         concurrency=settings.AUDIO_WORKER_CONCURRENCY or settings.WORKER_CONCURRENCY,
     )
 
@@ -443,7 +455,7 @@ def build_window_extraction_consumer() -> RedisStreamConsumer:
         stream=settings.REDIS_WINDOW_EXTRACTION_STREAM,
         group=settings.REDIS_WINDOW_EXTRACTION_GROUP,
         consumer_name=f"window-extraction-{uuid4().hex[:8]}",
-        handler=handle_window_extraction_event,
+        handler=_tracked_handler("window", handle_window_extraction_event),
         concurrency=settings.WINDOW_EXTRACTION_WORKER_CONCURRENCY or settings.MAX_ACTIVE_LLM_CALLS_PER_CONVERSATION,
     )
 
@@ -453,7 +465,7 @@ def build_processing_consumer() -> RedisStreamConsumer:
         stream=settings.REDIS_PROCESSING_STREAM,
         group=settings.REDIS_PROCESSING_GROUP,
         consumer_name=f"processing-{uuid4().hex[:8]}",
-        handler=handle_processing_event,
+        handler=_tracked_handler("processing", handle_processing_event),
         concurrency=settings.PROCESSING_WORKER_CONCURRENCY,
     )
 
@@ -476,6 +488,7 @@ async def run_retry_relay() -> None:
     import time
 
     producer = RedisStreamProducer()
+    window = RetryRelayWindow()
     while True:
         try:
             entries = await redis_client.xrange(
@@ -483,13 +496,20 @@ async def run_retry_relay() -> None:
             )
             now = time.time()
             for message_id, fields in entries:
+                window.messages_scanned += 1
                 not_before = float(fields.get("notBefore") or 0)
                 if not_before > now:
                     continue
+                window.messages_due += 1
                 target_stream = fields.get("targetStream")
                 raw_event = fields.get("event")
+                retry_event = None
                 if target_stream and raw_event:
-                    event = EventEnvelope.model_validate_json(raw_event)
+                    try:
+                        event = EventEnvelope.model_validate_json(raw_event)
+                    except Exception:
+                        window.invalid_messages += 1
+                        raise
                     retry_event = event.model_copy(
                         update={
                             "eventId": str(uuid4()),
@@ -497,17 +517,32 @@ async def run_retry_relay() -> None:
                         }
                     )
                     await producer.publish(target_stream, retry_event)
-                await redis_client.xdel(settings.REDIS_RETRY_STREAM, message_id)
+                    window.messages_republished += 1
+                    try:
+                        await redis_client.xdel(settings.REDIS_RETRY_STREAM, message_id)
+                    except Exception:
+                        window.delete_failures += 1
+                        diag_log(
+                            "retry_relay_publish_delete_mismatch",
+                            event_id=retry_event.eventId,
+                            target_stream=target_stream,
+                        )
+                        raise
+                else:
+                    await redis_client.xdel(settings.REDIS_RETRY_STREAM, message_id)
         except asyncio.CancelledError:
             raise
         except (RedisTimeoutError, ConnectionError, RedisError) as error:
+            window.maybe_emit()
             print(f"Retry relay Redis error: {error}", flush=True)
             await asyncio.sleep(2)
             continue
         except Exception as error:
+            window.maybe_emit()
             print(f"Retry relay failed: {error}", flush=True)
             await asyncio.sleep(2)
             continue
+        window.maybe_emit()
         await asyncio.sleep(1)
 
 

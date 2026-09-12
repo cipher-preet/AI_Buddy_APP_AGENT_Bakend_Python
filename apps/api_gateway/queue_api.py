@@ -25,6 +25,7 @@ ALLOWED_EVENT_TYPES = {
     "conversation.finalization.requested",
     "conversation.processing.requested",
     "job.retry.requested",
+    "daily.briefing.requested",
 }
 
 
@@ -139,6 +140,7 @@ def _stream_for_event(payload: dict[str, Any], event: EventEnvelope) -> str:
             settings.REDIS_FINALIZATION_STREAM,
             settings.REDIS_PROCESSING_STREAM,
             settings.REDIS_RETRY_STREAM,
+            settings.REDIS_DAILY_BRIEFING_STREAM,
         }
         if explicit not in allowed_streams:
             raise ValueError("targetStream is not allowed")
@@ -157,6 +159,8 @@ def _stream_for_event(payload: dict[str, Any], event: EventEnvelope) -> str:
         return settings.REDIS_PROCESSING_STREAM
     if event.eventType == "job.retry.requested":
         return settings.REDIS_RETRY_STREAM
+    if event.eventType == "daily.briefing.requested":
+        return settings.REDIS_DAILY_BRIEFING_STREAM
     raise ValueError("unsupported event type")
 
 

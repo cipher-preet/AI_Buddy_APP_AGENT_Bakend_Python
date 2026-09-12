@@ -4,6 +4,7 @@ from apps.api_gateway.routes.health import router as health_router
 from apps.api_gateway.routes.chat_routes import router as chat_router
 from apps.api_gateway.middleware.logging import log_requests
 from apps.api_gateway.routes.conversation_routes import router as conversation_router
+from apps.api_gateway.routes.daily_briefing_routes import router as daily_briefing_router
 from apps.api_gateway.routes.reminder_voice_routes import router as reminder_voice_router
 from apps.api_gateway.routes.reminder_device_routes import router as reminder_device_router
 from apps.api_gateway.routes.speech_routes import router as speech_router
@@ -34,6 +35,11 @@ app.include_router(
     conversation_router,
     prefix="/api/v1/conversations",
     tags=["Conversations"],
+)
+app.include_router(
+    daily_briefing_router,
+    prefix="/api/v1/daily-briefing",
+    tags=["Daily Briefing"],
 )
 
 

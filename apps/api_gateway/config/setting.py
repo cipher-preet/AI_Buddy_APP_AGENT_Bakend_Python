@@ -97,6 +97,7 @@ class Settings(BaseSettings):
     REDIS_PROCESSING_STREAM: str = "buddy:conversation:processing"
     REDIS_RETRY_STREAM: str = "buddy:conversation:retry"
     REDIS_DEAD_LETTER_STREAM: str = "buddy:dead-letter"
+    REDIS_DAILY_BRIEFING_STREAM: str = "buddy:daily-briefing:jobs"
 
     REDIS_AUDIO_GROUP: str = "audio-workers"
     REDIS_STT_GROUP: str = "stt-workers"
@@ -104,6 +105,18 @@ class Settings(BaseSettings):
     REDIS_WINDOW_EXTRACTION_GROUP: str = "window-extraction-workers"
     REDIS_FINALIZATION_GROUP: str = "finalization-workers"
     REDIS_PROCESSING_GROUP: str = "conversation-processing-workers"
+    REDIS_DAILY_BRIEFING_GROUP: str = "daily-briefing-workers"
+
+    DAILY_BRIEFING_ENABLED: bool = True
+    DAILY_BRIEFING_TRIGGER_HOUR: int = Field(default=0, ge=0, le=23)
+    DAILY_BRIEFING_TRIGGER_MINUTE: int = Field(default=5, ge=0, le=59)
+    DAILY_BRIEFING_GRACE_MINUTES: int = Field(default=5, ge=0, le=180)
+    DAILY_BRIEFING_BATCH_SIZE: int = Field(default=100, ge=1, le=2000)
+    DAILY_BRIEFING_MAX_CONCURRENCY: int = Field(default=5, ge=1, le=32)
+    DAILY_BRIEFING_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
+    DAILY_BRIEFING_SCAN_INTERVAL_SECONDS: int = Field(default=20, ge=5, le=3600)
+    DAILY_BRIEFING_WINDOW_TARGET_TOKENS: int = Field(default=5000, ge=200, le=100000)
+    DAILY_BRIEFING_WINDOW_MAX_TOKENS: int = Field(default=7000, ge=200, le=120000)
 
     REDIS_CLAIM_IDLE_MS: int = 60000
     REDIS_BLOCK_MS: int = 5000
@@ -346,6 +359,15 @@ class Settings(BaseSettings):
         if self.SERVICE_ROLE in {"worker", "all"}:
             if not self.MONGODB_URL.strip() or self.MONGODB_URL == "mongodb://localhost:27017":
                 raise ValueError("MONGODB_URL is required for worker roles and must not point to localhost")
+
+        if not (0 <= self.DAILY_BRIEFING_TRIGGER_HOUR <= 23):
+            raise ValueError("DAILY_BRIEFING_TRIGGER_HOUR must be 0-23")
+        if not (0 <= self.DAILY_BRIEFING_TRIGGER_MINUTE <= 59):
+            raise ValueError("DAILY_BRIEFING_TRIGGER_MINUTE must be 0-59")
+        if self.DAILY_BRIEFING_BATCH_SIZE < 1:
+            raise ValueError("DAILY_BRIEFING_BATCH_SIZE must be >= 1")
+        if self.DAILY_BRIEFING_MAX_CONCURRENCY < 1:
+            raise ValueError("DAILY_BRIEFING_MAX_CONCURRENCY must be >= 1")
 
         if self.STORAGE_PROVIDER == "s3" and self.SERVICE_ROLE in {"api", "worker", "all"}:
             if not self.S3_AUDIO_BUCKET.strip():

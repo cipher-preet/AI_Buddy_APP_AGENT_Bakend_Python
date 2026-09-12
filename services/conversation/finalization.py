@@ -11,6 +11,7 @@ from services.conversation.stt_failure import is_permanent_stt_failure, is_termi
 from services.conversation.transcript import detect_missing_sequences
 from services.conversation.windowing import is_useful_chunk
 from services.queue.streams import EventEnvelope, RedisStreamProducer
+from services.observability.diagnostics import note_stt_requeued
 from services.storage.s3_audio_storage import build_audio_object_key, use_s3_storage
 
 
@@ -250,6 +251,7 @@ class ConversationFinalizationCoordinator:
                     },
                 ),
             )
+            note_stt_requeued(1)
         return retryable_count
 
     async def _persist_accounting(self, conversation_id: str, accounting: dict) -> None:
