@@ -916,8 +916,8 @@ class ConversationRepository:
         return SpaceMemoryDocument(userId=to_mongo_id(user_id), spaceId=to_mongo_id(space_id))
 
     async def list_user_spaces(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Return active Buddy spaces only (deletedAt soft-delete, matching Node backend)."""
         user_keys = mongo_id_candidates(user_id)
-        spaces: dict[str, dict[str, Any]] = {}
         discovered_space_ids: list[Any] = []
         for collection_name in (
             "space_memory",
@@ -939,24 +939,18 @@ class ConversationRepository:
                 if value is None:
                     continue
                 discovered_space_ids.extend(mongo_id_candidates(value))
-                key = str(value)
-                spaces.setdefault(
-                    key,
-                    {
-                        "spaceId": key,
-                        "label": key,
-                        "sources": [],
-                    },
-                )
-                spaces[key]["sources"].append(collection_name)
 
+        spaces: dict[str, dict[str, Any]] = {}
         try:
-            space_queries: list[dict[str, Any]] = [_space_owner_query(user_keys)]
+            active = _active_space_filter()
+            space_queries: list[dict[str, Any]] = [{"$and": [_space_owner_query(user_keys), active]}]
             if discovered_space_ids:
-                space_queries.append(_space_identity_query(discovered_space_ids))
+                space_queries.append({"$and": [_space_identity_query(discovered_space_ids), active]})
             for collection_name in ("spaces", "space", "Spaces"):
-                cursor = self.db[collection_name].find({"$or": space_queries}).limit(limit)
+                cursor = self.db[collection_name].find({"$or": space_queries}).limit(max(limit * 2, limit))
                 async for item in cursor:
+                    if _space_is_deleted(item):
+                        continue
                     space_id = item.get("_id") or item.get("spaceId") or item.get("space_id") or item.get("id")
                     if space_id is None:
                         continue
@@ -1254,6 +1248,15 @@ def _space_owner_query(user_keys: list[Any]) -> dict[str, Any]:
             {"user_ids": {"$in": user_keys}},
         ]
     }
+
+
+def _active_space_filter() -> dict[str, Any]:
+    # Matches Node Home.repository: soft-deleted spaces set deletedAt to a Date.
+    return {"$or": [{"deletedAt": None}, {"deletedAt": {"$exists": False}}]}
+
+
+def _space_is_deleted(item: dict[str, Any]) -> bool:
+    return item.get("deletedAt") is not None
 
 
 def _space_identity_query(space_ids: list[Any]) -> dict[str, Any]:

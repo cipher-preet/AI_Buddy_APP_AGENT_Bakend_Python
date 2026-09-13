@@ -8,6 +8,7 @@ UTC = timezone.utc
 DEFAULT_TIMEZONE = "Asia/Kolkata"
 
 DELIVERY_TYPES = (
+    # Kept for legacy scheduled rows; new writes use alarm or AI call only.
     "NORMAL_NOTIFICATION",
     "ALARM_NOTIFICATION",
     "AI_CALL",
@@ -138,13 +139,14 @@ def compute_next_trigger(
     return None
 
 
-def delivery_type_from_flags(ai_calling: bool, beeping: bool, notification: bool) -> str | None:
+def delivery_type_from_flags(ai_calling: bool, beeping: bool, notification: bool = False) -> str | None:
     if ai_calling:
         return "AI_CALL"
     if beeping:
         return "ALARM_NOTIFICATION"
+    # Legacy notification-only rows deliver as alarm sound.
     if notification:
-        return "NORMAL_NOTIFICATION"
+        return "ALARM_NOTIFICATION"
     return None
 
 

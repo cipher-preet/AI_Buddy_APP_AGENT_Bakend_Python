@@ -5,12 +5,12 @@ The production default semantic path is services.conversation.meeting_pipeline.
 
 Stages request semantic capabilities. Buddy's existing LLMRouter resolves the
 concrete provider/model and fallback chain. This module does not hardcode
-Gemma, gpt-oss-120b, or gpt-oss-20b.
+Gemma or gpt-oss-20b (Krutrim retired gpt-oss-120b).
 
 Role mapping (current conversation-intelligence policy):
 
     SEMANTIC_EXTRACTION     → semantic role   (currently Gemma-4-31B-it)
-    FINAL_SYNTHESIS         → synthesis role  (currently gpt-oss-120b)
+    FINAL_SYNTHESIS         → synthesis role  (currently gpt-oss-20b)
                               Event-pipeline logs this as HIGH_ACCURACY_REASONING.
                               The HIGH_ACCURACY_REASONING enum still routes window
                               extraction to the semantic (Gemma) role.
@@ -115,7 +115,7 @@ def capability_log_name(stage: PipelineStage | str | LLMCapability) -> str:
     """User-facing capability name for [MODEL_ROUTE] logs.
 
     Task/note synthesis and hard thread escalation request FINAL_SYNTHESIS from
-    the router (gpt-oss-120b). Logs report that role as HIGH_ACCURACY_REASONING.
+    the router (gpt-oss-20b). Logs report that role as HIGH_ACCURACY_REASONING.
     """
     if isinstance(stage, LLMCapability):
         capability = stage

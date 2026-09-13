@@ -3,7 +3,7 @@
 Candidate generation is top-k embedding retrieval plus entity/object filters.
 Membership is validated semantically; vector similarity alone never links.
 Generative LLM is used only for ambiguous membership, with rare high-accuracy
-escalation. Pairwise gpt-oss-120b comparison of every event is forbidden.
+escalation. Pairwise high-accuracy comparison of every event is forbidden.
 """
 
 from __future__ import annotations

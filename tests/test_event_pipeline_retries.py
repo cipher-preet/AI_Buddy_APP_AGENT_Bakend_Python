@@ -224,10 +224,10 @@ def test_validator_failure_does_not_drop_grounded_artifacts():
 def test_synthesis_provider_failure_falls_back_to_deterministic():
     class BoomRouter:
         def route(self, capability):
-            return self, "gpt-oss-120b"
+            return self, "gpt-oss-20b"
 
         async def generate_structured(self, request, schema):
-            raise TimeoutError("gpt-oss-120b timeout")
+            raise TimeoutError("gpt-oss-20b timeout")
 
     event = AtomicEvent(
         eventId="e-server",

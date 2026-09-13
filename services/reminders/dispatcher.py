@@ -19,15 +19,6 @@ class DeliveryError(Exception):
 
 def android_payload(event: TriggerEvent, now: datetime | None = None) -> dict[str, str]:
     now = now or datetime.now(UTC)
-    if event.type == "ALARM_NOTIFICATION":
-        return {
-            "type": "reminder_alarm",
-            "reminderId": event.reminder_id,
-            "title": event.title,
-            "message": event.message,
-            "sound": "true",
-            "channelId": "buddy_reminder_alarms_v2",
-        }
     if event.type == "AI_CALL":
         expires = now + timedelta(seconds=AI_CALL_TTL_SECONDS)
         return {
@@ -39,12 +30,14 @@ def android_payload(event: TriggerEvent, now: datetime | None = None) -> dict[st
             "expiresAt": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "channelId": "buddy_reminder_calls_v2",
         }
+    # ALARM_NOTIFICATION and legacy NORMAL_NOTIFICATION both use alarm sound.
     return {
-        "type": "reminder_notification",
+        "type": "reminder_alarm",
         "reminderId": event.reminder_id,
         "title": event.title,
         "message": event.message,
-        "channelId": "buddy_reminders",
+        "sound": "true",
+        "channelId": "buddy_reminder_alarms_v2",
     }
 
 

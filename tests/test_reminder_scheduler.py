@@ -22,7 +22,7 @@ NOW = datetime(2026, 8, 30, 10, 0, tzinfo=UTC)
 def _reminder(
     reminder_id="rem_123",
     user_id="user_1",
-    delivery_type="NORMAL_NOTIFICATION",
+    delivery_type="ALARM_NOTIFICATION",
     status="SCHEDULED",
     occurrence=None,
     repeat="once",
@@ -39,8 +39,8 @@ def _reminder(
         "timezone": extra.get("timezone", "Asia/Kolkata"),
         "repeat": repeat,
         "aiCalling": delivery_type == "AI_CALL",
-        "beeping": delivery_type == "ALARM_NOTIFICATION",
-        "notification": True,
+        "beeping": delivery_type in {"ALARM_NOTIFICATION", "NORMAL_NOTIFICATION"},
+        "notification": False,
         "deliveryType": delivery_type,
         "deliveryStatus": status,
         "nextTriggerAtUtc": occurrence,
@@ -88,12 +88,13 @@ def test_one_time_reminder_fires_once():
     assert member not in schedule.zsets[schedule.keys.schedule]
 
 
-def test_normal_notification_routing():
+def test_legacy_notification_routes_as_alarm():
     payload = android_payload(
         TriggerEvent(1, "e", "r", "u", NOW, "Asia/Kolkata", "NORMAL_NOTIFICATION", "T", "M", "t")
     )
-    assert payload["type"] == "reminder_notification"
-    assert payload["channelId"] == "buddy_reminders"
+    assert payload["type"] == "reminder_alarm"
+    assert payload["channelId"] == "buddy_reminder_alarms_v2"
+    assert payload["sound"] == "true"
 
 
 def test_alarm_notification_routing():

@@ -51,8 +51,8 @@ class ReminderPayload(BaseModel):
     repeat: ReminderRepeat = "once"
     source: Literal["ai"] = "ai"
     aiCalling: bool = False
-    notification: bool = True
-    beeping: bool = False
+    notification: bool = False
+    beeping: bool = True
 
 
 class ReminderVoiceTurnResult(BaseModel):

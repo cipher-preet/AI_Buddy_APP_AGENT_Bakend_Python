@@ -48,12 +48,10 @@ from tests.fixtures.conversation_meetings import COMPLEX_MEETING_TRANSCRIPT  # n
 
 EXPECTED_KRUTRIM = {
     "gemma-4-31b-it": 131072,
-    "gpt-oss-120b": 65536,
     "gpt-oss-20b": 131072,
 }
 SMOKE_MODELS = [
     ("krutrim", "gemma-4-31b-it"),
-    ("krutrim", "gpt-oss-120b"),
     ("krutrim", "gpt-oss-20b"),
     ("mistral", "ministral-14b-latest"),
 ]

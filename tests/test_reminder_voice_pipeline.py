@@ -133,7 +133,8 @@ def test_complete_utterance_is_ready_without_llm():
     assert result.reminder.dateKey == "2026-08-31"
     assert result.reminder.timeLabel == "6:00 AM"
     assert result.reminder.source == "ai"
-    assert result.reminder.notification is True
+    assert result.reminder.notification is False
+    assert result.reminder.beeping is True
     assert result.reminder.aiCalling is False
     assert "call mom" in result.replyText.lower()
 

@@ -74,7 +74,8 @@ class Settings(BaseSettings):
     CONVERSATION_SEMANTIC_PROVIDER: str = "krutrim"
     CONVERSATION_SEMANTIC_MODEL: str = "gemma-4-31b-it"
     CONVERSATION_SYNTHESIS_PROVIDER: str = "krutrim"
-    CONVERSATION_SYNTHESIS_MODEL: str = "gpt-oss-120b"
+    # Krutrim retired gpt-oss-120b (404). Use gpt-oss-20b for synthesis structured JSON.
+    CONVERSATION_SYNTHESIS_MODEL: str = "gpt-oss-20b"
     CONVERSATION_SYNTHESIS_FALLBACK_PROVIDER: str = "krutrim"
     CONVERSATION_SYNTHESIS_FALLBACK_MODEL: str = "gemma-4-31b-it"
     # VALIDATION capability prefers gpt-oss-20b (FALLBACK_* below), then this pair.
@@ -262,7 +263,7 @@ class Settings(BaseSettings):
     SPARSE_WINDOW_MIN_USEFUL_TOKENS: int = Field(default=4, ge=1, le=500)
     LLM_PROVIDER_CONTEXT_TOKENS: str = "groq:8192,gemini:1048576,mistral:262144,sarvam:32768,openai:128000,anthropic:200000,krutrim:65536"
     # Model-specific context windows. Krutrim values come from GET /v1/models context_length.
-    LLM_MODEL_CONTEXT_TOKENS: str = "gemma-4-31b-it:131072,gpt-oss-120b:65536,gpt-oss-20b:131072,ministral-14b-latest:262144,ministral-14b-2512:262144"
+    LLM_MODEL_CONTEXT_TOKENS: str = "gemma-4-31b-it:131072,gpt-oss-20b:131072,ministral-14b-latest:262144,ministral-14b-2512:262144"
     WINDOW_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=180, ge=15, le=3600)
     STT_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=300, ge=30, le=3600)
     FINALIZATION_MAX_RETRIES: int = Field(default=8, ge=1, le=50)
