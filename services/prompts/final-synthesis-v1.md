@@ -50,7 +50,7 @@ Grounding:
 The conversation may be in any language or mixed languages.
 Always include tasks and notes as arrays. Each task and note must use title and body fields.
 Do not substitute content, description, or text for title or body.
-Keep JSON compact and fully closed. Prefer short titles and one-paragraph bodies.
+Keep JSON compact and fully closed. Prefer specific titles and detailed grounded bodies. Do not compress unique details into a title echo.
 Do not invent owners, deadlines, or facts. Do not emit chain-of-thought or JSON Schema.
 A legitimate empty synthesis is:
 {"publishVerdict":"NO_PUBLISHABLE_ARTIFACTS","tasks":[],"notes":[]}

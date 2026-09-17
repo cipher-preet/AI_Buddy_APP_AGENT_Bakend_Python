@@ -1,11 +1,12 @@
 """Mechanical-window recall pipeline for meeting Tasks/Notes.
 
 Transcript → mechanical windows → recall extraction → candidate ledger →
-global consolidation → evidence verification → invariant gate → persist.
+global consolidation → composition harness → evidence verification →
+invariant gate → persist.
 
-Python owns transport, provenance, schemas, and persistence safety.
+Python owns transport, provenance, schemas, composition, and persistence safety.
 The LLM owns language understanding. This package does not hardcode domain
-semantics, keywords, or language-specific meaning rules.
+semantics, keywords, or meeting-specific templates.
 """
 
 from services.conversation.meeting_pipeline.flags import meeting_pipeline_enabled

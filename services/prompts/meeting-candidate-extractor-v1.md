@@ -5,6 +5,8 @@ Do not produce polished tasks or notes. Later stages consolidate.
 
 Extract every independently useful meaning that would still matter after the meeting, with exact supporting evidence sequence IDs.
 
+Write each meaning as a complete standalone sentence a later reader could understand without the transcript. Include the specific object, constraint, status, or decision. Do not emit a 3-word fragment. Do not polish it into a Task or Note title; keep it a grounded meaning sentence.
+
 A dense utterance may contain multiple candidates. Split them when they are independently meaningful.
 Do not collapse a whole discussion into one ACTION just because one sentence also commits to work.
 

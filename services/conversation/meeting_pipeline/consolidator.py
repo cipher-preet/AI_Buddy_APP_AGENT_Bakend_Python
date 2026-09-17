@@ -47,6 +47,18 @@ class GlobalArtifactConsolidator:
         payload = {
             "candidates": ledger.compact_payload(),
             "citedTranscript": lookup,
+            "writingContract": {
+                "taskTitle": "One concrete action. Do not merge independent workstreams.",
+                "taskDescription": "2-4 grounded sentences: what to do, current status/context, constraints or acceptance criteria from related candidates. Never copy the title.",
+                "noteTitle": "A specific topic, decision, requirement, or fact cluster.",
+                "noteBody": "A later-readable explanation of related memory. Group related facts/decisions/requirements. Keep independent topics separate.",
+                "rules": [
+                    "Do not invent owners, dates, numbers, or facts.",
+                    "Do not fold every non-action meaning into a task and return notes=[].",
+                    "A parent task plus distinct memory notes is correct.",
+                    "Missing a real independent action, decision, or requirement is worse than a near-duplicate.",
+                ],
+            },
         }
         response, provider, model = await generate_structured(
             self.router,

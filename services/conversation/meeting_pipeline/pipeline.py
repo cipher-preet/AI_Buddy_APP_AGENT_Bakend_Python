@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from services.conversation.fingerprints import note_fingerprint, task_fingerprint
+from services.conversation.meeting_pipeline.composer import compose_artifacts
 from services.conversation.meeting_pipeline.consolidator import GlobalArtifactConsolidator, recover_unpublished_notes
 from services.conversation.meeting_pipeline.dates import normalize_supported_due_date
 from services.conversation.meeting_pipeline.extractor import MeetingCandidateExtractor
@@ -33,7 +34,7 @@ from services.llm.async_runtime import reraise_if_hard_runtime
 from services.llm.router import LLMRouter
 
 
-PIPELINE_VERSION = "meeting-extract-consolidate-verify-v1"
+PIPELINE_VERSION = "meeting-extract-compose-verify-v1"
 _MAX_WINDOW_ATTEMPTS = 3
 # API/schema compatibility only. Persistence uses verificationVerdict == SUPPORTED.
 COMPAT_CONFIDENCE = 0.5
@@ -113,6 +114,7 @@ async def run_meeting_pipeline(
 
         claims, summary, topics = await consolidator.consolidate(ledger, sequence_text)
         claims, recovered_notes = recover_unpublished_notes(claims, ledger, set(sequence_text))
+        claims, composition = compose_artifacts(claims, ledger, set(sequence_text))
         verified = await verifier.verify(claims, sequence_text, meeting_at=meeting_at) if claims else []
         accepted, rejected = apply_invariant_gate(
             verified,
@@ -151,6 +153,10 @@ async def run_meeting_pipeline(
             "consolidated_task_count": sum(1 for item in claims if item.kind == "task"),
             "consolidated_note_count": sum(1 for item in claims if item.kind == "note"),
             "recovered_note_count": recovered_notes,
+            "tasks_enriched": composition.get("tasksEnriched", 0),
+            "notes_clustered": composition.get("notesClustered", 0),
+            "composed_task_count": composition.get("composedTaskCount", 0),
+            "composed_note_count": composition.get("composedNoteCount", 0),
             "verified_supported_count": sum(1 for item in verified if item.verdict == VerifierVerdict.SUPPORTED),
             "verified_partial_count": verifier.partial,
             "verified_unsupported_count": sum(1 for item in verified if item.verdict == VerifierVerdict.UNSUPPORTED),

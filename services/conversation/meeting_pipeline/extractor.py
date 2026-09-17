@@ -39,6 +39,11 @@ class MeetingCandidateExtractor:
             "sequenceStart": window.sequence_start,
             "sequenceEnd": window.sequence_end,
             "transcript": window.text,
+            "extractionContract": {
+                "meaning": "Complete standalone sentence a later reader can understand without the transcript.",
+                "split": "A turn that both commits to work and explains how/why/what to include is several candidates, not one ACTION.",
+                "recall": "Missing a real commitment, requirement, decision, or important fact is worse than extracting it twice.",
+            },
         }
         response, provider, model = await generate_structured(
             self.router,

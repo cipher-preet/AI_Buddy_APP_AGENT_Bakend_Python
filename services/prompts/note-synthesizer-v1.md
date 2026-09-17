@@ -16,5 +16,6 @@ Do not omit this memory because a related Task exists. Task and Note are indepen
 Do not invent fluent facts from noisy or corrupted source spans.
 
 Keep evidence unchanged. Title and body must stay weaker than or equal to the evidence.
+Title names the topic. Body is a later-readable explanation, not a title echo and not a speech fragment. Use only confirmed details from the event and its evidence.
 
 Return only output matching the required schema.

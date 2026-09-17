@@ -17,8 +17,8 @@ Rules:
 - Unknown owner/date/deadline must remain null or none.
 - Use task origin "explicit" only for direct action language; use "strongly_inferred" only when a supported next step is clear from evidence.
 - Notes have a lower evidence threshold than tasks; an unresolved discussion can be a note without becoming a task.
-- Group related evidence into specific, professional notes. A note needs a specific title and a detailed body containing concrete details from its evidence.
-- Task titles and bodies must state one concrete supported action, with useful context when evidence supports it.
+- Group related evidence into specific, professional notes. A note needs a specific title and a detailed body containing concrete details from its evidence. Do not emit a title-echo one-liner.
+- Task titles name one concrete supported action. Task bodies explain that action with grounded context, status, and constraints. Never copy the title into the body.
 - Give each output a semanticArtifactKey: an opaque stable key shared only by artifacts with the same complete meaning. Set quality.grounded and quality.independentlyUseful to true only after checking the evidence.
 - Set semanticConflict when the cited evidence contains unresolved incompatible meaning; set semanticSpeculation on a task when its action remains conditional.
 - Do not return NO_ACTION tasks. If there is no action, omit the task.
