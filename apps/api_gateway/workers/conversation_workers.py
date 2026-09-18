@@ -35,9 +35,23 @@ from services.storage.s3_audio_storage import (
 from services.speech.transcription_router import transcribe_from_path_with_fallback
 from services.conversation.models import ConversationStatus, STTStatus
 from services.llm.router import LLMCapability, get_llm_router
+from services.meeting_extension.processor import process_meeting_video_chunk
+
+
+def is_meeting_extension_stt_event(event: EventEnvelope) -> bool:
+    payload = event.payload or {}
+    return (
+        event.eventType == "meeting.video.chunk.ready"
+        or payload.get("sourceType") == "meeting_extension"
+        or payload.get("jobType") == "meeting_video_chunk_ready"
+    )
 
 
 async def handle_stt_event(event: EventEnvelope) -> None:
+    if is_meeting_extension_stt_event(event):
+        await process_meeting_video_chunk(event)
+        return
+
     repository = ConversationRepository(get_database())
     payload = event.payload
     conversation_id = payload["conversationId"]

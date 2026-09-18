@@ -13,6 +13,10 @@ from apps.api_gateway.workers.conversation_workers import (
     run_inactivity_scanner,
     run_retry_relay,
 )
+from apps.api_gateway.workers.meeting_extension_worker import (
+    build_meeting_merge_consumer,
+    build_meeting_video_consumer,
+)
 from apps.api_gateway.workers.reminder_worker import start_reminder_worker
 from apps.api_gateway.workers.daily_briefing_worker import (
     build_daily_briefing_consumer,
@@ -92,14 +96,22 @@ async def main():
     transcript_ready_consumer = build_transcript_ready_consumer()
     window_extraction_consumer = build_window_extraction_consumer()
     daily_briefing_consumer = build_daily_briefing_consumer()
+    meeting_video_consumer = build_meeting_video_consumer()
+    meeting_merge_consumer = build_meeting_merge_consumer()
     stream_consumers = [
-        audio_consumer,
-        stt_consumer,
-        transcript_ready_consumer,
-        window_extraction_consumer,
-        finalization_consumer,
-        processing_consumer,
-        daily_briefing_consumer,
+        consumer
+        for consumer in (
+            audio_consumer,
+            stt_consumer,
+            transcript_ready_consumer,
+            window_extraction_consumer,
+            finalization_consumer,
+            processing_consumer,
+            daily_briefing_consumer,
+            meeting_video_consumer,
+            meeting_merge_consumer,
+        )
+        if consumer is not None
     ]
 
     await asyncio.gather(*(consumer.ensure_group() for consumer in stream_consumers))

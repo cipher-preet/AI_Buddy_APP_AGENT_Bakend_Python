@@ -26,6 +26,8 @@ ALLOWED_EVENT_TYPES = {
     "conversation.processing.requested",
     "job.retry.requested",
     "daily.briefing.requested",
+    "meeting.video.chunk.ready",
+    "meeting.video.merge.requested",
 }
 
 
@@ -141,6 +143,8 @@ def _stream_for_event(payload: dict[str, Any], event: EventEnvelope) -> str:
             settings.REDIS_PROCESSING_STREAM,
             settings.REDIS_RETRY_STREAM,
             settings.REDIS_DAILY_BRIEFING_STREAM,
+            settings.REDIS_MEETING_VIDEO_STREAM,
+            settings.REDIS_MEETING_MERGE_STREAM,
         }
         if explicit not in allowed_streams:
             raise ValueError("targetStream is not allowed")
@@ -161,6 +165,10 @@ def _stream_for_event(payload: dict[str, Any], event: EventEnvelope) -> str:
         return settings.REDIS_RETRY_STREAM
     if event.eventType == "daily.briefing.requested":
         return settings.REDIS_DAILY_BRIEFING_STREAM
+    if event.eventType == "meeting.video.chunk.ready":
+        return settings.REDIS_STT_STREAM
+    if event.eventType == "meeting.video.merge.requested":
+        return settings.REDIS_MEETING_MERGE_STREAM
     raise ValueError("unsupported event type")
 
 

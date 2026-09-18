@@ -126,8 +126,24 @@ class ConversationRepository:
         language_code: str | None,
         request_id: str | None,
         provider: str,
+        extra_fields: dict[str, Any] | None = None,
     ) -> None:
         now = utc_now()
+        fields: dict[str, Any] = {
+            "rawText": raw_text,
+            "languageCode": language_code,
+            "sttRequestId": request_id,
+            "sttProvider": provider,
+            "sttStatus": STTStatus.COMPLETED.value,
+            "lastError": None,
+            "failureStage": None,
+            "failureType": None,
+            "terminal": False,
+            "exclusionReason": None,
+            "updatedAt": now,
+        }
+        if extra_fields:
+            fields.update({key: value for key, value in extra_fields.items() if value is not None})
         result = await self.db.transcript_chunks.update_one(
             {
                 "conversationId": {"$in": mongo_id_candidates(conversation_id)},
@@ -135,19 +151,7 @@ class ConversationRepository:
                 "sttStatus": {"$ne": STTStatus.COMPLETED.value},
             },
             {
-                "$set": {
-                    "rawText": raw_text,
-                    "languageCode": language_code,
-                    "sttRequestId": request_id,
-                    "sttProvider": provider,
-                    "sttStatus": STTStatus.COMPLETED.value,
-                    "lastError": None,
-                    "failureStage": None,
-                    "failureType": None,
-                    "terminal": False,
-                    "exclusionReason": None,
-                    "updatedAt": now,
-                },
+                "$set": fields,
                 "$inc": {"sttAttempts": 1},
             },
         )

@@ -99,6 +99,8 @@ class Settings(BaseSettings):
     REDIS_RETRY_STREAM: str = "buddy:conversation:retry"
     REDIS_DEAD_LETTER_STREAM: str = "buddy:dead-letter"
     REDIS_DAILY_BRIEFING_STREAM: str = "buddy:daily-briefing:jobs"
+    REDIS_MEETING_VIDEO_STREAM: str = "buddy:stt:jobs"
+    REDIS_MEETING_MERGE_STREAM: str = "buddy:meeting:video-merge"
 
     REDIS_AUDIO_GROUP: str = "audio-workers"
     REDIS_STT_GROUP: str = "stt-workers"
@@ -107,6 +109,8 @@ class Settings(BaseSettings):
     REDIS_FINALIZATION_GROUP: str = "finalization-workers"
     REDIS_PROCESSING_GROUP: str = "conversation-processing-workers"
     REDIS_DAILY_BRIEFING_GROUP: str = "daily-briefing-workers"
+    REDIS_MEETING_VIDEO_GROUP: str = "meeting-video-workers"
+    REDIS_MEETING_MERGE_GROUP: str = "meeting-merge-workers"
 
     DAILY_BRIEFING_ENABLED: bool = True
     DAILY_BRIEFING_TRIGGER_HOUR: int = Field(default=0, ge=0, le=23)
@@ -174,6 +178,14 @@ class Settings(BaseSettings):
     S3_UPLOAD_TIMEOUT_SECONDS: float = 60
     S3_DOWNLOAD_TIMEOUT_SECONDS: float = 60
     S3_MAX_RETRIES: int = 3
+    MEETING_EXTENSION_ENABLED: bool = True
+    MEETING_STT_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
+    MEETING_MAX_FAILED_TRANSCRIPT_CHUNKS: int = Field(default=0, ge=0, le=1000)
+    MEETING_VIDEO_FINALIZATION_ENABLED: bool = True
+    MEETING_FFMPEG_TIMEOUT_SECONDS: float = Field(default=60, ge=5, le=600)
+    MEETING_MERGE_TIMEOUT_SECONDS: float = Field(default=300, ge=30, le=3600)
+    MEETING_S3_PREFIX: str = "meetings"
+    MEETING_WORKER_CONCURRENCY: int | None = Field(default=None, ge=1, le=64)
     CLOUDFRONT_URL: str = ""
     CLOUDFRONT_KEY_PAIR_ID: str = ""
     CLOUDFRONT_PRIVATE_KEY: SecretStr | str = ""

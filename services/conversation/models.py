@@ -186,6 +186,7 @@ class ConversationDocument(UtcAwareModel):
     processedAt: datetime | None = None
     finalizationAttempts: int = 0
     lastAccounting: dict[str, Any] = Field(default_factory=dict)
+    sourceType: str | None = None
     createdAt: datetime = Field(default_factory=utc_now)
     updatedAt: datetime = Field(default_factory=utc_now)
 
@@ -244,6 +245,10 @@ class TranscriptChunkDocument(UtcAwareModel):
     createdAt: datetime = Field(default_factory=utc_now)
     updatedAt: datetime = Field(default_factory=utc_now)
     expiresAt: datetime | None = None
+    sourceType: str | None = None
+    source: str | None = None
+    meetingSessionId: str | None = None
+    segments: list[dict[str, Any]] = Field(default_factory=list)
 
     class Config:
         populate_by_name = True

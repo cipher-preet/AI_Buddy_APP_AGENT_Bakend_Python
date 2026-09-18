@@ -56,6 +56,7 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
             IndexModel([("userId", ASCENDING), ("createdAt", ASCENDING)]),
             IndexModel([("conversationId", ASCENDING), ("sttStatus", ASCENDING)]),
             IndexModel([("conversationId", ASCENDING), ("processingStatus", ASCENDING)]),
+            IndexModel([("conversationId", ASCENDING), ("startTimeMs", ASCENDING)]),
             IndexModel([("expiresAt", ASCENDING)], expireAfterSeconds=0),
         ]
     )
@@ -205,3 +206,23 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
             IndexModel([("userId", ASCENDING), ("status", ASCENDING), ("dateKey", DESCENDING)]),
         ]
     )
+    await database.meeting_sessions.create_indexes(
+        [
+            IndexModel([("userId", ASCENDING), ("createdAt", DESCENDING)]),
+            IndexModel([("status", ASCENDING), ("updatedAt", ASCENDING)]),
+        ]
+    )
+    await database.meeting_recording_chunks.create_indexes(
+        [
+            IndexModel(
+                [("meetingSessionId", ASCENDING), ("sequence", ASCENDING), ("mediaKind", ASCENDING)],
+                unique=True,
+            ),
+            IndexModel([("meetingSessionId", ASCENDING), ("processingStatus", ASCENDING)]),
+            IndexModel([("processingStatus", ASCENDING), ("updatedAt", ASCENDING)]),
+        ]
+    )
+    try:
+        await database.meeting_recording_chunks.drop_index("meetingSessionId_1_sequence_1")
+    except Exception:
+        pass

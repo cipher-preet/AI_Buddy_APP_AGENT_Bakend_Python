@@ -31,6 +31,8 @@ class ConversationInactivityScanner:
         finalization_events_published = 0
         processing_events_published = 0
         for conversation in conversations:
+            if getattr(conversation, "sourceType", None) == "meeting_extension":
+                continue
             conversation_id = str(conversation.id)
             last_sequence = await self.repository.infer_last_sequence(conversation_id)
             if last_sequence is None:
