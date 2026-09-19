@@ -28,12 +28,17 @@ docker compose -f docker-compose.aws.yml --env-file .env.aws build
 docker compose -f docker-compose.aws.yml --env-file .env.aws up -d
 ```
 
-After pulling new code, always rebuild the worker image so Python deps (including `firebase-admin`) are installed:
+After pulling new code, rebuild the worker so Python deps (including `firebase-admin`) and FFmpeg are installed. Pip can sit on `Collecting cryptography` / `boto3` for a few minutes on a small EC2 — do not Ctrl+C.
+
+Prefer a dedicated build so Redis/Caddy are not competing for RAM:
 
 ```bash
 docker compose -f docker-compose.aws.yml --env-file .env.aws build --no-cache buddy-worker
-docker compose -f docker-compose.aws.yml --env-file .env.aws up -d buddy-worker
+docker compose -f docker-compose.aws.yml --env-file .env.aws up -d
+docker compose -f docker-compose.aws.yml --env-file .env.aws logs -f --tail=80 buddy-worker
 ```
+
+The worker must log `meeting ffmpeg: /usr/bin/ffmpeg`. If it logs `ffmpeg is not installed`, the image is stale — rebuild with `--no-cache` as above.
 
 ### Reminder / FCM (required when `FCM_ENABLED=true`)
 

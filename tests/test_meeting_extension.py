@@ -1,7 +1,17 @@
 import asyncio
 from pathlib import Path
 
-from services.meeting_extension.ffmpeg_audio import MeetingAudioExtractionError, extract_audio_for_stt
+from services.meeting_extension.ffmpeg_audio import (
+    MeetingAudioExtractionError,
+    extract_audio_for_stt,
+    extract_webm_init,
+    has_webm_header,
+    reset_ffmpeg_bin_cache,
+    resolve_ffmpeg_bin,
+    WEBM_CLUSTER_ID,
+    WEBM_EBML_ID,
+    write_standalone_webm,
+)
 from services.meeting_extension.processor import process_meeting_video_chunk
 from services.meeting_extension.segments import extract_stt_segments
 from services.meeting_extension.timestamps import meeting_relative_ms
@@ -18,6 +28,19 @@ def test_timestamp_normalization_example():
 def test_timestamp_rounding_is_stable():
     assert meeting_relative_ms(1000, 0.0014) == 1001
     assert meeting_relative_ms(1000, 0.0015) == 1002
+
+
+def test_webm_init_is_bytes_before_first_cluster(tmp_path):
+    header = WEBM_EBML_ID + b"\x01\x02\x03"
+    cluster = WEBM_CLUSTER_ID + b"cluster-payload"
+    assert extract_webm_init(header + cluster) == header
+    assert has_webm_header(header + cluster)
+    assert not has_webm_header(cluster)
+    fragment = tmp_path / "later.webm"
+    fragment.write_bytes(cluster)
+    repaired = write_standalone_webm(fragment, header)
+    assert has_webm_header(repaired.read_bytes())
+    assert repaired.read_bytes().endswith(cluster)
 
 
 def test_segment_extraction_uses_chunk_offsets_not_sequence_math():
@@ -63,6 +86,7 @@ def test_ffmpeg_failure_and_temp_cleanup(monkeypatch, tmp_path):
         return FakeProcess()
 
     monkeypatch.setattr("services.meeting_extension.ffmpeg_audio.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("services.meeting_extension.ffmpeg_audio.resolve_ffmpeg_bin", lambda: "ffmpeg")
     source = tmp_path / "chunk.webm"
     source.write_bytes(b"not-a-video")
     output = tmp_path / "out.wav"
@@ -416,6 +440,94 @@ def test_audio_chunk_skips_ffmpeg(monkeypatch, tmp_path):
     assert updates
 
 
+def test_later_muxed_chunk_prepends_webm_init(monkeypatch, tmp_path):
+    extracted = []
+    header = WEBM_EBML_ID + b"\x01\x02"
+    cluster = WEBM_CLUSTER_ID + b"later"
+
+    class FakeRepo:
+        async def get_transcript_chunk(self, conversation_id, sequence):
+            return None
+
+        async def mark_transcript_chunk_processing(self, conversation_id, sequence):
+            return True
+
+        async def complete_transcript_chunk(self, **kwargs):
+            return None
+
+        async def fail_transcript_chunk(self, *args, **kwargs):
+            return True
+
+        async def get_conversation(self, conversation_id):
+            return None
+
+    class FakeStorage:
+        bucket = "bucket"
+
+        async def download_file(self, bucket, object_key, destination):
+            path = Path(destination)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(header + cluster if object_key.endswith("000001.webm") else cluster)
+            return path
+
+    async def fake_extract(input_path, output_path):
+        extracted.append(Path(input_path).read_bytes())
+        path = Path(output_path).with_suffix(".wav")
+        path.write_bytes(b"audio")
+        return path
+
+    async def fake_stt(**kwargs):
+        return {
+            "transcript": "hello",
+            "language_code": "en",
+            "request_id": "r1",
+            "provider": "deepgram",
+            "results": {"utterances": [{"transcript": "hello", "start": 0.0, "end": 1.0}]},
+        }
+
+    class FakeProducer:
+        async def publish(self, stream, event):
+            return None
+
+    monkeypatch.setattr("services.meeting_extension.processor.ConversationRepository", lambda db: FakeRepo())
+    monkeypatch.setattr("services.meeting_extension.processor.get_s3_audio_storage", lambda: FakeStorage())
+    monkeypatch.setattr("services.meeting_extension.processor.extract_audio_for_stt", fake_extract)
+    monkeypatch.setattr("services.meeting_extension.processor.transcribe_from_path_with_fallback", fake_stt)
+    monkeypatch.setattr("services.meeting_extension.processor.RedisStreamProducer", FakeProducer)
+    monkeypatch.setattr("services.meeting_extension.processor.get_database", lambda: object())
+    monkeypatch.setattr("services.meeting_extension.processor.temp_audio_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        "services.meeting_extension.processor.validate_meeting_object_key",
+        lambda **kwargs: kwargs["object_key"],
+    )
+
+    async def noop_mark(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("services.meeting_extension.processor._mark_chunk_processed", noop_mark)
+
+    event = EventEnvelope(
+        eventType="meeting.video.chunk.ready",
+        correlationId="c1",
+        userId="u1",
+        spaceId="s1",
+        conversationId="c1",
+        payload={
+            "meetingSessionId": "c1",
+            "sequence": 4,
+            "mediaKind": "muxed",
+            "mimeType": "video/webm",
+            "s3Key": "meetings/u1/c1/chunks/000004.webm",
+            "startOffsetMs": 0,
+            "endOffsetMs": 1000,
+        },
+    )
+    asyncio.run(process_meeting_video_chunk(event))
+    assert extracted
+    assert has_webm_header(extracted[0])
+    assert extracted[0].endswith(cluster)
+
+
 def test_merge_prefers_video_folder_then_muxed(monkeypatch, tmp_path):
     from services.meeting_extension.video_merge import _download_merge_chunk
 
@@ -499,3 +611,45 @@ def test_stt_handler_routes_meeting_jobs_without_touching_mobile_path(monkeypatc
         payload={"conversationId": "c2", "sequenceNumber": 1},
     )
     assert conversation_workers.is_meeting_extension_stt_event(mobile) is False
+
+
+def test_resolve_ffmpeg_uses_configured_binary(monkeypatch, tmp_path):
+    binary = tmp_path / "ffmpeg.exe"
+    binary.write_bytes(b"ffmpeg")
+    monkeypatch.setattr(
+        "services.meeting_extension.ffmpeg_audio.settings.MEETING_FFMPEG_BIN",
+        str(binary),
+    )
+    reset_ffmpeg_bin_cache()
+    try:
+        assert resolve_ffmpeg_bin() == str(binary)
+    finally:
+        reset_ffmpeg_bin_cache()
+
+
+def test_resolve_ffmpeg_missing_raises(monkeypatch):
+    monkeypatch.setattr("services.meeting_extension.ffmpeg_audio.settings.MEETING_FFMPEG_BIN", "")
+    monkeypatch.delenv("IMAGEIO_FFMPEG_EXE", raising=False)
+    monkeypatch.setattr("services.meeting_extension.ffmpeg_audio.shutil.which", lambda name: None)
+    monkeypatch.setattr(
+        "services.meeting_extension.ffmpeg_audio.Path.is_file",
+        lambda self: False,
+    )
+
+    class MissingImageio:
+        @staticmethod
+        def get_ffmpeg_exe():
+            raise RuntimeError("no bundled ffmpeg")
+
+    monkeypatch.setitem(__import__("sys").modules, "imageio_ffmpeg", MissingImageio)
+    reset_ffmpeg_bin_cache()
+    try:
+        try:
+            resolve_ffmpeg_bin()
+            raise AssertionError("missing ffmpeg must fail")
+        except MeetingAudioExtractionError as error:
+            assert "not installed" in str(error)
+            assert error.corrupt is False
+    finally:
+        reset_ffmpeg_bin_cache()
+

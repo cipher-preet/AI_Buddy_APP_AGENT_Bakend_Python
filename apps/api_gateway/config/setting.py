@@ -182,6 +182,7 @@ class Settings(BaseSettings):
     MEETING_STT_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
     MEETING_MAX_FAILED_TRANSCRIPT_CHUNKS: int = Field(default=0, ge=0, le=1000)
     MEETING_VIDEO_FINALIZATION_ENABLED: bool = True
+    MEETING_FFMPEG_BIN: str = ""
     MEETING_FFMPEG_TIMEOUT_SECONDS: float = Field(default=60, ge=5, le=600)
     MEETING_MERGE_TIMEOUT_SECONDS: float = Field(default=300, ge=30, le=3600)
     MEETING_S3_PREFIX: str = "meetings"

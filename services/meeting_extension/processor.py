@@ -12,8 +12,14 @@ from apps.api_gateway.config.setting import settings
 from services.conversation.models import ConversationStatus, STTStatus
 from services.conversation.repository import ConversationRepository
 from services.db.mongo import get_database
-from services.meeting_extension.ffmpeg_audio import MeetingAudioExtractionError, extract_audio_for_stt
-from services.meeting_extension.s3_keys import validate_meeting_object_key
+from services.meeting_extension.ffmpeg_audio import (
+    MeetingAudioExtractionError,
+    extract_audio_for_stt,
+    extract_webm_init,
+    has_webm_header,
+    write_standalone_webm,
+)
+from services.meeting_extension.s3_keys import meeting_chunk_object_key, validate_meeting_object_key
 from services.meeting_extension.segments import extract_stt_segments
 from services.observability.diagnostics import diag_log
 from services.queue.streams import EventEnvelope, NonRetryableQueueError, RedisStreamProducer
@@ -88,6 +94,15 @@ async def process_meeting_video_chunk(event: EventEnvelope) -> None:
                 userId=user_id,
             )
         else:
+            video_path = await _ensure_standalone_webm(
+                video_path,
+                sequence=sequence,
+                user_id=user_id,
+                meeting_session_id=meeting_session_id,
+                media_kind=media_kind or "muxed",
+                bucket=bucket,
+                job_dir=job_dir,
+            )
             audio_path = await extract_audio_for_stt(video_path, job_dir / "audio")
             diag_log(
                 "meeting_audio_extracted",
@@ -223,6 +238,9 @@ async def _mark_chunk_processed(
     if failure_message:
         update["failureMessage"] = failure_message
         update["failureCode"] = processing_status
+    elif processing_status == "COMPLETED":
+        update["failureMessage"] = None
+        update["failureCode"] = None
     query: dict[str, Any] = {
         "meetingSessionId": _object_id(meeting_session_id),
         "sequence": sequence,
@@ -238,3 +256,46 @@ async def _mark_chunk_processed(
             {"_id": _object_id(meeting_session_id)},
             {"$inc": {"processedChunks": 1}, "$set": {"updatedAt": now, "transcriptStatus": "processing"}},
         )
+
+
+async def _ensure_standalone_webm(
+    video_path: Path,
+    *,
+    sequence: int,
+    user_id: str,
+    meeting_session_id: str,
+    media_kind: str,
+    bucket: str,
+    job_dir: Path,
+) -> Path:
+    payload = video_path.read_bytes()
+    if has_webm_header(payload) or sequence <= 1:
+        return video_path
+    init_key = meeting_chunk_object_key(
+        user_id,
+        meeting_session_id,
+        1,
+        media_kind=media_kind if media_kind in {"audio", "video", "muxed"} else "muxed",
+    )
+    init_path = job_dir / "webm-init-source.webm"
+    try:
+        await get_s3_audio_storage().download_file(bucket=bucket, object_key=init_key, destination=init_path)
+    except Exception as error:
+        diag_log(
+            "meeting_webm_init_missing",
+            meetingSessionId=meeting_session_id,
+            chunkSequence=sequence,
+            error=str(error)[:200],
+        )
+        return video_path
+    init_bytes = extract_webm_init(init_path.read_bytes())
+    if not init_bytes:
+        return video_path
+    repaired = write_standalone_webm(video_path, init_bytes, job_dir / f"{video_path.stem}.standalone.webm")
+    diag_log(
+        "meeting_webm_init_prepended",
+        meetingSessionId=meeting_session_id,
+        chunkSequence=sequence,
+        initBytes=len(init_bytes),
+    )
+    return repaired
