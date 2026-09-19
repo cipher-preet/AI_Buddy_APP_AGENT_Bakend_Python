@@ -742,6 +742,11 @@ class ConversationRepository:
             await self._replace_staged_collection("stagedNotes", run, staged_notes)
             await self._replace_staged_collection("stagedDecisions", run, staged_decisions)
             await self._replace_staged_collection("stagedIssues", run, staged_issues)
+            # Official store is main `tasks` / `notes` — mirror whenever staged
+            # artifacts exist so AI output is queryable even if a later publish fails.
+            if staged_tasks or staged_notes:
+                await self._publish_tasks(run)
+                await self._publish_notes(run)
 
     async def mark_extraction_run_failed(self, run_id: Any, error: Exception | str) -> None:
         await self.db.extraction_runs.update_one(
@@ -842,6 +847,9 @@ class ConversationRepository:
             doc["spaceId"] = to_mongo_id(run.spaceId)
             doc["updatedAt"] = utc_now()
             doc.setdefault("createdAt", run.startedAt)
+            doc.setdefault("origin", "ai")
+            doc.setdefault("source", "meeting")
+            doc["deletedAt"] = None
             doc["status"] = task_status_for_operation(task.operation, task.needsConfirmation)
             for evidence in doc.get("evidence", []):
                 if isinstance(evidence, dict):
@@ -858,9 +866,16 @@ class ConversationRepository:
                 task_id = task_object_id(run.id, doc, len(task_ids))
                 doc["_id"] = task_id
                 filter_doc = {"fingerprint": task.fingerprint} if task.fingerprint else {"_id": task_id}
+                set_doc = {key: value for key, value in doc.items() if key not in {"_id", "createdAt"}}
                 result = await self.db.tasks.find_one_and_update(
                     filter_doc,
-                    {"$setOnInsert": doc},
+                    {
+                        "$set": set_doc,
+                        "$setOnInsert": {
+                            "_id": task_id,
+                            "createdAt": doc.get("createdAt", utc_now()),
+                        },
+                    },
                     upsert=True,
                     return_document=ReturnDocument.AFTER,
                 )
@@ -878,6 +893,9 @@ class ConversationRepository:
             doc["spaceId"] = to_mongo_id(run.spaceId)
             doc["updatedAt"] = utc_now()
             doc.setdefault("createdAt", run.startedAt)
+            doc.setdefault("origin", "ai")
+            doc.setdefault("source", "meeting")
+            doc["deletedAt"] = None
             for evidence in doc.get("evidence", []):
                 if isinstance(evidence, dict):
                     evidence.setdefault("_id", embedded_object_id(evidence))
@@ -885,9 +903,16 @@ class ConversationRepository:
             note_id = note_object_id(run.id, doc, len(note_ids))
             doc["_id"] = note_id
             filter_doc = {"fingerprint": note.fingerprint} if note.fingerprint else {"_id": note_id}
+            set_doc = {key: value for key, value in doc.items() if key not in {"_id", "createdAt"}}
             result = await self.db.notes.find_one_and_update(
                 filter_doc,
-                {"$setOnInsert": doc},
+                {
+                    "$set": set_doc,
+                    "$setOnInsert": {
+                        "_id": note_id,
+                        "createdAt": doc.get("createdAt", utc_now()),
+                    },
+                },
                 upsert=True,
                 return_document=ReturnDocument.AFTER,
             )
