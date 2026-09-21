@@ -10,7 +10,7 @@ from bson import ObjectId
 
 from apps.api_gateway.config.setting import settings
 from services.conversation.models import ConversationStatus, STTStatus
-from services.conversation.repository import ConversationRepository
+from services.conversation.repository import ConversationRepository, has_space_id
 from services.db.mongo import get_database
 from services.meeting_extension.ffmpeg_audio import (
     MeetingAudioExtractionError,
@@ -40,7 +40,8 @@ async def process_meeting_video_chunk(event: EventEnvelope) -> None:
     meeting_session_id = str(payload.get("meetingSessionId") or event.conversationId)
     sequence = int(payload.get("sequence") or payload.get("sequenceNumber") or 0)
     user_id = str(payload.get("userId") or event.userId)
-    space_id = str(payload.get("spaceId") or event.spaceId)
+    raw_space = payload.get("spaceId") if payload.get("spaceId") not in (None, "") else event.spaceId
+    space_id = str(raw_space) if has_space_id(raw_space) else ""
     chunk_id = str(payload.get("chunkId") or f"meeting:{meeting_session_id}:chunk:{sequence}")
     object_key = str(payload.get("s3Key") or payload.get("objectKey") or "")
     bucket = str(payload.get("s3Bucket") or payload.get("bucket") or "")

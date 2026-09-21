@@ -253,6 +253,43 @@ def test_missing_sequences_are_not_terminal_immediately():
     assert accounting["missingSequences"] == [4, 5]
 
 
+def test_meeting_extension_does_not_require_sequence_zero():
+    """Extension chunks are 1..N; a phantom missing 0 must not block intelligence."""
+    conversation = _conversation(1)
+    conversation.sourceType = "meeting_extension"
+    conversation.receivedAudioChunkCount = 1
+    chunks = [_chunk(1, "hello from meet")]
+    _, unresolved, accounting = _session_readiness(conversation, chunks, [])
+    assert unresolved is False
+    assert accounting["missingSequences"] == []
+    assert accounting["expectedSequences"] == 1
+
+
+def test_meeting_extension_reports_missing_from_one():
+    conversation = _conversation(3)
+    conversation.sourceType = "meeting_extension"
+    conversation.receivedAudioChunkCount = 2
+    chunks = [_chunk(1, "first"), _chunk(3, "third")]
+    _, unresolved, accounting = _session_readiness(conversation, chunks, [])
+    assert unresolved is True
+    assert accounting["missingSequences"] == [2]
+    assert accounting["expectedSequences"] == 3
+
+
+def test_meeting_extension_skips_never_uploaded_sequences_after_short_stop_timeout():
+    conversation = _conversation(9)
+    conversation.sourceType = "meeting_extension"
+    conversation.spaceId = None
+    conversation.stoppedAt = datetime.now(timezone.utc) - timedelta(seconds=60)
+    conversation.receivedAudioChunkCount = 7
+    chunks = [_chunk(index, f"text {index}") for index in range(3, 10)]
+    skippable, unresolved, accounting = _session_readiness(conversation, chunks, [])
+    assert unresolved is False
+    assert 1 in skippable
+    assert 2 in skippable
+    assert accounting["missingSequences"] == [1, 2]
+
+
 def test_missing_sequences_become_skippable_after_timeout():
     conversation = _conversation(5)
     conversation.stoppedAt = datetime.now(timezone.utc) - timedelta(seconds=1000)

@@ -59,6 +59,8 @@ class ConversationRepository:
         update_doc = {"status": target.value, "updatedAt": utc_now()}
         if updates:
             update_doc.update(updates)
+        if target in {ConversationStatus.COMPLETED, ConversationStatus.PARTIAL}:
+            update_doc.setdefault("processedAt", utc_now())
         result = await self.db.conversations.find_one_and_update(
             {**_id_query(conversation_id), "status": current.status.value},
             {"$set": update_doc},
@@ -66,13 +68,85 @@ class ConversationRepository:
         )
         if not result:
             raise ValueError(f"Conversation transition conflict: {conversation_id}")
-        return ConversationDocument.model_validate(result)
+        saved = ConversationDocument.model_validate(result)
+        await self.sync_meeting_session_status(saved)
+        return saved
+
+    async def sync_meeting_session_status(self, conversation: ConversationDocument) -> None:
+        """Keep meeting_sessions in sync so clients don't stay stuck on queued/not_started."""
+        if getattr(conversation, "sourceType", None) != "meeting_extension":
+            return
+        now = utc_now()
+        patch: dict[str, Any] = {"updatedAt": now}
+        status = conversation.status
+        if status == ConversationStatus.WAITING_FOR_TRANSCRIPTS:
+            patch.update(
+                {
+                    "status": "WAITING_FOR_TRANSCRIPTS",
+                    "processingStatus": "waiting_for_transcripts",
+                    "transcriptStatus": "waiting",
+                    "intelligenceStatus": "not_started",
+                }
+            )
+        elif status == ConversationStatus.FINALIZING:
+            patch.update(
+                {
+                    "status": "FINALIZING",
+                    "processingStatus": "finalizing",
+                    "transcriptStatus": "processing",
+                    "intelligenceStatus": "not_started",
+                }
+            )
+        elif status == ConversationStatus.READY_FOR_PROCESSING:
+            patch.update(
+                {
+                    "status": "PROCESSING",
+                    "processingStatus": "ready",
+                    "transcriptStatus": "completed",
+                    "intelligenceStatus": "queued",
+                }
+            )
+        elif status in {ConversationStatus.PROCESSING, ConversationStatus.VALIDATING}:
+            patch.update(
+                {
+                    "status": "PROCESSING",
+                    "processingStatus": "processing",
+                    "transcriptStatus": "completed",
+                    "intelligenceStatus": "processing",
+                }
+            )
+        elif status in {ConversationStatus.COMPLETED, ConversationStatus.PARTIAL}:
+            patch.update(
+                {
+                    "status": "READY",
+                    "processingStatus": "completed",
+                    "transcriptStatus": "completed",
+                    "intelligenceStatus": "completed",
+                    "finalizedAt": conversation.processedAt or now,
+                }
+            )
+        elif status == ConversationStatus.FAILED:
+            patch.update(
+                {
+                    "status": "FINALIZATION_FAILED",
+                    "processingStatus": "failed",
+                    "intelligenceStatus": "finalization_failed",
+                    "lastErrorCode": "CONVERSATION_FAILED",
+                    "lastErrorMessage": (conversation.lastError or "Conversation processing failed")[:200],
+                }
+            )
+        else:
+            return
+        await self.db.meeting_sessions.update_one(
+            {"_id": to_mongo_id(conversation.id)},
+            {"$set": patch},
+        )
 
     async def record_audio_chunk(self, metadata: AudioChunkMetadata) -> bool:
         doc = metadata.model_dump()
         doc["conversationId"] = to_mongo_id(metadata.conversationId)
         doc["userId"] = to_mongo_id(metadata.userId)
-        doc["spaceId"] = to_mongo_id(metadata.spaceId)
+        doc["spaceId"] = optional_mongo_id(metadata.spaceId)
         result = await self.db.audio_chunks.update_one(
             {
                 "conversationId": doc["conversationId"],
@@ -131,6 +205,7 @@ class ConversationRepository:
         now = utc_now()
         fields: dict[str, Any] = {
             "rawText": raw_text,
+            "normalizedText": raw_text,
             "languageCode": language_code,
             "sttRequestId": request_id,
             "sttProvider": provider,
@@ -261,7 +336,41 @@ class ConversationRepository:
         cursor = self.db.transcript_chunks.find(
             {"conversationId": {"$in": mongo_id_candidates(conversation_id)}}
         ).sort("sequenceNumber", 1)
-        chunks = [TranscriptChunkDocument.model_validate(doc) async for doc in cursor]
+        chunks: list[TranscriptChunkDocument] = []
+        async for doc in cursor:
+            if str(doc.get("processingStatus") or "").strip().lower() == TranscriptProcessingStatus.EXCLUDED.value:
+                # Self-heal legacy rows so workers stop seeing invalid enum values.
+                await self.db.transcript_chunks.update_one(
+                    {"_id": doc["_id"]},
+                    {
+                        "$set": {
+                            "processingStatus": TranscriptProcessingStatus.PROCESSED.value,
+                            "exclusionReason": doc.get("exclusionReason")
+                            or TranscriptExclusionReason.EMPTY_TRANSCRIPT.value,
+                            "updatedAt": utc_now(),
+                        }
+                    },
+                )
+                doc = {
+                    **doc,
+                    "processingStatus": TranscriptProcessingStatus.PROCESSED.value,
+                    "exclusionReason": doc.get("exclusionReason")
+                    or TranscriptExclusionReason.EMPTY_TRANSCRIPT.value,
+                }
+            try:
+                chunks.append(TranscriptChunkDocument.model_validate(doc))
+            except Exception as error:
+                # One bad legacy row must not DLQ the whole finalization stream.
+                print(
+                    "Skipping invalid transcript chunk document:",
+                    {
+                        "conversationId": conversation_id,
+                        "chunkId": doc.get("chunkId"),
+                        "sequenceNumber": doc.get("sequenceNumber"),
+                        "processingStatus": doc.get("processingStatus"),
+                        "error": str(error)[:300],
+                    },
+                )
         return sorted(chunks, key=lambda chunk: int(chunk.sequenceNumber))
 
     async def list_transcript_chunks_in_range(
@@ -435,7 +544,7 @@ class ConversationRepository:
         doc = window.model_dump(by_alias=True)
         doc["conversationId"] = to_mongo_id(window.conversationId)
         doc["userId"] = to_mongo_id(window.userId)
-        doc["spaceId"] = to_mongo_id(window.spaceId)
+        doc["spaceId"] = optional_mongo_id(window.spaceId)
         doc["createdAt"] = window.createdAt
         doc["updatedAt"] = now
         result = await self.db.conversation_windows.find_one_and_update(
@@ -687,12 +796,21 @@ class ConversationRepository:
             }
         )
         if existing:
-            return ExtractionRunDocument.model_validate(existing)
+            run = ExtractionRunDocument.model_validate(existing)
+            if getattr(conversation, "sourceType", None) == "meeting_extension":
+                run.spaceId = None
+            return run
 
+        # Meeting-extension conversations are not tied to a Buddy space.
+        space_id = (
+            None
+            if getattr(conversation, "sourceType", None) == "meeting_extension"
+            else conversation.spaceId
+        )
         run = ExtractionRunDocument(
             conversationId=conversation.id,
             userId=conversation.userId,
-            spaceId=conversation.spaceId,
+            spaceId=space_id,
             processingVersion=conversation.processingVersion,
             provider=provider,
             model=model,
@@ -816,23 +934,25 @@ class ConversationRepository:
         summary_doc = summary.model_dump(by_alias=True)
         summary_doc["conversationId"] = to_mongo_id(summary.conversationId)
         summary_doc["userId"] = to_mongo_id(summary.userId)
-        summary_doc["spaceId"] = to_mongo_id(summary.spaceId)
+        summary_doc["spaceId"] = optional_mongo_id(summary.spaceId)
         await self.db.conversation_summaries.update_one(
             {"conversationId": to_mongo_id(summary.conversationId)},
             {"$set": summary_doc},
             upsert=True,
         )
 
-        memory_doc = memory.model_dump(by_alias=True)
-        memory_doc["userId"] = to_mongo_id(memory.userId)
-        memory_doc["spaceId"] = to_mongo_id(memory.spaceId)
-        if memory.lastUpdatedConversationId is not None:
-            memory_doc["lastUpdatedConversationId"] = to_mongo_id(memory.lastUpdatedConversationId)
-        await self.db.space_memory.update_one(
-            {"userId": to_mongo_id(memory.userId), "spaceId": to_mongo_id(memory.spaceId)},
-            {"$set": memory_doc},
-            upsert=True,
-        )
+        # Extension meetings have no space context — do not write space_memory.
+        if has_space_id(memory.spaceId):
+            memory_doc = memory.model_dump(by_alias=True)
+            memory_doc["userId"] = to_mongo_id(memory.userId)
+            memory_doc["spaceId"] = to_mongo_id(memory.spaceId)
+            if memory.lastUpdatedConversationId is not None:
+                memory_doc["lastUpdatedConversationId"] = to_mongo_id(memory.lastUpdatedConversationId)
+            await self.db.space_memory.update_one(
+                {"userId": to_mongo_id(memory.userId), "spaceId": to_mongo_id(memory.spaceId)},
+                {"$set": memory_doc},
+                upsert=True,
+            )
         return {"taskIds": task_ids, "noteIds": note_ids}
 
     async def _publish_tasks(self, run: ExtractionRunDocument) -> list[Any]:
@@ -844,7 +964,7 @@ class ConversationRepository:
             doc["conversationId"] = to_mongo_id(run.conversationId)
             doc["sourceConversationId"] = to_mongo_id(task.sourceConversationId)
             doc["userId"] = to_mongo_id(run.userId)
-            doc["spaceId"] = to_mongo_id(run.spaceId)
+            doc["spaceId"] = optional_mongo_id(run.spaceId)
             doc["updatedAt"] = utc_now()
             doc.setdefault("createdAt", run.startedAt)
             doc.setdefault("origin", "ai")
@@ -857,8 +977,16 @@ class ConversationRepository:
 
             existing_task_id = task.existingTaskId.strip() if task.existingTaskId else None
             if existing_task_id:
+                task_filter: dict[str, Any] = {
+                    "_id": to_mongo_id(existing_task_id),
+                    "userId": doc["userId"],
+                }
+                if doc["spaceId"] is None:
+                    task_filter["$or"] = [{"spaceId": None}, {"spaceId": {"$exists": False}}]
+                else:
+                    task_filter["spaceId"] = doc["spaceId"]
                 result = await self.db.tasks.find_one_and_update(
-                    {"_id": to_mongo_id(existing_task_id), "userId": doc["userId"], "spaceId": doc["spaceId"]},
+                    task_filter,
                     {"$set": {key: value for key, value in doc.items() if key != "createdAt"}},
                     return_document=ReturnDocument.AFTER,
                 )
@@ -890,7 +1018,7 @@ class ConversationRepository:
             doc["conversationId"] = to_mongo_id(run.conversationId)
             doc["sourceConversationId"] = to_mongo_id(note.sourceConversationId)
             doc["userId"] = to_mongo_id(run.userId)
-            doc["spaceId"] = to_mongo_id(run.spaceId)
+            doc["spaceId"] = optional_mongo_id(run.spaceId)
             doc["updatedAt"] = utc_now()
             doc.setdefault("createdAt", run.startedAt)
             doc.setdefault("origin", "ai")
@@ -936,7 +1064,9 @@ class ConversationRepository:
             },
         )
 
-    async def get_space_memory(self, user_id: str, space_id: str) -> SpaceMemoryDocument:
+    async def get_space_memory(self, user_id: str, space_id: str | None) -> SpaceMemoryDocument:
+        if not has_space_id(space_id):
+            return SpaceMemoryDocument(userId=to_mongo_id(user_id), spaceId=None)
         data = await self.db.space_memory.find_one(
             {"userId": {"$in": mongo_id_candidates(user_id)}, "spaceId": {"$in": mongo_id_candidates(space_id)}}
         )
@@ -1148,7 +1278,28 @@ def to_mongo_id(value: Any) -> Any:
     return value
 
 
+def has_space_id(value: Any) -> bool:
+    """True when value is a real space id (not null / empty / sentinel strings)."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed or trimmed.lower() in {"none", "null", "undefined"}:
+            return False
+        return True
+    return True
+
+
+def optional_mongo_id(value: Any) -> Any | None:
+    """Convert to ObjectId when present; keep null for unscoped extension meetings."""
+    if not has_space_id(value):
+        return None
+    return to_mongo_id(value)
+
+
 def mongo_id_candidates(value: Any) -> list[Any]:
+    if not has_space_id(value):
+        return [None]
     mongo_id = to_mongo_id(value)
     candidates = [mongo_id]
     if isinstance(mongo_id, ObjectId):
@@ -1203,7 +1354,7 @@ def staged_collection_doc(
     item["extractionRunId"] = run.id
     item["conversationId"] = to_mongo_id(run.conversationId)
     item["userId"] = to_mongo_id(run.userId)
-    item["spaceId"] = to_mongo_id(run.spaceId)
+    item["spaceId"] = optional_mongo_id(run.spaceId)
     item["processingVersion"] = run.processingVersion
     item["updatedAt"] = run.updatedAt
     item.setdefault("createdAt", run.startedAt)

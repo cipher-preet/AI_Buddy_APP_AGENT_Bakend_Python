@@ -8,7 +8,7 @@ from services.conversation.incremental import IncrementalMeetingProcessor
 from services.conversation.models import ConversationStatus, STTStatus, WindowProcessingStatus, as_utc, utc_now
 from services.conversation.repository import ConversationRepository, to_mongo_id
 from services.conversation.stt_failure import is_permanent_stt_failure, is_terminal_failed_chunk
-from services.conversation.transcript import detect_missing_sequences
+from services.conversation.transcript import detect_missing_sequences, first_sequence_for_conversation
 from services.conversation.windowing import is_useful_chunk
 from services.queue.streams import EventEnvelope, RedisStreamProducer
 from services.observability.diagnostics import note_stt_requeued
@@ -98,7 +98,15 @@ class ConversationFinalizationCoordinator:
                     {"conversationId": conversation_id, "count": len(reclaimed)},
                 )
             windows = await self.repository.list_conversation_windows(conversation_id)
-            incomplete = [window for window in windows if window.status != WindowProcessingStatus.COMPLETED]
+            # Extraction-skipped / final-partial windows are completed by design for
+            # meeting-pipeline / meeting_extension finalization — never block READY on them.
+            incomplete = [
+                window
+                for window in windows
+                if window.status != WindowProcessingStatus.COMPLETED
+                and not getattr(window, "extractionSkipped", False)
+                and not getattr(window, "isFinalPartial", False)
+            ]
             queued_stale_before = utc_now() - timedelta(seconds=settings.WINDOW_PROCESSING_STALE_TIMEOUT_SECONDS)
             for window in incomplete:
                 if not _should_publish_window_job(window, queued_stale_before):
@@ -110,7 +118,7 @@ class ConversationFinalizationCoordinator:
                         eventType="conversation.window.extraction.requested",
                         correlationId=conversation_id,
                         userId=str(window.userId),
-                        spaceId=str(window.spaceId),
+                        spaceId=_envelope_space_id(window.spaceId),
                         conversationId=conversation_id,
                         payload={"windowId": str(window.id), "windowIndex": window.windowIndex},
                     ),
@@ -155,7 +163,7 @@ class ConversationFinalizationCoordinator:
                             eventType="conversation.window.extraction.requested",
                             correlationId=conversation_id,
                             userId=str(window.userId),
-                            spaceId=str(window.spaceId),
+                            spaceId=_envelope_space_id(window.spaceId),
                             conversationId=conversation_id,
                             payload={"windowId": str(window.id), "windowIndex": window.windowIndex, "recovery": True},
                         ),
@@ -199,7 +207,7 @@ class ConversationFinalizationCoordinator:
                 eventType="conversation.processing.requested",
                 correlationId=conversation_id,
                 userId=str(conversation.userId),
-                spaceId=str(conversation.spaceId),
+                spaceId=_envelope_space_id(conversation.spaceId),
                 conversationId=conversation_id,
                 payload={
                     "processingVersion": conversation.processingVersion,
@@ -239,12 +247,12 @@ class ConversationFinalizationCoordinator:
                     eventType="stt.requested",
                     correlationId=conversation_id,
                     userId=str(chunk.userId),
-                    spaceId=str(chunk.spaceId),
+                    spaceId=_envelope_space_id(chunk.spaceId),
                     conversationId=conversation_id,
                     payload={
                         "conversationId": str(chunk.conversationId),
                         "userId": str(chunk.userId),
-                        "spaceId": str(chunk.spaceId),
+                        "spaceId": _envelope_space_id(chunk.spaceId),
                         "chunkId": chunk.chunkId,
                         "sequenceNumber": chunk.sequenceNumber,
                         **audio_fields,
@@ -279,10 +287,19 @@ class ConversationFinalizationCoordinator:
             return False
 
 
+def _first_sequence_for_conversation(conversation) -> int:
+    return first_sequence_for_conversation(conversation)
+
+
 def _session_readiness(conversation, chunks, windows) -> tuple[set[int], bool, dict]:
     expected_last = int(conversation.expectedLastSequence)
+    first_sequence = first_sequence_for_conversation(conversation)
     present = {chunk.sequenceNumber for chunk in chunks}
-    missing = detect_missing_sequences(list(present), expected_last)
+    missing = detect_missing_sequences(
+        list(present),
+        expected_last,
+        first_sequence=first_sequence,
+    )
     pending = [chunk for chunk in chunks if chunk.sttStatus in {STTStatus.PENDING, STTStatus.PROCESSING}]
     failed = [chunk for chunk in chunks if chunk.sttStatus == STTStatus.FAILED]
     missing_timeout = _missing_sequences_are_terminal(conversation)
@@ -313,7 +330,7 @@ def _session_readiness(conversation, chunks, windows) -> tuple[set[int], bool, d
     processing = sum(1 for chunk in chunks if chunk.sttStatus == STTStatus.PROCESSING)
     terminal_sequences = successful + empty_count + permanently_failed
     accounting = {
-        "expectedSequences": expected_last + 1,
+        "expectedSequences": max(0, expected_last - first_sequence + 1),
         "accountedSequences": len(present) + (len(missing) if missing_timeout else 0),
         "missingSequences": missing,
         "emptyTranscripts": empty_count,
@@ -371,10 +388,18 @@ def _public_accounting(accounting: dict) -> dict:
 
 def _missing_sequences_are_terminal(conversation) -> bool:
     stopped_at = as_utc(conversation.stoppedAt)
+    if stopped_at is None and getattr(conversation, "sourceType", None) == "meeting_extension":
+        # Node stop always sets expectedLastSequence. If stoppedAt was omitted,
+        # still allow a short wait from last conversation update.
+        if conversation.expectedLastSequence is not None:
+            stopped_at = as_utc(getattr(conversation, "updatedAt", None))
     if stopped_at is None:
         return False
     elapsed = utc_now() - stopped_at
-    return elapsed.total_seconds() >= settings.FINALIZATION_MISSING_SEQUENCE_TIMEOUT_SECONDS
+    timeout = settings.FINALIZATION_MISSING_SEQUENCE_TIMEOUT_SECONDS
+    if getattr(conversation, "sourceType", None) == "meeting_extension":
+        timeout = settings.MEETING_EXTENSION_MISSING_SEQUENCE_TIMEOUT_SECONDS
+    return elapsed.total_seconds() >= timeout
 
 
 def _should_publish_window_job(window, stale_before) -> bool:
@@ -489,3 +514,13 @@ def _is_permanent_audio_failure(chunk) -> bool:
     if getattr(chunk, "failureType", None) and is_terminal_failed_chunk(chunk):
         return True
     return is_permanent_stt_failure(chunk.lastError)
+
+
+def _envelope_space_id(space_id) -> str:
+    """Redis envelopes require a string; extension meetings use empty when unscoped."""
+    if space_id is None:
+        return ""
+    value = str(space_id).strip()
+    if not value or value.lower() in {"none", "null", "undefined"}:
+        return ""
+    return value

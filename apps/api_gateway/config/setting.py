@@ -281,6 +281,10 @@ class Settings(BaseSettings):
     STT_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=300, ge=30, le=3600)
     FINALIZATION_MAX_RETRIES: int = Field(default=8, ge=1, le=50)
     FINALIZATION_MISSING_SEQUENCE_TIMEOUT_SECONDS: int = Field(default=900, ge=15, le=3600)
+    # Extension stop already drained uploads (~90s). Never-uploaded sequences (no
+    # audio/transcript row) cannot be STT-retried — skip them quickly so remaining
+    # speech still produces tasks/notes, matching the mobile app path.
+    MEETING_EXTENSION_MISSING_SEQUENCE_TIMEOUT_SECONDS: int = Field(default=45, ge=15, le=900)
     COVERAGE_SPARSE_WINDOW_ENABLED: bool = True
     MEETING_MEMORY_RETRIEVAL_LIMIT: int = Field(default=12, ge=1, le=50)
     MEETING_MEMORY_GLOBAL_ITEM_LIMIT: int = Field(default=30, ge=5, le=100)

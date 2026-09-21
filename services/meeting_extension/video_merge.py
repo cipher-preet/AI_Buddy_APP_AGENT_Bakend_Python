@@ -34,10 +34,32 @@ async def process_meeting_video_merge(event: EventEnvelope) -> None:
         )
         storage = get_s3_audio_storage()
         chunk_paths = []
+        missing_sequences: list[int] = []
         for sequence in range(1, expected + 1):
             destination = job_dir / f"{sequence:06d}.webm"
-            await _download_merge_chunk(storage, user_id, meeting_session_id, sequence, destination)
+            try:
+                await _download_merge_chunk(storage, user_id, meeting_session_id, sequence, destination)
+            except Exception:
+                # Late/missing uploads (often seq 1) must not fail the whole merge.
+                missing_sequences.append(sequence)
+                diag_log(
+                    "meeting_video_merge_chunk_skipped",
+                    meetingSessionId=meeting_session_id,
+                    userId=user_id,
+                    chunkSequence=sequence,
+                )
+                continue
             chunk_paths.append(destination)
+        if not chunk_paths:
+            raise MeetingAudioExtractionError("No uploaded video chunks available to merge", corrupt=True)
+        if missing_sequences:
+            diag_log(
+                "meeting_video_merge_partial",
+                meetingSessionId=meeting_session_id,
+                userId=user_id,
+                missingSequences=missing_sequences,
+                presentCount=len(chunk_paths),
+            )
         output = job_dir / "meeting.webm"
         await concat_webm_chunks(chunk_paths, output)
         await storage.upload_file(output, final_key, content_type="video/webm")

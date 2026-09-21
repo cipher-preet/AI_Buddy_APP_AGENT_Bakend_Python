@@ -58,7 +58,7 @@ class ConversationProcessingWorkflow:
                     eventType="conversation.finalization.requested",
                     correlationId=conversation_id,
                     userId=str(conversation.userId),
-                    spaceId=str(conversation.spaceId),
+                    spaceId="" if conversation.spaceId is None else str(conversation.spaceId),
                     conversationId=conversation_id,
                     payload={"expectedLastSequence": conversation.expectedLastSequence, "source": "processing-not-ready"},
                 ),
@@ -94,7 +94,9 @@ class ConversationProcessingWorkflow:
                 incomplete = [
                     window
                     for window in windows
-                    if window.status != WindowProcessingStatus.COMPLETED and not window.extractionSkipped
+                    if window.status != WindowProcessingStatus.COMPLETED
+                    and not window.extractionSkipped
+                    and not window.isFinalPartial
                 ]
                 if unwindowed or incomplete:
                     print(
@@ -114,7 +116,7 @@ class ConversationProcessingWorkflow:
                             eventType="conversation.finalization.requested",
                             correlationId=conversation_id,
                             userId=str(conversation.userId),
-                            spaceId=str(conversation.spaceId),
+                            spaceId="" if conversation.spaceId is None else str(conversation.spaceId),
                             conversationId=conversation_id,
                             payload={"expectedLastSequence": conversation.expectedLastSequence, "source": "processing-drain-guard"},
                         ),
@@ -211,16 +213,24 @@ class ConversationProcessingWorkflow:
             }
 
             await self.repository.transition(conversation_id, ConversationStatus.VALIDATING)
+            artifact_space_id = (
+                None
+                if getattr(conversation, "sourceType", None) == "meeting_extension"
+                else conversation.spaceId
+            )
             summary = await agents.summarize_conversation(
                 self.router,
                 conversation_id,
                 conversation.userId,
-                conversation.spaceId,
+                artifact_space_id,
                 state.normalized_transcript,
                 outputs,
                 conversation.processingVersion,
             )
-            previous_memory = await self.repository.get_space_memory(conversation.userId, conversation.spaceId)
+            previous_memory = await self.repository.get_space_memory(
+                conversation.userId,
+                artifact_space_id,
+            )
             memory = await agents.update_space_memory(self.router, previous_memory, summary)
             await self.repository.publish_outputs(run, summary, memory)
             await self.repository.schedule_transcript_expiry(conversation_id)
@@ -462,7 +472,11 @@ class ConversationProcessingWorkflow:
             chunks,
             conversation_id,
             str(conversation.userId),
-            str(conversation.spaceId),
+            (
+                ""
+                if getattr(conversation, "sourceType", None) == "meeting_extension" or conversation.spaceId is None
+                else str(conversation.spaceId)
+            ),
             router=self.router,
             meeting_at=getattr(conversation, "startedAt", None),
         )
@@ -707,7 +721,11 @@ class ConversationProcessingWorkflow:
         summary = ConversationSummaryDocument(
             conversationId=conversation.id,
             userId=conversation.userId,
-            spaceId=conversation.spaceId,
+            spaceId=(
+                None
+                if getattr(conversation, "sourceType", None) == "meeting_extension"
+                else conversation.spaceId
+            ),
             summary=result.summary or result.narrative,
             topics=result.topics,
             importantFacts=result.importantFacts,
@@ -719,7 +737,12 @@ class ConversationProcessingWorkflow:
             modelName=model,
             promptVersion="final-synthesis-v1",
         )
-        previous_memory = await self.repository.get_space_memory(conversation.userId, conversation.spaceId)
+        previous_memory = await self.repository.get_space_memory(
+            conversation.userId,
+            None
+            if getattr(conversation, "sourceType", None) == "meeting_extension"
+            else conversation.spaceId,
+        )
         memory_update = await agents.update_space_memory(self.router, previous_memory, summary)
         expected_tasks = [task for task in result.tasks if task.operation != "NO_ACTION"]
         expected_notes = list(result.notes)

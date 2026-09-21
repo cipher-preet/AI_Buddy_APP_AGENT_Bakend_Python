@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from redis.exceptions import ConnectionError, ResponseError, TimeoutError as RedisTimeoutError
 
 from apps.api_gateway.config.setting import settings
@@ -45,7 +45,15 @@ class EventEnvelope(BaseModel):
         mode="before",
     )
     @classmethod
-    def stringify_identifiers(cls, value):
+    def stringify_identifiers(cls, value, info: ValidationInfo):
+        # Extension meetings are unscoped: never let a raw None crash Redis publish.
+        if info.field_name == "spaceId":
+            if value is None:
+                return ""
+            text = str(value).strip()
+            if not text or text.lower() in {"none", "null", "undefined"}:
+                return ""
+            return text
         if value is None:
             return value
         return str(value)

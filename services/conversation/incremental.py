@@ -26,6 +26,7 @@ from services.conversation.windowing import (
     is_useful_chunk,
     leading_skippable_sequences,
 )
+from services.conversation.transcript import first_sequence_for_conversation
 from services.conversation.semantic_input import (
     as_sequence_number,
     assemble_semantic_window_input,
@@ -79,7 +80,12 @@ class IncrementalMeetingProcessor:
         ]
         existing_windows = await self.repository.list_conversation_windows(conversation_id)
         start_index = len(existing_windows)
-        expected_start = as_sequence_number(existing_windows[-1].sequenceEnd) + 1 if existing_windows else 0
+        first_sequence = first_sequence_for_conversation(conversation)
+        expected_start = (
+            as_sequence_number(existing_windows[-1].sequenceEnd) + 1
+            if existing_windows
+            else first_sequence
+        )
         unwindowed = [chunk for chunk in unwindowed if as_sequence_number(chunk.sequenceNumber) >= expected_start]
         useful_sequences = {
             as_sequence_number(chunk.sequenceNumber)
@@ -126,9 +132,23 @@ class IncrementalMeetingProcessor:
 
         if unwindowed and as_sequence_number(unwindowed[0].sequenceNumber) != expected_start:
             hole = list(range(expected_start, as_sequence_number(unwindowed[0].sequenceNumber)))
+            present = {as_sequence_number(chunk.sequenceNumber) for chunk in all_chunks}
+            if force_final:
+                # Stop already happened. Sequences with no transcript/audio row will
+                # never be recovered by STT retry — skip them and window the rest.
+                skippable.update(sequence for sequence in hole if sequence not in present)
             if any(sequence not in skippable for sequence in hole):
+                print(
+                    "Window close deferred; sequence hole is not skippable:",
+                    {
+                        "conversationId": conversation_id,
+                        "expectedStart": expected_start,
+                        "firstUnwindowed": as_sequence_number(unwindowed[0].sequenceNumber),
+                        "hole": hole,
+                        "sourceType": getattr(conversation, "sourceType", None),
+                    },
+                )
                 return []
-            present = {chunk.sequenceNumber for chunk in all_chunks}
             missing_hole = [sequence for sequence in hole if sequence not in present]
             failed_hole = [sequence for sequence in hole if sequence in present]
             if missing_hole:
@@ -170,24 +190,38 @@ class IncrementalMeetingProcessor:
             )
             window_ids.append(str(saved.id))
             retain_raw = saved.isFinalPartial or built.close_reason == CLOSE_REASON_FORCED_FINAL
-            if retain_raw:
+            # force_final can still emit mid-session TOKEN_TARGET closes. Meeting pipeline /
+            # meeting_extension finalization extracts from full transcript, so do not block
+            # READY on live window-extraction workers for those closes.
+            defer_finalization = force_final and (
+                meeting_pipeline_enabled()
+                or getattr(conversation, "sourceType", None) == "meeting_extension"
+            )
+            if retain_raw or defer_finalization:
+                checkpoint_kind = (
+                    "deferred_meeting_pipeline"
+                    if defer_finalization and meeting_pipeline_enabled()
+                    else "raw_final"
+                )
                 await self.repository.complete_window(
                     saved.id,
                     WindowExtractionResult(isCheckpoint=False),
-                    provider="none",
-                    model="raw-passthrough",
+                    provider="none" if retain_raw and not defer_finalization else "meeting-pipeline",
+                    model="raw-passthrough" if retain_raw and not defer_finalization else "deferred-to-finalization",
                     artifact_count=0,
                     artifact_persistence_ok=True,
                     extraction_skipped=True,
-                    checkpoint_kind="raw_final",
+                    checkpoint_kind=checkpoint_kind,
                 )
                 print(
-                    "Final partial window retained as raw transcript:",
+                    "Window retained for finalization without live extraction:",
                     {
                         "conversationId": conversation_id,
                         "windowId": str(saved.id),
                         "windowIndex": saved.windowIndex,
                         "closeReason": saved.closeReason or built.close_reason,
+                        "checkpointKind": checkpoint_kind,
+                        "forceFinal": force_final,
                         "usefulTokenCount": saved.usefulTokenCount,
                         "meaningfulSpeechMs": saved.meaningfulSpeechMs,
                     },
@@ -200,7 +234,7 @@ class IncrementalMeetingProcessor:
                         eventType="conversation.window.extraction.requested",
                         correlationId=conversation_id,
                         userId=str(conversation.userId),
-                        spaceId=str(conversation.spaceId),
+                        spaceId=_envelope_space_id(conversation.spaceId),
                         conversationId=conversation_id,
                         payload={
                             "windowId": str(saved.id),
@@ -660,3 +694,12 @@ def _derived_skippable_sequences(chunks) -> set[int]:
         if chunk.sttStatus == STTStatus.FAILED and is_terminal_failed_chunk(chunk):
             skippable.add(chunk.sequenceNumber)
     return skippable
+
+
+def _envelope_space_id(space_id) -> str:
+    if space_id is None:
+        return ""
+    value = str(space_id).strip()
+    if not value or value.lower() in {"none", "null", "undefined"}:
+        return ""
+    return value

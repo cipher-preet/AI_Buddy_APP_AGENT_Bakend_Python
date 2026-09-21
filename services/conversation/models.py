@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Literal
 
 from bson import ObjectId
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def utc_now() -> datetime:
@@ -131,6 +131,8 @@ class TranscriptProcessingStatus(str, Enum):
     PROCESSED = "processed"
     ARCHIVED = "archived"
     EXPIRED = "expired"
+    # Legacy value written by older pipelines. Treated as PROCESSED + exclusionReason.
+    EXCLUDED = "excluded"
 
 
 class TranscriptExclusionReason(str, Enum):
@@ -252,6 +254,24 @@ class TranscriptChunkDocument(UtcAwareModel):
 
     class Config:
         populate_by_name = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_excluded_status(cls, data: Any):
+        """Legacy docs used processingStatus='excluded'. Treat as processed + exclusion."""
+        if not isinstance(data, dict):
+            return data
+        status = data.get("processingStatus")
+        if status is None:
+            return data
+        text = str(status).strip().lower()
+        if text != TranscriptProcessingStatus.EXCLUDED.value:
+            return data
+        normalized = dict(data)
+        normalized["processingStatus"] = TranscriptProcessingStatus.PROCESSED.value
+        if not normalized.get("exclusionReason"):
+            normalized["exclusionReason"] = TranscriptExclusionReason.EMPTY_TRANSCRIPT.value
+        return normalized
 
 
 class EvidenceSpan(BaseModel):

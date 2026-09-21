@@ -160,6 +160,29 @@ def _sequence_from_line(line: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def detect_missing_sequences(sequence_numbers: list[int], expected_last_sequence: int) -> list[int]:
+def first_sequence_for_conversation(conversation) -> int:
+    """Meeting-extension chunks are 1..N; mobile conversations remain 0..N."""
+    source_type = getattr(conversation, "sourceType", None)
+    if source_type == "meeting_extension":
+        return 1
+    return 0
+
+
+def detect_missing_sequences(
+    sequence_numbers: list[int],
+    expected_last_sequence: int,
+    *,
+    first_sequence: int = 0,
+) -> list[int]:
+    """Return missing sequence numbers in [first_sequence, expected_last_sequence].
+
+    Mobile conversations use 0-based sequences. Meeting-extension recordings use
+    1-based sequences (1..N). Passing the wrong first_sequence leaves a phantom
+    gap (e.g. sequence 0) that blocks finalization forever.
+    """
     present = set(sequence_numbers)
-    return [number for number in range(0, expected_last_sequence + 1) if number not in present]
+    start = int(first_sequence)
+    end = int(expected_last_sequence)
+    if end < start:
+        return []
+    return [number for number in range(start, end + 1) if number not in present]
