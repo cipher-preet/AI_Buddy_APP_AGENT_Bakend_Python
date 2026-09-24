@@ -67,8 +67,8 @@ async def process_meeting_video_merge(event: EventEnvelope) -> None:
                 presentCount=len(chunk_paths),
                 expected=expected,
             )
-        output = job_dir / "meeting.mp4"
-        await concat_webm_chunks(chunk_paths, output)
+        output = job_dir / "meeting.webm"
+        output = await concat_webm_chunks(chunk_paths, output)
         if not output.exists() or output.stat().st_size < 8_192:
             raise MeetingAudioExtractionError(
                 "Merged recording is empty or too small to play",
@@ -78,10 +78,10 @@ async def process_meeting_video_merge(event: EventEnvelope) -> None:
         is_webm = probe.startswith(bytes([0x1A, 0x45, 0xDF, 0xA3]))
         is_mp4 = b"ftyp" in probe
         if is_webm:
-            # Remux fell back to WebM bytes — store under .webm so browsers get the right type.
             final_key = final_key.rsplit(".", 1)[0] + ".webm"
             await storage.upload_file(output, final_key, content_type="video/webm")
         elif is_mp4:
+            final_key = final_key.rsplit(".", 1)[0] + ".mp4"
             await storage.upload_file(output, final_key, content_type="video/mp4")
         else:
             raise MeetingAudioExtractionError(

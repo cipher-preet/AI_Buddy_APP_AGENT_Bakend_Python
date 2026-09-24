@@ -192,6 +192,8 @@ class Settings(BaseSettings):
     MEETING_FFMPEG_BIN: str = ""
     MEETING_FFMPEG_TIMEOUT_SECONDS: float = Field(default=60, ge=5, le=600)
     MEETING_MERGE_TIMEOUT_SECONDS: float = Field(default=300, ge=30, le=3600)
+    # Heavy libvpx/libx264 remux OOMs small workers (ffmpeg exit -9). Keep false in prod.
+    MEETING_MERGE_ALLOW_REENCODE: bool = False
     MEETING_S3_PREFIX: str = "meetings"
     MEETING_WORKER_CONCURRENCY: int | None = Field(default=None, ge=1, le=64)
     CLOUDFRONT_URL: str = ""

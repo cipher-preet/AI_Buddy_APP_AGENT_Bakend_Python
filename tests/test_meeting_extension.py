@@ -653,3 +653,45 @@ def test_resolve_ffmpeg_missing_raises(monkeypatch):
     finally:
         reset_ffmpeg_bin_cache()
 
+
+def test_concat_single_webm_chunk_skips_ffmpeg(tmp_path, monkeypatch):
+    from services.meeting_extension.ffmpeg_audio import concat_webm_chunks
+
+    async def fail_ffmpeg(*args, **kwargs):
+        raise AssertionError("single complete WebM must not invoke ffmpeg")
+
+    monkeypatch.setattr("services.meeting_extension.ffmpeg_audio._run_ffmpeg", fail_ffmpeg)
+    chunk = tmp_path / "000001.webm"
+    chunk.write_bytes(WEBM_EBML_ID + b"\x00" * 10_000)
+    out = tmp_path / "meeting.mp4"
+    result = asyncio.run(concat_webm_chunks([chunk], out))
+    assert result.suffix == ".webm"
+    assert result.exists()
+    assert has_webm_header(result.read_bytes()[:4])
+    assert result.stat().st_size > 8_192
+
+
+def test_concat_uses_stream_copy_without_h264_remux(tmp_path, monkeypatch):
+    from services.meeting_extension import ffmpeg_audio
+
+    calls: list[list[str]] = []
+
+    async def fake_run(command, *, timeout, allow_failure):
+        calls.append(command)
+        Path(command[-1]).write_bytes(WEBM_EBML_ID + b"\x00" * 10_000)
+        return None
+
+    monkeypatch.setattr(ffmpeg_audio, "_run_ffmpeg", fake_run)
+    monkeypatch.setattr(ffmpeg_audio.settings, "MEETING_MERGE_ALLOW_REENCODE", False)
+    a = tmp_path / "a.webm"
+    b = tmp_path / "b.webm"
+    a.write_bytes(WEBM_EBML_ID + WEBM_CLUSTER_ID + b"\x01" * 100)
+    b.write_bytes(WEBM_CLUSTER_ID + b"\x02" * 100)
+    out = tmp_path / "meeting.webm"
+    result = asyncio.run(ffmpeg_audio.concat_webm_chunks([a, b], out))
+    assert result.exists()
+    assert has_webm_header(result.read_bytes()[:4])
+    assert calls
+    joined = " ".join(calls[0])
+    assert "libx264" not in joined
+    assert "-c" in calls[0] and "copy" in calls[0]
