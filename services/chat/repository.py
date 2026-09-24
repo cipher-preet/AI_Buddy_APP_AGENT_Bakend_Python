@@ -43,10 +43,15 @@ class ChatRepository:
             if not session:
                 raise ValueError("Chat session not found")
             if not same_mongo_id(session.userId, user_id):
-                raise PermissionError("Chat session does not belong to this user or space")
-            if space_id is not None and not same_mongo_id(session.spaceId, space_id):
-                raise PermissionError("Chat session does not belong to this user or space")
-            session_space_id = space_id if space_id is not None else str(session.spaceId) if session.spaceId is not None else None
+                raise PermissionError("Chat session does not belong to this user")
+            # Space context on ask is request-scoped (tools/RAG). Do not reject an
+            # existing thread when the user adds/changes space context mid-chat.
+            # ask() will update session.spaceId when a primary space is provided.
+            session_space_id = (
+                space_id
+                if space_id is not None
+                else (str(session.spaceId) if session.spaceId is not None else None)
+            )
             if not is_native_object_id(session.id) or not is_native_object_id(session.userId):
                 await self.archive_session(session.id)
                 return await self.create_session(user_id, session_space_id)

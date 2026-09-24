@@ -3,20 +3,48 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+try:
+    # Windows Python installs often need the tzdata package for IANA names.
+    import tzdata  # noqa: F401
+except ImportError:
+    pass
+
 DEFAULT_TIMEZONE = "Asia/Kolkata"
 DATE_KEY_FORMAT = "%Y-%m-%d"
+IST = timezone(timedelta(hours=5, minutes=30))
+UTC = timezone.utc
+_FIXED_OFFSETS = {
+    "asia/kolkata": IST,
+    "asia/calcutta": IST,
+    "ist": IST,
+    "india": IST,
+    "utc": UTC,
+    "etc/utc": UTC,
+    "gmt": UTC,
+}
 
 
 class InvalidTimezoneError(ValueError):
     pass
 
 
-def resolve_zone(timezone_name: str | None) -> ZoneInfo:
+def resolve_zone(timezone_name: str | None):
+    """Return a tzinfo for the given IANA name, with IST/UTC fallbacks on Windows."""
     name = (timezone_name or DEFAULT_TIMEZONE).strip() or DEFAULT_TIMEZONE
     try:
         return ZoneInfo(name)
-    except Exception as error:
-        raise InvalidTimezoneError(f"Unsupported IANA timezone: {name}") from error
+    except Exception:
+        pass
+
+    key = name.casefold().replace(" ", "")
+    if key in _FIXED_OFFSETS:
+        return _FIXED_OFFSETS[key]
+
+    # Keep chat/day tools usable even when tzdata is missing.
+    if name == DEFAULT_TIMEZONE or key in {"asia/kolkata", "asia/calcutta", "ist"}:
+        return IST
+
+    raise InvalidTimezoneError(f"Unsupported IANA timezone: {name}")
 
 
 def ensure_utc(value: datetime) -> datetime:

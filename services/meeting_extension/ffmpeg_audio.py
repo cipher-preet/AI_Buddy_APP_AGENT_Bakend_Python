@@ -191,6 +191,7 @@ async def concat_webm_chunks(chunk_paths: list[Path], output_path: Path) -> Path
         "".join(f"file '{path.as_posix()}'\n" for path in normalized),
         encoding="utf-8",
     )
+    intermediate = output_path.with_name(f"{output_path.stem}.concat.webm")
     copy_error = await _run_ffmpeg(
         [
             "ffmpeg",
@@ -203,39 +204,106 @@ async def concat_webm_chunks(chunk_paths: list[Path], output_path: Path) -> Path
             str(list_file),
             "-c",
             "copy",
-            str(output_path),
+            str(intermediate),
         ],
         timeout=settings.MEETING_MERGE_TIMEOUT_SECONDS,
         allow_failure=True,
     )
-    if copy_error is None and output_path.exists() and output_path.stat().st_size > 0:
-        return output_path
-    reencode_error = await _run_ffmpeg(
+    if copy_error is not None or not intermediate.exists() or intermediate.stat().st_size <= 0:
+        reencode_error = await _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_file),
+                "-c:v",
+                "libvpx",
+                "-b:v",
+                "600k",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "48k",
+                str(intermediate),
+            ],
+            timeout=settings.MEETING_MERGE_TIMEOUT_SECONDS,
+            allow_failure=False,
+        )
+        if reencode_error:
+            raise reencode_error
+
+    # Remux to a browser-seekable MP4 when requested, otherwise rewrite WebM with cues.
+    if output_path.suffix.lower() == ".mp4":
+        remux_error = await _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                *_FFMPEG_INPUT_FLAGS,
+                "-i",
+                str(intermediate),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ],
+            timeout=settings.MEETING_MERGE_TIMEOUT_SECONDS,
+            allow_failure=True,
+        )
+        if remux_error is None and output_path.exists() and output_path.stat().st_size > 0:
+            return output_path
+
+    seekable_error = await _run_ffmpeg(
         [
             "ffmpeg",
             "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
+            *_FFMPEG_INPUT_FLAGS,
             "-i",
-            str(list_file),
+            str(intermediate),
             "-c:v",
             "libvpx",
             "-b:v",
-            "600k",
+            "800k",
+            "-deadline",
+            "good",
+            "-cpu-used",
+            "4",
+            "-auto-alt-ref",
+            "0",
             "-c:a",
             "libopus",
             "-b:a",
-            "48k",
-            str(output_path),
+            "64k",
+            "-f",
+            "webm",
+            str(output_path if output_path.suffix.lower() == ".webm" else intermediate),
         ],
         timeout=settings.MEETING_MERGE_TIMEOUT_SECONDS,
-        allow_failure=False,
+        allow_failure=True,
     )
-    if reencode_error:
-        raise reencode_error
-    return output_path
+    target = output_path if output_path.suffix.lower() == ".webm" else intermediate
+    if seekable_error is None and target.exists() and target.stat().st_size > 0:
+        if target != output_path:
+            output_path.write_bytes(target.read_bytes())
+        return output_path
+
+    # Do not ship a cue-less concat dump as "meeting.mp4" — Chromium then fails decode/seek.
+    raise MeetingAudioExtractionError(
+        "Could not produce a browser-playable recording (mp4/webm remux failed)",
+        corrupt=True,
+    )
 
 
 async def _run_ffmpeg(

@@ -55,6 +55,8 @@ class GlobalArtifactConsolidator:
                 "rules": [
                     "Do not invent owners, dates, numbers, or facts.",
                     "Do not fold every non-action meaning into a task and return notes=[].",
+                    "Do not return tasks=[] when ACTION candidates describe real intended work.",
+                    "Do not publish two tasks for the same work. Merge paraphrases.",
                     "A parent task plus distinct memory notes is correct.",
                     "Missing a real independent action, decision, or requirement is worse than a near-duplicate.",
                 ],

@@ -23,6 +23,11 @@ from services.conversation.meeting_pipeline.schemas import (
     VerifiedArtifact,
     VerifierVerdict,
 )
+from services.conversation.meeting_pipeline.task_eligibility import (
+    TaskEligibilityReviewer,
+    recover_unpublished_actions,
+    unique_task_claims,
+)
 from services.conversation.meeting_pipeline.verifier import ArtifactEvidenceVerifier
 from services.conversation.meeting_pipeline.windows import (
     build_extraction_windows,
@@ -50,6 +55,7 @@ async def run_meeting_pipeline(
     extractor: MeetingCandidateExtractor | None = None,
     consolidator: GlobalArtifactConsolidator | None = None,
     verifier: ArtifactEvidenceVerifier | None = None,
+    task_eligibility: TaskEligibilityReviewer | None = None,
     meeting_at: datetime | None = None,
 ) -> MeetingPipelineResult:
     started = time.perf_counter()
@@ -61,6 +67,8 @@ async def run_meeting_pipeline(
     extractor = extractor or MeetingCandidateExtractor(router)
     consolidator = consolidator or GlobalArtifactConsolidator(router)
     verifier = verifier or ArtifactEvidenceVerifier(router)
+    if task_eligibility is None and callable(getattr(router, "route", None)):
+        task_eligibility = TaskEligibilityReviewer(router)
     ledger = CandidateLedger()
     retries = 0
     window_counts: list[int] = []
@@ -113,6 +121,17 @@ async def run_meeting_pipeline(
                     )
 
         claims, summary, topics = await consolidator.consolidate(ledger, sequence_text)
+        consolidated_task_count = sum(1 for item in claims if item.kind == "task")
+        consolidated_note_count = sum(1 for item in claims if item.kind == "note")
+        # Recover unpublished intended work as Tasks before note recovery so ACTION
+        # candidates are not left stranded while notes stay on their own path.
+        claims, action_recovery = await recover_unpublished_actions(
+            claims,
+            ledger,
+            sequence_text,
+            reviewer=task_eligibility,
+        )
+        claims = unique_task_claims(claims)
         claims, recovered_notes = recover_unpublished_notes(claims, ledger, set(sequence_text))
         claims, composition = compose_artifacts(claims, ledger, set(sequence_text))
         verified = await verifier.verify(claims, sequence_text, meeting_at=meeting_at) if claims else []
@@ -138,6 +157,7 @@ async def run_meeting_pipeline(
         usage_records = list(usage)
         input_tokens = sum(int(item.get("inputTokens") or 0) for item in usage_records)
         output_tokens = sum(int(item.get("outputTokens") or 0) for item in usage_records)
+        eligibility_calls = int(getattr(task_eligibility, "calls", 0) or 0)
         observability = {
             "session_id": conversation_id,
             "window_count": len(windows),
@@ -150,9 +170,15 @@ async def run_meeting_pipeline(
             "emptyCandidateWindowRate": (useful_zero / len(windows)) if windows else 0.0,
             "usefulWindowsWithZeroCandidates": useful_zero,
             "total_candidate_count": len(ledger.candidates),
-            "consolidated_task_count": sum(1 for item in claims if item.kind == "task"),
-            "consolidated_note_count": sum(1 for item in claims if item.kind == "note"),
+            "consolidated_task_count": consolidated_task_count,
+            "consolidated_note_count": consolidated_note_count,
             "recovered_note_count": recovered_notes,
+            "recovered_task_count": int(action_recovery.get("recoveredTaskCount") or 0),
+            "pending_action_candidates": int(action_recovery.get("pendingActionCandidates") or 0),
+            "task_eligibility_reviewed": int(action_recovery.get("eligibilityReviewed") or 0),
+            "task_eligibility_approved": int(action_recovery.get("eligibilityApproved") or 0),
+            "task_eligibility_failed": int(action_recovery.get("eligibilityFailed") or 0),
+            "task_deterministic_fallback": int(action_recovery.get("deterministicFallback") or 0),
             "tasks_enriched": composition.get("tasksEnriched", 0),
             "notes_clustered": composition.get("notesClustered", 0),
             "composed_task_count": composition.get("composedTaskCount", 0),
@@ -167,6 +193,8 @@ async def run_meeting_pipeline(
             "extractor_model": extractor.last_model,
             "consolidator_provider": consolidator.last_provider,
             "consolidator_model": consolidator.last_model,
+            "task_eligibility_provider": getattr(task_eligibility, "last_provider", "none"),
+            "task_eligibility_model": getattr(task_eligibility, "last_model", "none"),
             "verifier_provider": verifier.last_provider,
             "verifier_model": verifier.last_model,
             "retry_count": retries,
@@ -174,9 +202,10 @@ async def run_meeting_pipeline(
             "processing_duration_ms": duration_ms,
             "extractor_calls": extractor.calls,
             "consolidator_calls": consolidator.calls,
+            "task_eligibility_calls": eligibility_calls,
             "verifier_calls": verifier.calls,
             "repair_calls": getattr(verifier, "repair_calls", 0),
-            "model_calls": extractor.calls + consolidator.calls + verifier.calls,
+            "model_calls": extractor.calls + consolidator.calls + eligibility_calls + verifier.calls,
             "transcript_sequence_count": len(sequence_text),
             "consolidator_cited_sequence_count": len(
                 {sequence for item in ledger.candidates for sequence in item.evidenceSequences}
@@ -224,7 +253,7 @@ async def run_meeting_pipeline(
             "artifactPipelineVersion": PIPELINE_VERSION,
             "pipelineMode": "meeting_pipeline",
             "eventSchemaVersion": "meeting-candidate-v1",
-            "promptVersion": "meeting-candidate-extractor-v1,meeting-artifact-consolidator-v1,meeting-evidence-verifier-v1",
+            "promptVersion": "meeting-candidate-extractor-v1,meeting-artifact-consolidator-v1,meeting-task-eligibility-v1,meeting-evidence-verifier-v1",
             "finalSynthesisInvoked": bool(ledger.candidates),
             "finalSynthesisVerdict": "PUBLISH" if tasks or notes else "NO_PUBLISHABLE_ARTIFACTS",
             "qualityAcceptedTaskCount": len(tasks),

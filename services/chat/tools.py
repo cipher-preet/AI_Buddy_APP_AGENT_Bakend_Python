@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from typing import Any
 
 from services.chat.planner import ChatQueryPlan
 from services.conversation.repository import ConversationRepository
+from services.daily_briefing.sources import ActivitySource
+from services.daily_briefing.timezones import DEFAULT_TIMEZONE, date_key_for, local_day_bounds_utc
 from services.db.mongo import get_database
 
 
@@ -13,8 +15,15 @@ class ChatToolRunner:
     def __init__(self, repository: ConversationRepository | None = None):
         self.repository = repository or ConversationRepository(get_database())
 
-    async def build_context(self, question: str, user_id: str, space_id: str | None, plan: ChatQueryPlan | None = None) -> str:
-        result = await self.run(question, user_id, space_id, plan)
+    async def build_context(
+        self,
+        question: str,
+        user_id: str,
+        space_id: str | None,
+        plan: ChatQueryPlan | None = None,
+        space_ids: list[str] | None = None,
+    ) -> str:
+        result = await self.run(question, user_id, space_id, plan, space_ids=space_ids)
         return str(result["context"])
 
     async def run(
@@ -23,8 +32,34 @@ class ChatToolRunner:
         user_id: str,
         space_id: str | None,
         plan: ChatQueryPlan | None = None,
+        space_ids: list[str] | None = None,
+        pending_write: dict[str, Any] | None = None,
+        auth_token: str | None = None,
     ) -> dict[str, Any]:
         plan = plan or ChatQueryPlan(understoodRequest=question, searchQueries=[question])
+        resolved_space_ids = _normalize_space_ids(space_id, space_ids)
+
+        # Create task/note/space/reminder/event before read tools.
+        has_pending_write = bool(pending_write and pending_write.get("type") == "complete_write")
+        if getattr(plan, "writeAction", "none") != "none" or has_pending_write:
+            from services.chat.actions import execute_write_action
+
+            write_result = await execute_write_action(
+                user_id=user_id,
+                question=question,
+                plan=plan,
+                space_ids=resolved_space_ids,
+                pending_write=pending_write,
+                auth_token=auth_token,
+            )
+            if write_result is not None:
+                # Mark provider as the specific write tool for observability.
+                tool_name = write_result.get("tool_name") or getattr(plan, "writeAction", "write")
+                write_result.setdefault("context", f"Tool:{tool_name}")
+                return write_result
+
+        primary_space_id = resolved_space_ids[0] if resolved_space_ids else None
+
         if plan.optionKind == "spaces" and (plan.responseMode == "list_options" or plan.requiresSpace):
             spaces = await self.repository.list_user_spaces(user_id)
             answer = _space_options_answer(spaces)
@@ -52,7 +87,21 @@ class ChatToolRunner:
                 "pending_action": None,
             }
 
-        if not space_id:
+        focus = set(plan.toolFocus or [])
+        wants_day = "day_summary" in focus or "calendar" in focus or "meetings" in focus
+        today = date_key_for(datetime.now(timezone.utc), DEFAULT_TIMEZONE)
+        target_date = plan.dateKey or today
+
+        if wants_day and not primary_space_id:
+            day_context = await self._day_activity_context(user_id, target_date, resolved_space_ids)
+            return {
+                "context": day_context,
+                "answer": None,
+                "direct": False,
+                "pending_action": None,
+            }
+
+        if not primary_space_id:
             if not _plan_needs_space(plan):
                 return {
                     "context": "Structured tools skipped: no spaceId was provided and this query does not require workspace tools.",
@@ -82,27 +131,50 @@ class ChatToolRunner:
                 "pending_action": None,
             }
 
-        today = datetime.now().astimezone().date().isoformat()
+        space_sections = await asyncio.gather(
+            *[self._space_sections(user_id, sid, plan, today) for sid in resolved_space_ids]
+        )
+        sections: list[str] = [f"Today: {today}", f"Active spaces: {', '.join(resolved_space_ids)}"]
+        if wants_day:
+            sections.append(await self._day_activity_context(user_id, target_date, resolved_space_ids))
+        for block in space_sections:
+            sections.extend(block["sections"])
+
+        context = "\n\n".join(section for section in sections if section.strip())
+        # Prefer LLM synthesis when multiple spaces or day reports are involved.
+        answer = None
+        if len(resolved_space_ids) == 1 and plan.directToolAnswerAllowed and not wants_day:
+            primary = space_sections[0]
+            answer = _direct_answer(
+                temporal_scope=plan.temporalScope,
+                today=today,
+                memory=primary["memory"],
+                summaries=primary["summaries"],
+                tasks=primary["tasks"],
+                notes=primary["notes"],
+                staged_tasks=primary["staged_tasks"],
+                staged_notes=primary["staged_notes"],
+                wants_summary=primary["wants_summary"],
+                wants_tasks=primary["wants_tasks"],
+                wants_notes=primary["wants_notes"],
+                include_all=primary["include_all"],
+            )
+        return {
+            "context": context,
+            "answer": answer,
+            "direct": bool(answer and (plan.directToolAnswerAllowed or not plan.useVectorSearch)),
+            "pending_action": None,
+        }
+
+    async def _space_sections(self, user_id: str, space_id: str, plan: ChatQueryPlan, today: str) -> dict[str, Any]:
         focus = set(plan.toolFocus or ["tasks", "notes", "summaries", "space_memory"])
         wants_notes = "notes" in focus
         wants_tasks = "tasks" in focus or "planning" in focus
-        wants_summary = bool({"summaries", "space_memory", "planning"} & focus)
+        wants_summary = bool({"summaries", "space_memory", "planning", "day_summary"} & focus)
         wants_decisions = "decisions" in focus
         wants_issues = "issues" in focus
-
         include_all = not plan.toolFocus
-        sections: list[str] = [f"Today: {today}"]
-
-        memory = None
-        user_profile: dict[str, Any] | None = None
-        stats: dict[str, int] | None = None
-        summaries: list[dict[str, Any]] = []
-        tasks: list[dict[str, Any]] = []
-        notes: list[dict[str, Any]] = []
-        staged_tasks: list[dict[str, Any]] = []
-        staged_notes: list[dict[str, Any]] = []
-        staged_decisions: list[dict[str, Any]] = []
-        staged_issues: list[dict[str, Any]] = []
+        sections: list[str] = [f"Space context: {space_id}"]
 
         calls: dict[str, Any] = {
             "user_profile": _maybe_call(self.repository, "get_user_profile", user_id),
@@ -123,10 +195,8 @@ class ChatToolRunner:
 
         results = await asyncio.gather(*calls.values())
         data = dict(zip(calls.keys(), results))
-
-        user_profile = data.get("user_profile")
         memory = data["memory"]
-        stats = data.get("stats")
+        memory_dump = memory.model_dump(by_alias=True) if hasattr(memory, "model_dump") else dict(memory or {})
         summaries = data.get("summaries") or []
         tasks = data.get("tasks") or []
         notes = data.get("notes") or []
@@ -135,10 +205,10 @@ class ChatToolRunner:
         staged_decisions = data.get("staged_decisions") or []
         staged_issues = data.get("staged_issues") or []
 
-        sections.append(_format_user_profile(user_profile))
-        sections.append(_format_space_stats(stats))
+        sections.append(_format_user_profile(data.get("user_profile")))
+        sections.append(_format_space_stats(data.get("stats")))
         if wants_summary or include_all:
-            sections.append(_format_space_memory(memory.model_dump(by_alias=True)))
+            sections.append(_format_space_memory(memory_dump))
             sections.append(_format_summaries(summaries))
         if wants_summary or wants_decisions or include_all:
             sections.append(_format_staged_decisions(staged_decisions))
@@ -151,27 +221,85 @@ class ChatToolRunner:
             sections.append(_format_notes(notes))
             sections.append(_format_staged_notes(staged_notes))
 
-        context = "\n\n".join(section for section in sections if section.strip())
-        answer = _direct_answer(
-            temporal_scope=plan.temporalScope,
-            today=today,
-            memory=memory.model_dump(by_alias=True),
-            summaries=summaries,
-            tasks=tasks,
-            notes=notes,
-            staged_tasks=staged_tasks,
-            staged_notes=staged_notes,
-            wants_summary=wants_summary,
-            wants_tasks=wants_tasks,
-            wants_notes=wants_notes,
-            include_all=include_all,
-        )
         return {
-            "context": context,
-            "answer": answer,
-            "direct": bool(answer and (plan.directToolAnswerAllowed or not plan.useVectorSearch)),
-            "pending_action": None,
+            "sections": sections,
+            "memory": memory_dump,
+            "summaries": summaries,
+            "tasks": tasks,
+            "notes": notes,
+            "staged_tasks": staged_tasks,
+            "staged_notes": staged_notes,
+            "wants_summary": wants_summary,
+            "wants_tasks": wants_tasks,
+            "wants_notes": wants_notes,
+            "include_all": include_all,
         }
+
+    async def _day_activity_context(
+        self,
+        user_id: str,
+        date_key: str,
+        space_ids: list[str] | None = None,
+    ) -> str:
+        period_start, period_end = local_day_bounds_utc(date_key, DEFAULT_TIMEZONE)
+        bundle = await ActivitySource(get_database()).load(user_id, date_key, period_start, period_end)
+        allowed = {sid for sid in (space_ids or []) if sid}
+
+        def _in_scope(item: dict[str, Any]) -> bool:
+            if not allowed:
+                return True
+            item_space = str(item.get("spaceId") or "")
+            return not item_space or item_space in allowed
+
+        transcripts = [item for item in bundle.transcripts if _in_scope(item)]
+        tasks = [item for item in bundle.tasks if _in_scope(item)]
+        notes = [item for item in bundle.notes if _in_scope(item)]
+        events = list(bundle.events)
+        reminders = list(bundle.reminders)
+
+        lines = [
+            f"Tool: day_activity dateKey={date_key} timezone={DEFAULT_TIMEZONE}",
+            f"Scope: {'selected spaces ' + ', '.join(sorted(allowed)) if allowed else 'all user activity'}",
+            f"Counts: transcripts={len(transcripts)} tasks={len(tasks)} notes={len(notes)} "
+            f"events={len(events)} reminders={len(reminders)} pendingTranscripts={bundle.pendingTranscriptCount}",
+        ]
+        if events:
+            lines.append("Calendar events:")
+            for event in events[:20]:
+                lines.append(
+                    f"- {event.get('title') or 'Untitled'} "
+                    f"({event.get('startTimeLabel') or '?'}–{event.get('endTimeLabel') or '?'})"
+                    + (f" @ {event.get('location')}" if event.get("location") else "")
+                )
+        if reminders:
+            lines.append("Reminders:")
+            for reminder in reminders[:20]:
+                lines.append(f"- {reminder.get('title') or 'Reminder'} at {reminder.get('timeLabel') or '?'}")
+        if tasks:
+            lines.append("Tasks touched / due:")
+            for task in tasks[:30]:
+                lines.append(
+                    f"- [{task.get('status') or 'open'}] {task.get('title') or 'Untitled'}"
+                    + (f" due {task.get('dueDate')}" if task.get("dueDate") else "")
+                )
+        if notes:
+            lines.append("Notes created:")
+            for note in notes[:20]:
+                body = str(note.get("detail") or note.get("body") or "").strip()
+                preview = body[:180] + ("…" if len(body) > 180 else "")
+                lines.append(f"- {note.get('title') or 'Untitled'}: {preview}")
+        if transcripts:
+            lines.append("Transcript highlights:")
+            for item in transcripts[:12]:
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                preview = text[:240] + ("…" if len(text) > 240 else "")
+                space = item.get("spaceId") or "unknown-space"
+                lines.append(f"- [{space}] {preview}")
+        if len(lines) <= 3:
+            lines.append("No saved activity found for this date.")
+        return "\n".join(lines)
 
 
 def _direct_answer(
@@ -410,7 +538,30 @@ def _english_missing_info_answer(plan: ChatQueryPlan) -> str:
 
 
 def _plan_needs_space(plan: ChatQueryPlan) -> bool:
+    write_action = getattr(plan, "writeAction", "none")
+    if write_action in {"create_space", "create_reminder", "create_event"}:
+        return False
+    if isinstance(write_action, str) and (
+        write_action.startswith("update_") or write_action.startswith("delete_")
+    ):
+        return False
+    if write_action in {"create_task", "create_note"}:
+        return True
+    focus = set(plan.toolFocus or [])
+    if focus & {"day_summary", "calendar", "meetings"}:
+        return False
     return plan.requiresSpace or plan.optionKind == "spaces" or bool(plan.toolFocus)
+
+
+def _normalize_space_ids(space_id: str | None, space_ids: list[str] | None) -> list[str]:
+    values: list[str] = []
+    for item in [*(space_ids or []), space_id]:
+        if not item:
+            continue
+        cleaned = str(item).strip()
+        if cleaned and cleaned not in values:
+            values.append(cleaned)
+    return values
 
 
 def _space_pending_action(question: str, spaces: list[dict[str, Any]], plan: ChatQueryPlan) -> dict[str, Any] | None:

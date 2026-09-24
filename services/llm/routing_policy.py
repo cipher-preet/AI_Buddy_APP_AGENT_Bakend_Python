@@ -4,10 +4,10 @@ from apps.api_gateway.config.setting import settings
 from services.llm.quota import ProviderQuota
 
 
-# Unrelated chat/normalization still use the free-tier chain. Conversation
-# intelligence no longer shares this order.
-CHAT_PROVIDER_ORDER = ("groq", "gemini", "mistral", "sarvam")
-NORMALIZATION_PROVIDER_ORDER = ("gemini", "groq", "mistral", "sarvam")
+# Buddy chat + query planning prefer Krutrim, then Mistral. Free-tier providers
+# remain as last-resort fallbacks only.
+CHAT_PROVIDER_ORDER = ("krutrim", "mistral", "groq", "gemini")
+NORMALIZATION_PROVIDER_ORDER = ("krutrim", "mistral", "groq", "gemini")
 CONVERSATION_INTELLIGENCE_FREE_PROVIDERS = ("groq", "gemini", "sarvam")
 
 CONVERSATION_INTELLIGENCE_CAPABILITY_VALUES = {
@@ -96,11 +96,11 @@ def provider_model_for(provider_name: str) -> str:
     if provider_name == "gemini":
         return settings.GEMINI_FREE_MODEL
     if provider_name == "mistral":
-        return settings.MISTRAL_CHEAP_MODEL
+        return settings.CHAT_MISTRAL_MODEL or settings.MISTRAL_CHEAP_MODEL
     if provider_name == "sarvam":
         return settings.SARVAM_DEFAULT_MODEL
     if provider_name == "krutrim":
-        return settings.CONVERSATION_SEMANTIC_MODEL
+        return settings.CHAT_KRUTRIM_MODEL or settings.CONVERSATION_SEMANTIC_MODEL
     return settings.LLM_DEFAULT_MODEL
 
 

@@ -16,23 +16,30 @@ class ChatRetriever:
         self.child_limit = child_limit
         self.parent_window = parent_window
 
-    async def retrieve(self, question: str, user_id: str, space_id: str | None = None) -> list[RetrievedContext]:
-        return await self.retrieve_many([question], user_id, space_id)
+    async def retrieve(
+        self,
+        question: str,
+        user_id: str,
+        space_id: str | None = None,
+        space_ids: list[str] | None = None,
+    ) -> list[RetrievedContext]:
+        return await self.retrieve_many([question], user_id, space_id, space_ids=space_ids)
 
     async def retrieve_many(
         self,
         queries: list[str],
         user_id: str,
         space_id: str | None = None,
+        space_ids: list[str] | None = None,
     ) -> list[RetrievedContext]:
         await ensure_collection_exists()
-        search_filter = _user_space_filter(user_id, space_id)
+        search_filter = _user_space_filter(user_id, space_id, space_ids)
         hits = []
         for query in _dedupe_queries(queries):
             query_vector = await generate_embedding(query)
             hits.extend(await _search_points(query_vector, search_filter, self.child_limit))
         children = [_context_from_hit(hit) for hit in hits]
-        parents = await self._expand_parent_context(children, user_id, space_id)
+        parents = await self._expand_parent_context(children, user_id, space_id, space_ids)
         merged = _rank_contexts(_dedupe_contexts([*children, *parents]), queries)
         return merged[: self.child_limit * (self.parent_window * 2 + 1)]
 
@@ -41,6 +48,7 @@ class ChatRetriever:
         children: list[RetrievedContext],
         user_id: str,
         space_id: str | None,
+        space_ids: list[str] | None = None,
     ) -> list[RetrievedContext]:
         by_job: dict[str, set[int]] = defaultdict(set)
         for child in children:
@@ -57,7 +65,7 @@ class ChatRetriever:
             if child.jobId is not None and child.chunkIndex is not None and child.score is not None
         }
         for job_id, indexes in by_job.items():
-            scroll_filter = _parent_filter(user_id, space_id, job_id, sorted(indexes))
+            scroll_filter = _parent_filter(user_id, space_id, job_id, sorted(indexes), space_ids)
             records, _ = await qdrant_client.scroll(
                 collection_name=QDRANT_COLLECTION,
                 scroll_filter=scroll_filter,
@@ -89,23 +97,41 @@ def format_context(contexts: list[RetrievedContext]) -> str:
     return "\n\n".join(lines)
 
 
-def _user_space_filter(user_id: str, space_id: str | None) -> Filter:
+def _user_space_filter(
+    user_id: str,
+    space_id: str | None,
+    space_ids: list[str] | None = None,
+) -> Filter:
     conditions = [
         FieldCondition(key="userId", match=MatchValue(value=user_id)),
     ]
-    if space_id is not None:
-        conditions.append(FieldCondition(key="spaceId", match=MatchValue(value=space_id)))
+    resolved = [sid for sid in [*(space_ids or []), space_id] if sid]
+    unique = list(dict.fromkeys(resolved))
+    if len(unique) == 1:
+        conditions.append(FieldCondition(key="spaceId", match=MatchValue(value=unique[0])))
+    elif len(unique) > 1:
+        conditions.append(FieldCondition(key="spaceId", match=MatchAny(any=unique)))
     return Filter(must=conditions)
 
 
-def _parent_filter(user_id: str, space_id: str | None, job_id: str, indexes: list[int]) -> Filter:
+def _parent_filter(
+    user_id: str,
+    space_id: str | None,
+    job_id: str,
+    indexes: list[int],
+    space_ids: list[str] | None = None,
+) -> Filter:
     conditions = [
         FieldCondition(key="userId", match=MatchValue(value=user_id)),
         FieldCondition(key="job_id", match=MatchValue(value=job_id)),
         FieldCondition(key="chunkIndex", match=MatchAny(any=indexes)),
     ]
-    if space_id is not None:
-        conditions.append(FieldCondition(key="spaceId", match=MatchValue(value=space_id)))
+    resolved = [sid for sid in [*(space_ids or []), space_id] if sid]
+    unique = list(dict.fromkeys(resolved))
+    if len(unique) == 1:
+        conditions.append(FieldCondition(key="spaceId", match=MatchValue(value=unique[0])))
+    elif len(unique) > 1:
+        conditions.append(FieldCondition(key="spaceId", match=MatchAny(any=unique)))
     return Filter(must=conditions)
 
 

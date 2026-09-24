@@ -35,12 +35,15 @@ async def process_meeting_video_merge(event: EventEnvelope) -> None:
         storage = get_s3_audio_storage()
         chunk_paths = []
         missing_sequences: list[int] = []
+        present_sequences: list[int] = []
         for sequence in range(1, expected + 1):
             destination = job_dir / f"{sequence:06d}.webm"
             try:
                 await _download_merge_chunk(storage, user_id, meeting_session_id, sequence, destination)
+                if not destination.exists() or destination.stat().st_size <= 0:
+                    raise MeetingAudioExtractionError("Downloaded chunk is empty", corrupt=True)
             except Exception:
-                # Late/missing uploads (often seq 1) must not fail the whole merge.
+                # Lost/empty chunks are skipped — final video continues from the next good chunk.
                 missing_sequences.append(sequence)
                 diag_log(
                     "meeting_video_merge_chunk_skipped",
@@ -50,19 +53,41 @@ async def process_meeting_video_merge(event: EventEnvelope) -> None:
                 )
                 continue
             chunk_paths.append(destination)
+            present_sequences.append(sequence)
         if not chunk_paths:
             raise MeetingAudioExtractionError("No uploaded video chunks available to merge", corrupt=True)
+        # Gap-tolerant: concat only present chunks in sequence order (already ascending).
         if missing_sequences:
             diag_log(
                 "meeting_video_merge_partial",
                 meetingSessionId=meeting_session_id,
                 userId=user_id,
                 missingSequences=missing_sequences,
+                presentSequences=present_sequences,
                 presentCount=len(chunk_paths),
+                expected=expected,
             )
-        output = job_dir / "meeting.webm"
+        output = job_dir / "meeting.mp4"
         await concat_webm_chunks(chunk_paths, output)
-        await storage.upload_file(output, final_key, content_type="video/webm")
+        if not output.exists() or output.stat().st_size < 8_192:
+            raise MeetingAudioExtractionError(
+                "Merged recording is empty or too small to play",
+                corrupt=True,
+            )
+        probe = output.read_bytes()[:64]
+        is_webm = probe.startswith(bytes([0x1A, 0x45, 0xDF, 0xA3]))
+        is_mp4 = b"ftyp" in probe
+        if is_webm:
+            # Remux fell back to WebM bytes — store under .webm so browsers get the right type.
+            final_key = final_key.rsplit(".", 1)[0] + ".webm"
+            await storage.upload_file(output, final_key, content_type="video/webm")
+        elif is_mp4:
+            await storage.upload_file(output, final_key, content_type="video/mp4")
+        else:
+            raise MeetingAudioExtractionError(
+                "Merged recording is not a recognized MP4/WebM container",
+                corrupt=True,
+            )
         now = datetime.now(timezone.utc)
         await db.meeting_sessions.update_one(
             {"_id": _oid(meeting_session_id)},
@@ -71,6 +96,8 @@ async def process_meeting_video_merge(event: EventEnvelope) -> None:
                     "videoMergeStatus": "COMPLETED",
                     "finalRecordingS3Key": final_key,
                     "updatedAt": now,
+                    "mergeMissingSequences": missing_sequences,
+                    "mergePresentChunkCount": len(chunk_paths),
                 }
             },
         )

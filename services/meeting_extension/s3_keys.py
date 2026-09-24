@@ -24,7 +24,7 @@ def meeting_chunk_object_key(
 
 def meeting_final_object_key(user_id: str, meeting_session_id: str) -> str:
     prefix = settings.MEETING_S3_PREFIX.strip().strip("/") or "meetings"
-    return f"{prefix}/{sanitize_key_part(user_id)}/{sanitize_key_part(meeting_session_id)}/meeting.webm"
+    return f"{prefix}/{sanitize_key_part(user_id)}/{sanitize_key_part(meeting_session_id)}/meeting.mp4"
 
 
 def validate_meeting_object_key(*, object_key: str, user_id: str, meeting_session_id: str) -> str:

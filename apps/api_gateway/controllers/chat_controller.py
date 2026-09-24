@@ -9,15 +9,19 @@ async def ask_chat_controller(
     user_id: str,
     question: str,
     space_id: str | None = None,
+    space_ids: list[str] | None = None,
     chat_id: str | None = None,
+    auth_token: str | None = None,
 ):
     return {
         "success": True,
         "data": await ChatService().ask(
             user_id=user_id,
             space_id=space_id,
+            space_ids=space_ids,
             chat_id=chat_id,
             question=question,
+            auth_token=auth_token,
         ),
     }
 

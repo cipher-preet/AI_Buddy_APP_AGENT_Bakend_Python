@@ -92,6 +92,10 @@ class MeetingConsolidatorResponse(BaseModel):
     topics: list[str] = Field(default_factory=list)
 
 
+class MeetingTaskEligibilityResponse(BaseModel):
+    tasks: list[ConsolidatedTaskItem] = Field(default_factory=list)
+
+
 class ArtifactClaim(BaseModel):
     artifactKey: str
     kind: Literal["task", "note"]

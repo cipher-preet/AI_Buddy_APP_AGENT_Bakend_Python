@@ -71,6 +71,13 @@ class Settings(BaseSettings):
     KRUTRIM_API_KEY: SecretStr | str = ""
     KRUTRIM_BASE_URL: str = "https://cloud.olakrutrim.com/v1"
 
+    # Buddy desktop/web chat answer + planner models (no OpenAI/ChatGPT).
+    CHAT_KRUTRIM_MODEL: str = "gemma-4-31b-it"
+    CHAT_MISTRAL_MODEL: str = "ministral-14b-latest"
+
+    # Node Buddy API used by chat write tools (create task/note/space/reminder/event).
+    NODE_API_BASE_URL: str = "http://127.0.0.1:5000"
+
     CONVERSATION_SEMANTIC_PROVIDER: str = "krutrim"
     CONVERSATION_SEMANTIC_MODEL: str = "gemma-4-31b-it"
     CONVERSATION_SYNTHESIS_PROVIDER: str = "krutrim"

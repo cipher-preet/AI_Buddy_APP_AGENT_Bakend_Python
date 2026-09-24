@@ -505,6 +505,11 @@ class ConversationProcessingWorkflow:
                 "extractor_calls",
                 "consolidator_calls",
                 "verifier_calls",
+                "recovered_task_count",
+                "recovered_note_count",
+                "pending_action_candidates",
+                "task_eligibility_calls",
+                "task_eligibility_failed",
             )},
             **diagnostics,
         }

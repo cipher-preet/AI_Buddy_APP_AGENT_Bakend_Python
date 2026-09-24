@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from apps.api_gateway.controllers.chat_controller import (
@@ -16,7 +16,9 @@ class AskChatRequest(BaseModel):
     userId: str
     question: str = Field(min_length=1)
     spaceId: str | None = None
+    spaceIds: list[str] = Field(default_factory=list)
     chatId: str | None = None
+    authToken: str | None = None
 
 
 class CreateChatSessionRequest(BaseModel):
@@ -30,13 +32,21 @@ async def create_chat_session(request: CreateChatSessionRequest):
 
 
 @router.post("/ask")
-async def ask_chat(request: AskChatRequest):
+async def ask_chat(
+    request: AskChatRequest,
+    authorization: str | None = Header(default=None),
+):
+    auth_token = request.authToken
+    if not auth_token and authorization and authorization.lower().startswith("bearer "):
+        auth_token = authorization[7:].strip()
     return await _call(
         ask_chat_controller(
             user_id=request.userId,
             space_id=request.spaceId,
+            space_ids=request.spaceIds,
             chat_id=request.chatId,
             question=request.question,
+            auth_token=auth_token,
         )
     )
 

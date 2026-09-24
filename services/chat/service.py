@@ -24,23 +24,34 @@ from services.llm.models import LLMMessage, LLMRequest, StructuredLLMRequest
 from services.llm.router import LLMCapability, get_llm_router
 
 
-SYSTEM_PROMPT = """You are Buddy's chat assistant.
+SYSTEM_PROMPT = """You are Buddy — the user's personal companion and workspace co-pilot.
+You have access to their spaces, tasks, notes, meeting transcripts, embeddings, calendar events, reminders, and past chat turns when those tools return context.
+You can also create tasks, notes, spaces, reminders, and calendar events when the user asks.
 Answer in English only, even when the user asks in Hindi, Hinglish, or any other language.
-Use the retrieved context as evidence. The context may be in Hindi, English, or mixed language; translate and reason over it internally.
-Use structured tool context as the authoritative source for tasks, notes, today/due-date questions, unfinished work, recent summaries, and space memory.
-For topic-specific questions, combine structured tool context with retrieved transcript context. If they differ, explain only what is supported and prefer saved structured task/note fields for task status and due dates.
-For general knowledge, drafting, education, or note-generation requests that do not ask about the user's saved workspace data, answer from your general knowledge.
-If the user asks about their saved workspace data and the answer is not supported by the retrieved context or chat history, say what is missing and ask a concise follow-up.
-Be direct, useful, and avoid inventing facts.
-Never return an empty response.
-Never include raw source IDs, chunk numbers, citations, source lists, or verbatim retrieved context in the final answer.
-Do not add a Source, Sources, Evidence, Context, or References section."""
+
+How to answer:
+- First respect any selected space context. If one or more spaces are in context, prioritize evidence from those spaces and use that spaceId when creating tasks or notes.
+- If no space context is provided and the question is general (knowledge, drafting, casual chat), answer from general knowledge without inventing personal facts.
+- When structured tools already created something, confirm clearly what was saved (title, space, due date/time). Do not pretend you created something if tools did not.
+- For day summaries, meeting reports, and "what happened today" questions: synthesize structured day activity + transcript evidence into a clear, polished brief. Lead with the headline of the day, then key meetings/outcomes, open tasks, and notable notes. Keep it concise but useful — not a raw dump.
+- For space overviews: cover what the space is about (memory/summary), current unfinished work, recent notes, and risks/decisions if present.
+- Use structured tool context as authoritative for tasks, notes, due dates, calendar, and space memory.
+- Use retrieved transcript embeddings for what was discussed, said, decided, or explained.
+- If structured data and transcripts conflict, prefer structured fields for status/due dates and say what each source supports.
+- Never invent tasks, meetings, notes, or quotes. If evidence is thin, say so briefly and ask one precise follow-up.
+- Be direct, warm, and optimized for action. Prefer short sections and bullets when summarizing.
+- Never return an empty response.
+- Never include raw source IDs, chunk numbers, citations, source lists, or verbatim retrieved context dumps.
+- Do not add a Source, Sources, Evidence, Context, or References section."""
 
 
 class ChatState(TypedDict):
     user_id: str
     space_id: str | None
+    space_ids: list[str]
     question: str
+    pending_write: dict[str, Any] | None
+    auth_token: str | None
     plan: ChatQueryPlan | None
     search_queries: list[str]
     history: list[BaseMessage]
@@ -80,10 +91,20 @@ class ChatService:
         session = await self.repository.create_session(user_id, space_id)
         return _session_response(session)
 
-    async def ask(self, user_id: str, question: str, space_id: str | None = None, chat_id: str | None = None) -> dict[str, Any]:
+    async def ask(
+        self,
+        user_id: str,
+        question: str,
+        space_id: str | None = None,
+        space_ids: list[str] | None = None,
+        chat_id: str | None = None,
+        auth_token: str | None = None,
+    ) -> dict[str, Any]:
         user_id = user_id.strip()
-        space_id = space_id.strip() if space_id else None
         question = question.strip()
+        auth_token = (auth_token or "").strip() or None
+        resolved_space_ids = _normalize_request_space_ids(space_id, space_ids)
+        space_id = resolved_space_ids[0] if resolved_space_ids else None
         if not user_id:
             raise ValueError("userId is required")
         if not question:
@@ -100,12 +121,22 @@ class ChatService:
         session_space_id = str(session.spaceId) if session.spaceId is not None else None
         effective_space_id = space_id
         effective_question = question
+        pending_write = (
+            dict(session.pendingAction)
+            if session.pendingAction and session.pendingAction.get("type") == "complete_write"
+            else None
+        )
+        resolved_from_select = False
         if not effective_space_id:
-            effective_space_id, effective_question = self._resolve_pending_action(
+            selected_space_id, selected_question = self._resolve_pending_action(
                 question,
                 None,
                 session.pendingAction,
             )
+            if selected_space_id:
+                effective_space_id = selected_space_id
+                effective_question = selected_question
+                resolved_from_select = True
         if not effective_space_id:
             effective_space_id, effective_question = await self._resolve_space_from_message_or_history(
                 question,
@@ -114,16 +145,36 @@ class ChatService:
             )
         if not effective_space_id:
             effective_space_id = session_space_id
-        if effective_space_id:
+        effective_space_ids = list(resolved_space_ids)
+        if effective_space_id and effective_space_id not in effective_space_ids:
+            effective_space_ids = [effective_space_id, *effective_space_ids]
+
+        if resolved_from_select:
             await self.repository.clear_pending_action(session.id)
-            if not session_space_id or session_space_id != effective_space_id:
-                await self.repository.set_session_space(session.id, effective_space_id)
+
+        if effective_space_id and (
+            not session_space_id or session_space_id != effective_space_id
+        ):
+            await self.repository.set_session_space(session.id, effective_space_id)
+
+        # Continue an incomplete create (e.g. user replied with only the space name).
+        if pending_write:
+            original = str(pending_write.get("originalQuestion") or "").strip()
+            write_action = str(pending_write.get("writeAction") or "")
+            if write_action == "create_space" and question and "space" not in question.lower():
+                effective_question = f"{original or 'create a space'} called {question}".strip()
+            elif original and question.lower() not in original.lower():
+                effective_question = f"{original} {question}".strip()
+
         result = await self._invoke_graph(
             {
                 "user_id": user_id,
                 "space_id": effective_space_id,
+                "space_ids": effective_space_ids,
                 "question": effective_question,
                 "history": history,
+                "pending_write": pending_write,
+                "auth_token": auth_token,
             }
         )
         if HumanMessage is None or AIMessage is None:
@@ -134,10 +185,10 @@ class ChatService:
                 AIMessage(content=result["answer"]),
             ]
         )
-        pending_action = _merge_pending_space_action(session.pendingAction, result.get("pendingAction"))
+        pending_action = _merge_pending_action(session.pendingAction, result.get("pendingAction"))
         if pending_action:
             await self.repository.set_pending_action(session.id, pending_action)
-        elif effective_space_id or session.pendingAction:
+        else:
             await self.repository.clear_pending_action(session.id)
         await self.repository.sync_message_count(session.id)
         return {
@@ -228,7 +279,10 @@ class ChatService:
         state: ChatState = {
             "user_id": inputs["user_id"],
             "space_id": inputs.get("space_id"),
+            "space_ids": list(inputs.get("space_ids") or []),
             "question": inputs["question"],
+            "pending_write": inputs.get("pending_write"),
+            "auth_token": inputs.get("auth_token"),
             "plan": None,
             "search_queries": [inputs["question"]],
             "history": history,
@@ -262,22 +316,58 @@ class ChatService:
         workflow.add_node("run_tools", self._run_tools_node)
         workflow.add_node("generate", self._generate_node)
         workflow.set_entry_point("plan_query")
-        workflow.add_edge("plan_query", "expand_query")
+        # Write tools skip RAG for speed: plan -> tools -> generate.
+        workflow.add_conditional_edges(
+            "plan_query",
+            self._route_after_plan,
+            {
+                "write": "run_tools",
+                "read": "expand_query",
+            },
+        )
         workflow.add_edge("expand_query", "retrieve")
         workflow.add_edge("retrieve", "run_tools")
         workflow.add_edge("run_tools", "generate")
         workflow.add_edge("generate", END)
         return workflow.compile()
 
+    def _route_after_plan(self, state: ChatState) -> str:
+        plan = state.get("plan")
+        pending_write = state.get("pending_write")
+        if pending_write and pending_write.get("type") == "complete_write":
+            return "write"
+        if plan and getattr(plan, "writeAction", "none") != "none":
+            return "write"
+        return "read"
+
     async def _fallback_graph(self, state: ChatState) -> ChatState:
         state = await self._plan_query_node(state)
-        state = await self._expand_query_node(state)
-        state = await self._retrieve_node(state)
+        if self._route_after_plan(state) == "read":
+            state = await self._expand_query_node(state)
+            state = await self._retrieve_node(state)
+        else:
+            state["search_queries"] = [state["question"]]
+            state["context_text"] = "Vector retrieval skipped for write tool."
         state = await self._run_tools_node(state)
         return await self._generate_node(state)
 
     async def _plan_query_node(self, state: ChatState) -> ChatState:
-        state["plan"] = await plan_chat_query(state["question"], state["space_id"])
+        state["plan"] = await plan_chat_query(
+            state["question"],
+            state["space_id"],
+            space_ids=state.get("space_ids") or [],
+        )
+        pending_write = state.get("pending_write")
+        if pending_write and pending_write.get("type") == "complete_write":
+            action = str(pending_write.get("writeAction") or "none")
+            if action != "none" and state["plan"] is not None:
+                state["plan"].writeAction = action  # type: ignore[assignment]
+                state["plan"].useStructuredTools = True
+                state["plan"].useVectorSearch = False
+                state["plan"].directToolAnswerAllowed = True
+                state["plan"].requiresSpace = False
+                state["plan"].optionKind = "none"
+                state["plan"].responseMode = "answer"
         return state
 
     async def _expand_query_node(self, state: ChatState) -> ChatState:
@@ -295,6 +385,7 @@ class ChatService:
             state["search_queries"],
             state["user_id"],
             state["space_id"],
+            space_ids=state.get("space_ids") or [],
         )
         state["context_text"] = format_context(contexts)
         return state
@@ -305,6 +396,9 @@ class ChatService:
             state["user_id"],
             state["space_id"],
             state.get("plan"),
+            space_ids=state.get("space_ids") or [],
+            pending_write=state.get("pending_write"),
+            auth_token=state.get("auth_token"),
         )
         state["tool_context"] = str(result.get("context") or "")
         answer = result.get("answer")
@@ -316,7 +410,11 @@ class ChatService:
     async def _generate_node(self, state: ChatState) -> ChatState:
         if state.get("tool_direct") and state.get("tool_answer"):
             state["answer"] = str(state["tool_answer"]).strip()
-            state["provider"] = "structured-tools"
+            tool_hint = ""
+            context = str(state.get("tool_context") or "")
+            if context.startswith("Write tool") or "Write tool completed:" in context:
+                tool_hint = "write-tool"
+            state["provider"] = tool_hint or "structured-tools"
             state["model"] = "workspace-direct-answer"
             state["usage"] = {}
             return state
@@ -366,8 +464,12 @@ class ChatService:
 
 
 def _build_llm_messages(state: ChatState) -> list[LLMMessage]:
+    space_ids = state.get("space_ids") or ([] if not state.get("space_id") else [state["space_id"]])
+    space_label = ", ".join(space_ids) if space_ids else "none (general mode)"
     messages: list[LLMMessage] = [
         LLMMessage(role="system", content=SYSTEM_PROMPT),
+        LLMMessage(role="system", content=f"Active space context: {space_label}"),
+        LLMMessage(role="system", content=f"Understood request: {(state.get('plan').understoodRequest if state.get('plan') else state['question'])}"),
         LLMMessage(role="system", content=f"Search queries used: {state['search_queries']}"),
         LLMMessage(role="system", content=f"Structured tool context:\n{state['tool_context']}"),
         LLMMessage(role="system", content=f"Structured draft answer, if any:\n{state.get('tool_answer') or 'none'}"),
@@ -376,6 +478,17 @@ def _build_llm_messages(state: ChatState) -> list[LLMMessage]:
     messages.extend(_langchain_memory_to_llm_messages(state["history"][-20:]))
     messages.append(LLMMessage(role="user", content=state["question"]))
     return messages
+
+
+def _normalize_request_space_ids(space_id: str | None, space_ids: list[str] | None) -> list[str]:
+    values: list[str] = []
+    for item in [*(space_ids or []), space_id]:
+        if not item:
+            continue
+        cleaned = str(item).strip()
+        if cleaned and cleaned not in values:
+            values.append(cleaned)
+    return values
 
 
 async def _build_multilingual_search_queries(question: str) -> list[str]:
@@ -565,31 +678,21 @@ def _last_non_selection_user_request(history: list[BaseMessage]) -> str | None:
     return None
 
 
+def _merge_pending_action(
+    existing: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Prefer the newest pending action from this turn. None means clear."""
+    if current is not None:
+        return current
+    return None
+
+
 def _merge_pending_space_action(
     existing: dict[str, Any] | None,
     current: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    if not current:
-        return None
-    if not existing:
-        return current
-    if existing.get("type") != "select_option" or current.get("type") != "select_option":
-        return current
-    if existing.get("optionKind") != "spaces" or current.get("optionKind") != "spaces":
-        return current
-
-    current_plan = current.get("plan") or {}
-    if current_plan.get("responseMode") != "list_options":
-        return current
-
-    merged = dict(current)
-    previous_question = existing.get("originalQuestion")
-    previous_plan = existing.get("plan")
-    if previous_question:
-        merged["originalQuestion"] = previous_question
-    if previous_plan:
-        merged["plan"] = previous_plan
-    return merged
+    return _merge_pending_action(existing, current)
 
 
 def _sanitize_public_answer(answer: str) -> str:
