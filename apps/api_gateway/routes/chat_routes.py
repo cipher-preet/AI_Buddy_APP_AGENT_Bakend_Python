@@ -19,16 +19,18 @@ class AskChatRequest(BaseModel):
     spaceIds: list[str] = Field(default_factory=list)
     chatId: str | None = None
     authToken: str | None = None
+    meetingId: str | None = None
 
 
 class CreateChatSessionRequest(BaseModel):
     userId: str
     spaceId: str | None = None
+    meetingId: str | None = None
 
 
 @router.post("/sessions")
 async def create_chat_session(request: CreateChatSessionRequest):
-    return await _call(create_chat_session_controller(request.userId, request.spaceId))
+    return await _call(create_chat_session_controller(request.userId, request.spaceId, request.meetingId))
 
 
 @router.post("/ask")
@@ -47,6 +49,7 @@ async def ask_chat(
             chat_id=request.chatId,
             question=request.question,
             auth_token=auth_token,
+            meeting_id=request.meetingId,
         )
     )
 
@@ -55,10 +58,11 @@ async def ask_chat(
 async def list_chat_sessions(
     user_id: str = Query(..., alias="userId"),
     space_id: str | None = Query(default=None, alias="spaceId"),
+    meeting_id: str | None = Query(default=None, alias="meetingId"),
     limit: int = Query(default=20, ge=1, le=100),
     cursor: str | None = Query(default=None),
 ):
-    return await _call(list_chats_controller(user_id, space_id, limit, cursor))
+    return await _call(list_chats_controller(user_id, space_id, limit, cursor, meeting_id))
 
 
 @router.get("/sessions/{session_id}")

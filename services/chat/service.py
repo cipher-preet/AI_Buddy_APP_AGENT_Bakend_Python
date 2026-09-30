@@ -83,11 +83,23 @@ class ChatService:
         self.retriever = retriever or ChatRetriever()
         self.tool_runner = tool_runner or ChatToolRunner()
 
-    async def create_chat_session(self, user_id: str, space_id: str | None = None) -> dict[str, Any]:
+    async def create_chat_session(
+        self,
+        user_id: str,
+        space_id: str | None = None,
+        meeting_id: str | None = None,
+    ) -> dict[str, Any]:
         user_id = user_id.strip()
         space_id = space_id.strip() if space_id else None
+        meeting_id = meeting_id.strip() if meeting_id else None
         if not user_id:
             raise ValueError("userId is required")
+        if meeting_id:
+            from services.chat.meeting.context import MeetingContextLoader
+
+            context = await MeetingContextLoader(self.repository.db).load(user_id, meeting_id)
+            session = await self.repository.create_session(user_id, space_id or context.space_id, meeting_id=meeting_id)
+            return _session_response(session)
         session = await self.repository.create_session(user_id, space_id)
         return _session_response(session)
 
@@ -99,10 +111,27 @@ class ChatService:
         space_ids: list[str] | None = None,
         chat_id: str | None = None,
         auth_token: str | None = None,
+        meeting_id: str | None = None,
     ) -> dict[str, Any]:
         user_id = user_id.strip()
         question = question.strip()
         auth_token = (auth_token or "").strip() or None
+        meeting_id = (meeting_id or "").strip() or None
+        if not meeting_id and chat_id:
+            existing = await self.repository.get_session(chat_id)
+            if existing and existing.meetingId is not None:
+                meeting_id = str(existing.meetingId)
+        if meeting_id:
+            from services.chat.meeting import MeetingChatService
+
+            return await MeetingChatService(repository=self.repository).ask(
+                user_id=user_id,
+                meeting_id=meeting_id,
+                question=question,
+                space_ids=_normalize_request_space_ids(space_id, space_ids),
+                chat_id=chat_id,
+                auth_token=auth_token,
+            )
         resolved_space_ids = _normalize_request_space_ids(space_id, space_ids)
         space_id = resolved_space_ids[0] if resolved_space_ids else None
         if not user_id:
@@ -261,9 +290,16 @@ class ChatService:
         space_id: str | None = None,
         limit: int = 20,
         cursor: str | None = None,
+        meeting_id: str | None = None,
     ) -> dict[str, Any]:
         page_size = max(1, min(limit, 100))
-        sessions = await self.repository.list_sessions(user_id, space_id, page_size + 1, cursor)
+        sessions = await self.repository.list_sessions(
+            user_id,
+            space_id,
+            page_size + 1,
+            cursor,
+            meeting_id=(meeting_id or "").strip() or None,
+        )
         visible_sessions = sessions[:page_size]
         has_more = len(sessions) > page_size
         return {
@@ -739,6 +775,7 @@ def _session_response(session) -> dict[str, Any]:
         "id": str(session.id),
         "userId": str(session.userId),
         "spaceId": None if session.spaceId is None else str(session.spaceId),
+        "meetingId": None if session.meetingId is None else str(session.meetingId),
         "title": session.title,
         "status": session.status,
         "messageCount": session.messageCount,

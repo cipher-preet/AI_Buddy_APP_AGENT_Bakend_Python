@@ -5,7 +5,7 @@ from apps.api_gateway.config.setting import settings
 from services.daily_briefing.log import briefing_log
 from services.daily_briefing.pipeline import DailyBriefingPipeline, PendingTranscriptError
 from services.daily_briefing.prepare import filter_and_order_transcripts
-from services.daily_briefing.schemas import SourceStats
+from services.daily_briefing.schemas import PIPELINE_VERSION, SourceStats
 from services.daily_briefing.sources import ActivitySource
 from services.daily_briefing.store import DailyBriefingStore
 from services.daily_briefing.timezones import local_day_bounds_utc
@@ -13,12 +13,21 @@ from services.observability.diagnostics import briefing_duplicates, diag_log
 from services.queue.streams import EventEnvelope, NonRetryableQueueError
 
 
+def default_pipeline():
+    if settings.DAILY_BRIEFING_PIPELINE_VERSION == "v2":
+        from services.daily_briefing.pipeline_v2 import DailyBriefingPipelineV2
+
+        return DailyBriefingPipelineV2()
+    return DailyBriefingPipeline()
+
+
 class DailyBriefingJobHandler:
-    def __init__(self, database, pipeline: DailyBriefingPipeline | None = None):
+    def __init__(self, database, pipeline=None):
         self.database = database
         self.store = DailyBriefingStore(database)
         self.sources = ActivitySource(database)
-        self.pipeline = pipeline or DailyBriefingPipeline()
+        self.pipeline = pipeline or default_pipeline()
+        self.pipeline_version = getattr(self.pipeline, "version", PIPELINE_VERSION)
 
     async def handle(self, event: EventEnvelope) -> None:
         payload = event.payload or {}
@@ -69,7 +78,13 @@ class DailyBriefingJobHandler:
                 finish_status = claim_state
                 return
             try:
-                bundle = await self.sources.load(user_id, date_key, period_start, period_end)
+                bundle = await self.sources.load(
+                    user_id,
+                    date_key,
+                    period_start,
+                    period_end,
+                    include_plan_context=self.pipeline_version != PIPELINE_VERSION,
+                )
                 allow_pending = event.attempt >= settings.DAILY_BRIEFING_MAX_RETRIES
                 useful_transcripts = filter_and_order_transcripts(bundle.transcripts)
                 has_activity = bool(
@@ -79,6 +94,12 @@ class DailyBriefingJobHandler:
                     or bundle.events
                     or bundle.reminders
                 )
+                if not has_activity and self.pipeline_version != PIPELINE_VERSION:
+                    has_activity = bool(
+                        filter_and_order_transcripts(bundle.chats)
+                        or bundle.planEvents
+                        or bundle.planReminders
+                    )
                 if bundle.pendingTranscriptCount > 0 and not allow_pending:
                     raise PendingTranscriptError(
                         f"pending_transcripts={bundle.pendingTranscriptCount}"
@@ -113,6 +134,7 @@ class DailyBriefingJobHandler:
                     period_end,
                     synthesis,
                     stats,
+                    pipeline_version=self.pipeline_version,
                 )
                 transcript_count = stats.transcriptCount
                 finish_status = "READY"

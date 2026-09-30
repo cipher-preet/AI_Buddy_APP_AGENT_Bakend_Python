@@ -104,6 +104,14 @@ class FakeCollection:
                 seeded = {**query, **copy.deepcopy(payload)}
                 self.docs.append(seeded)
 
+    async def delete_one(self, query):
+        async with self._lock:
+            for index, doc in enumerate(self.docs):
+                if _match(doc, query):
+                    del self.docs[index]
+                    return type("DeleteResult", (), {"deleted_count": 1})()
+            return type("DeleteResult", (), {"deleted_count": 0})()
+
     async def find_one_and_update(self, query, update, return_document=None):
         async with self._lock:
             payload = update.get("$set", {})

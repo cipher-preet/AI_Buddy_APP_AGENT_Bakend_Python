@@ -65,6 +65,7 @@ class ChatRepository:
             "status": "active",
             "_id": {"$type": "objectId"},
             "messageCount": {"$lte": MAX_CHAT_MESSAGES - 2},
+            "meetingId": None,
         }
         if space_id is not None:
             query["spaceId"] = to_mongo_id(space_id)
@@ -76,8 +77,57 @@ class ChatRepository:
             return ChatSessionDocument.model_validate(document)
         return await self.create_session(user_id, space_id)
 
-    async def create_session(self, user_id: str, space_id: str | None) -> ChatSessionDocument:
-        session = ChatSessionDocument(userId=to_mongo_id(user_id), spaceId=to_mongo_id(space_id))
+    async def get_or_create_meeting_session(
+        self,
+        user_id: str,
+        meeting_id: str,
+        space_id: str | None,
+        chat_id: str | None = None,
+    ) -> ChatSessionDocument:
+        if chat_id:
+            session = await self.get_session(chat_id)
+            if not session:
+                raise ValueError("Chat session not found")
+            if not same_mongo_id(session.userId, user_id):
+                raise PermissionError("Chat session does not belong to this user")
+            if session.meetingId is not None and not same_mongo_id(session.meetingId, meeting_id):
+                raise ValueError("Chat session belongs to a different meeting")
+            if session.meetingId is None:
+                await self.db.chat_sessions.update_one(
+                    _id_query(session.id),
+                    {"$set": {"meetingId": to_mongo_id(meeting_id), "updatedAt": utc_now()}},
+                )
+                session.meetingId = to_mongo_id(meeting_id)
+            if session.status == "active" and session.messageCount + 2 <= MAX_CHAT_MESSAGES:
+                return session
+            await self.archive_session(session.id)
+            return await self.create_session(user_id, space_id, meeting_id=meeting_id)
+
+        document = await self.db.chat_sessions.find_one(
+            {
+                "userId": to_mongo_id(user_id),
+                "meetingId": to_mongo_id(meeting_id),
+                "status": "active",
+                "_id": {"$type": "objectId"},
+                "messageCount": {"$lte": MAX_CHAT_MESSAGES - 2},
+            },
+            sort=[("updatedAt", -1)],
+        )
+        if document:
+            return ChatSessionDocument.model_validate(document)
+        return await self.create_session(user_id, space_id, meeting_id=meeting_id)
+
+    async def create_session(
+        self,
+        user_id: str,
+        space_id: str | None,
+        meeting_id: str | None = None,
+    ) -> ChatSessionDocument:
+        session = ChatSessionDocument(
+            userId=to_mongo_id(user_id),
+            spaceId=to_mongo_id(space_id),
+            meetingId=to_mongo_id(meeting_id),
+        )
         await self.db.chat_sessions.insert_one(session.model_dump(by_alias=True))
         return session
 
@@ -133,10 +183,12 @@ class ChatRepository:
         space_id: str | None = None,
         limit: int = 20,
         cursor: str | None = None,
+        meeting_id: str | None = None,
     ) -> list[ChatSessionDocument]:
         query: dict[str, Any] = {
             "userId": to_mongo_id(user_id),
             "_id": {"$type": "objectId"},
+            "meetingId": to_mongo_id(meeting_id) if meeting_id else None,
         }
         if space_id is not None:
             query["spaceId"] = to_mongo_id(space_id)

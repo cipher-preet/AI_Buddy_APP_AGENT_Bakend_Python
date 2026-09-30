@@ -177,7 +177,7 @@ def test_atomic_event_extraction_routes_through_semantic_extraction():
     assert capability_for_stage(PipelineStage.SEMANTIC_COMPLETENESS) == LLMCapability.SEMANTIC_EXTRACTION
     assert LLMCapability.SEMANTIC_EXTRACTION in router.requested
     assert LLMCapability.FINAL_SYNTHESIS not in router.requested
-    assert _candidate_models(_ci_router(), LLMCapability.SEMANTIC_EXTRACTION) == ["gemma-4-31b-it"]
+    assert _candidate_models(_ci_router(), LLMCapability.SEMANTIC_EXTRACTION) == ["gpt-oss-120b", "gemma-4-31b-it"]
 
 
 def test_final_synthesis_routes_through_high_accuracy_reasoning():
@@ -216,18 +216,18 @@ def test_validation_routes_through_validation_capability():
     assert models[-1] == settings.CONVERSATION_VALIDATION_MODEL
 
 
-def test_event_pipeline_evidence_validation_prefers_gpt_oss_20b():
+def test_event_pipeline_evidence_validation_prefers_gpt_oss_120b():
     assert capability_for_stage(PipelineStage.VALIDATION) == LLMCapability.VALIDATION
     models = _candidate_models(_ci_router(), LLMCapability.VALIDATION)
     names = _candidate_names(_ci_router(), LLMCapability.VALIDATION)
     provider, model = _ci_router().route(LLMCapability.VALIDATION)
     assert names[0] == "krutrim"
-    assert models[0] == "gpt-oss-20b"
-    assert model == "gpt-oss-20b"
+    assert models[0] == "gpt-oss-120b"
+    assert model == "gpt-oss-120b"
     assert getattr(provider, "name", None) == "krutrim"
     assert names[-1] == settings.CONVERSATION_VALIDATION_PROVIDER
     assert models[-1] == settings.CONVERSATION_VALIDATION_MODEL
-    assert models[-1] != "gpt-oss-20b" or len(models) == 1
+    assert models[-1] != "gpt-oss-120b" or len(models) == 1
 
 
 def test_provider_failure_uses_existing_fallback_chain():
@@ -257,10 +257,10 @@ def test_context_overflow_does_not_discard_fitting_fallback(monkeypatch):
     monkeypatch.setattr(
         settings,
         "LLM_MODEL_CONTEXT_TOKENS",
-        "gpt-oss-20b:2000,gemma-4-31b-it:131072,ministral-14b-latest:262144",
+        "gpt-oss-120b:2000,gemma-4-31b-it:131072,ministral-14b-latest:262144",
     )
     router = _ci_router()
-    primary_budget = safe_input_budget("krutrim", model="gpt-oss-20b")
+    primary_budget = safe_input_budget("krutrim", model="gpt-oss-120b")
     fallback_budget = safe_input_budget("krutrim", model="gemma-4-31b-it")
     assert primary_budget < fallback_budget
     estimated = primary_budget + 500
@@ -271,10 +271,10 @@ def test_context_overflow_does_not_discard_fitting_fallback(monkeypatch):
     assert isinstance(provider, FallbackLLMProvider)
     models = [item.model for item in provider.candidates]
     assert "gemma-4-31b-it" in models
-    assert models[0] != "gpt-oss-20b" or primary_budget >= estimated
+    assert models[0] != "gpt-oss-120b" or primary_budget >= estimated
     if primary_budget < estimated <= fallback_budget:
         assert models[0] == "gemma-4-31b-it"
-        assert "gpt-oss-20b" not in models
+        assert "gpt-oss-120b" not in models
 
 
 def test_malformed_structured_output_retries_fallback():
@@ -284,11 +284,11 @@ def test_malformed_structured_output_retries_fallback():
     wrapped = FallbackLLMProvider(
         "krutrim",
         [
-            LLMRouteCandidate(provider=failing, model="gpt-oss-20b"),
+            LLMRouteCandidate(provider=failing, model="gpt-oss-120b"),
             LLMRouteCandidate(provider=backup, model="gemma-4-31b-it"),
         ],
     )
-    router.route = lambda capability: (wrapped, "gpt-oss-20b")  # type: ignore[method-assign]
+    router.route = lambda capability: (wrapped, "gpt-oss-120b")  # type: ignore[method-assign]
     router._cost_optimized_candidates = lambda capability: []  # type: ignore[method-assign]
     response, provider, model = asyncio.run(
         generate_structured_for_stage(
@@ -354,7 +354,7 @@ def test_event_pipeline_does_not_hardcode_provider_api_calls():
     assert "router.route(" in routing
     assert "capability_for_stage" in routing
     tree = ast.parse((root / "events.py").read_text(encoding="utf-8"))
-    hardcoded_models = {"gemma-4-31b-it", "gpt-oss-20b"}
+    hardcoded_models = {"gemma-4-31b-it", "gpt-oss-120b"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and node.value in hardcoded_models:
             raise AssertionError("events.py hardcodes a concrete model")
@@ -421,8 +421,8 @@ def test_model_route_logs_use_intended_capability_names():
     assert capability_log_name(PipelineStage.THREAD_HARD) == "HIGH_ACCURACY_REASONING"
     assert capability_log_name(PipelineStage.VALIDATION) == "VALIDATION"
     assert stage_log_name(PipelineStage.ATOMIC_EVENTS) == "atomic_event_extraction"
-    assert _candidate_models(_ci_router(), LLMCapability.SEMANTIC_EXTRACTION) == ["gemma-4-31b-it"]
-    assert _candidate_models(_ci_router(), LLMCapability.FINAL_SYNTHESIS)[0] == "gpt-oss-20b"
+    assert _candidate_models(_ci_router(), LLMCapability.SEMANTIC_EXTRACTION) == ["gpt-oss-120b", "gemma-4-31b-it"]
+    assert _candidate_models(_ci_router(), LLMCapability.FINAL_SYNTHESIS)[0] == "gpt-oss-120b"
     assert _candidate_models(_ci_router(), LLMCapability.VALIDATION)[0] == settings.CONVERSATION_VALIDATION_FALLBACK_MODEL
     assert _candidate_models(_ci_router(), LLMCapability.VALIDATION)[-1] == settings.CONVERSATION_VALIDATION_MODEL
 
@@ -450,9 +450,9 @@ def test_schema_is_not_weakened_for_invalid_output():
     router = _llm_router(krutrim=failing)
     wrapped = FallbackLLMProvider(
         "krutrim",
-        [LLMRouteCandidate(provider=failing, model="gpt-oss-20b")],
+        [LLMRouteCandidate(provider=failing, model="gpt-oss-120b")],
     )
-    router.route = lambda capability: (wrapped, "gpt-oss-20b")  # type: ignore[method-assign]
+    router.route = lambda capability: (wrapped, "gpt-oss-120b")  # type: ignore[method-assign]
     router._cost_optimized_candidates = lambda capability: []  # type: ignore[method-assign]
     try:
         asyncio.run(

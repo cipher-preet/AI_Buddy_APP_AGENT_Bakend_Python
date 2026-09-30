@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from apps.api_gateway.config.setting import settings
 from services.chat.planner import ChatQueryPlan
 from services.chat.write_tools import WRITE_TOOL_NAMES, ChatWriteToolRegistry, tool_catalog_for_prompt
 from services.chat.writes import ChatWriteStore
@@ -125,11 +126,36 @@ async def extract_write_spec(
             ),
         ],
     )
+    strong = await _strong_write_spec(request)
+    if strong is not None:
+        return _normalize_spec(strong, planned_action, today, plan)
     try:
         spec = await provider.generate_structured(request, ChatWriteSpec)
         return _normalize_spec(spec, planned_action, today, plan)
     except Exception:
         return emergency
+
+
+async def _strong_write_spec(request: StructuredLLMRequest) -> ChatWriteSpec | None:
+    """Try the reasoning model first; None means fall back to the chat route."""
+    krutrim = get_llm_router().providers.get("krutrim")
+    if not settings.CHAT_WRITE_MODEL or krutrim is None or getattr(krutrim, "configured", True) is False:
+        return None
+    extra_body = {"reasoning_effort": settings.CHAT_WRITE_REASONING_EFFORT} if settings.CHAT_WRITE_REASONING_EFFORT else {}
+    strong_request = request.model_copy(
+        update={
+            "model": settings.CHAT_WRITE_MODEL,
+            "max_tokens": max(request.max_tokens or 0, 2000),
+            "metadata": {**request.metadata, "extra_body": extra_body},
+        },
+        deep=True,
+    )
+    try:
+        spec = await krutrim.generate_structured(strong_request, ChatWriteSpec)
+    except Exception as error:
+        print("Chat write strong model failed:", {"model": settings.CHAT_WRITE_MODEL, "error": str(error)[:300]})
+        return None
+    return spec if isinstance(spec, ChatWriteSpec) else None
 
 
 async def execute_write_action(

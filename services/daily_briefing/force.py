@@ -7,13 +7,14 @@ from apps.api_gateway.config.setting import settings
 from services.daily_briefing.jobs import DailyBriefingJobHandler
 from services.daily_briefing.log import briefing_log
 from services.daily_briefing.scheduler import resolve_user_timezone
-from services.daily_briefing.store import DailyBriefingStore
+from services.daily_briefing.schemas import BriefingStatus
+from services.daily_briefing.store import DailyBriefingStore, is_stale_for_requeue
 from services.daily_briefing.timezones import (
     date_key_for,
     local_day_bounds_utc,
     previous_date_key,
 )
-from services.queue.streams import EventEnvelope
+from services.queue.streams import EventEnvelope, RedisStreamProducer
 
 
 async def _run_force_job(database, event: EventEnvelope) -> None:
@@ -30,12 +31,26 @@ async def _run_force_job(database, event: EventEnvelope) -> None:
         )
 
 
+async def _dispatch(database, event: EventEnvelope) -> None:
+    """Queue to the briefing worker (it holds the LLM keys); run in-process only if publishing fails."""
+    try:
+        await RedisStreamProducer().publish(settings.REDIS_DAILY_BRIEFING_STREAM, event)
+    except Exception as error:
+        briefing_log(
+            "daily_briefing_force_publish_failed",
+            userId=event.userId,
+            jobId=event.eventId,
+            error=f"{type(error).__name__}: {str(error)[:200]}",
+        )
+        asyncio.create_task(_run_force_job(database, event))
+
+
 async def force_generate_daily_briefing(
     database,
     *,
     user_id: str,
     date_key: str | None = None,
-    period: str = "today",
+    period: str = "yesterday",
 ) -> dict:
     """
     Temporary test helper: delete any existing briefing for the target day,
@@ -75,7 +90,25 @@ async def force_generate_daily_briefing(
 
     period_start, period_end = local_day_bounds_utc(target_date, timezone_name)
     store = DailyBriefingStore(database)
-    await store.delete(user_id, target_date)
+    existing = await store.get(user_id, target_date)
+    status = (existing or {}).get("status")
+    if status == BriefingStatus.READY.value or (
+        status in {BriefingStatus.PENDING.value, BriefingStatus.PROCESSING.value}
+        and not is_stale_for_requeue(existing)
+    ):
+        return {
+            "userId": user_id,
+            "dateKey": target_date,
+            "timezone": timezone_name,
+            "status": status,
+            "forced": False,
+            "message": "Briefing already exists or is being generated.",
+        }
+    force_count = int((existing or {}).get("forceCount") or 0)
+    if force_count >= settings.DAILY_BRIEFING_FORCE_DAILY_LIMIT:
+        raise PermissionError("Daily briefing regenerate limit reached for this day.")
+    if existing is not None and status != BriefingStatus.FAILED.value:
+        await store.delete(user_id, target_date)
     reserved = await store.reserve(
         user_id,
         target_date,
@@ -85,6 +118,7 @@ async def force_generate_daily_briefing(
     )
     if not reserved:
         raise RuntimeError("Could not reserve daily briefing for force generate.")
+    await store.set_force_count(user_id, target_date, force_count + 1)
 
     event = EventEnvelope(
         eventType="daily.briefing.requested",
@@ -108,7 +142,7 @@ async def force_generate_daily_briefing(
         jobId=event.eventId,
         period=period,
     )
-    asyncio.create_task(_run_force_job(database, event))
+    await _dispatch(database, event)
     return {
         "userId": user_id,
         "dateKey": target_date,

@@ -12,9 +12,9 @@ router = APIRouter()
 class ForceGenerateBody(BaseModel):
     userId: str = Field(min_length=1)
     date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    # today = best for manual testing with recent activity
     # yesterday = same day the midnight scheduler would use
-    period: str = Field(default="today", pattern=r"^(today|yesterday)$")
+    # today = manual testing only; a READY "today" briefing blocks the midnight run for that day
+    period: str = Field(default="yesterday", pattern=r"^(today|yesterday)$")
 
 
 @router.get("")

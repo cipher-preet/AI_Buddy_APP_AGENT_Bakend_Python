@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 from typing import Awaitable, Callable
 
+from apps.api_gateway.config.setting import settings
 from services.llm.models import LLMMessage, StructuredLLMRequest
 from services.llm.router import LLMCapability, get_llm_router
 from services.prompts.loader import load_prompt
@@ -204,7 +205,10 @@ async def extract_with_krutrim(
     now: datetime,
 ) -> ReminderExtractorResponse | None:
     router = get_llm_router()
-    provider, model = router.route(LLMCapability.SEMANTIC_EXTRACTION)
+    provider = router.providers.get("krutrim")
+    model = settings.REMINDER_EXTRACTION_MODEL
+    if provider is None or getattr(provider, "configured", True) is False:
+        provider, model = router.route(LLMCapability.SEMANTIC_EXTRACTION)
     payload = {
         "now": now.isoformat(),
         "timezone": str(now.tzinfo or "Asia/Kolkata"),

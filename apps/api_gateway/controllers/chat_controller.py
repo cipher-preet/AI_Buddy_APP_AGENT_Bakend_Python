@@ -1,8 +1,15 @@
 from services.chat.service import ChatService
 
 
-async def create_chat_session_controller(user_id: str, space_id: str | None = None):
-    return {"success": True, "data": await ChatService().create_chat_session(user_id, space_id)}
+async def create_chat_session_controller(
+    user_id: str,
+    space_id: str | None = None,
+    meeting_id: str | None = None,
+):
+    return {
+        "success": True,
+        "data": await ChatService().create_chat_session(user_id, space_id, meeting_id=meeting_id),
+    }
 
 
 async def ask_chat_controller(
@@ -12,6 +19,7 @@ async def ask_chat_controller(
     space_ids: list[str] | None = None,
     chat_id: str | None = None,
     auth_token: str | None = None,
+    meeting_id: str | None = None,
 ):
     return {
         "success": True,
@@ -22,6 +30,7 @@ async def ask_chat_controller(
             chat_id=chat_id,
             question=question,
             auth_token=auth_token,
+            meeting_id=meeting_id,
         ),
     }
 
@@ -35,5 +44,9 @@ async def list_chats_controller(
     space_id: str | None = None,
     limit: int = 20,
     cursor: str | None = None,
+    meeting_id: str | None = None,
 ):
-    return {"success": True, "data": await ChatService().list_chats(user_id, space_id, limit, cursor)}
+    return {
+        "success": True,
+        "data": await ChatService().list_chats(user_id, space_id, limit, cursor, meeting_id=meeting_id),
+    }

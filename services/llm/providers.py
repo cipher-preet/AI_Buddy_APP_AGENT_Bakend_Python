@@ -92,7 +92,7 @@ def build_krutrim_provider() -> OpenAICompatibleProvider | NotConfiguredProvider
         name="krutrim",
         api_key=settings.secret_value(settings.KRUTRIM_API_KEY),
         base_url=base_url,
-        default_model=settings.CONVERSATION_SEMANTIC_MODEL,
+        default_model=settings.KRUTRIM_DEFAULT_MODEL,
         timeout_seconds=max(settings.LLM_TIMEOUT_SECONDS, 180),
         max_retries=settings.SARVAM_MAX_RETRIES,
         max_concurrency=settings.LLM_MAX_CONCURRENCY,

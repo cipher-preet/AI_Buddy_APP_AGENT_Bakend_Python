@@ -78,24 +78,37 @@ class Settings(BaseSettings):
     # Node Buddy API used by chat write tools (create task/note/space/reminder/event).
     NODE_API_BASE_URL: str = "http://127.0.0.1:5000"
 
+    # Default Krutrim model for callers that do not pick one (chat, planner, reminders).
+    KRUTRIM_DEFAULT_MODEL: str = "gemma-4-31b-it"
+    # Task/note extraction (window extraction, meeting extractor, task eligibility).
     CONVERSATION_SEMANTIC_PROVIDER: str = "krutrim"
-    CONVERSATION_SEMANTIC_MODEL: str = "gemma-4-31b-it"
+    CONVERSATION_SEMANTIC_MODEL: str = "gpt-oss-120b"
+    CONVERSATION_SEMANTIC_FALLBACK_PROVIDER: str = "krutrim"
+    CONVERSATION_SEMANTIC_FALLBACK_MODEL: str = "gemma-4-31b-it"
+    # Buddy chat "create/update task or note" argument extraction; empty = chat route.
+    CHAT_WRITE_MODEL: str = "gpt-oss-120b"
+    CHAT_WRITE_REASONING_EFFORT: str = "low"
+    # Voice reminder turns need a fast, non-reasoning model (256-token budget).
+    REMINDER_EXTRACTION_MODEL: str = "gemma-4-31b-it"
     CONVERSATION_SYNTHESIS_PROVIDER: str = "krutrim"
-    # Krutrim retired gpt-oss-120b (404). Use gpt-oss-20b for synthesis structured JSON.
-    CONVERSATION_SYNTHESIS_MODEL: str = "gpt-oss-20b"
+    CONVERSATION_SYNTHESIS_MODEL: str = "gpt-oss-120b"
     CONVERSATION_SYNTHESIS_FALLBACK_PROVIDER: str = "krutrim"
     CONVERSATION_SYNTHESIS_FALLBACK_MODEL: str = "gemma-4-31b-it"
-    # VALIDATION capability prefers gpt-oss-20b (FALLBACK_* below), then this pair.
+    # VALIDATION capability prefers gpt-oss-120b (FALLBACK_* below), then this pair.
     CONVERSATION_VALIDATION_PROVIDER: str = "mistral"
     CONVERSATION_VALIDATION_MODEL: str = "ministral-14b-latest"
     CONVERSATION_VALIDATION_FALLBACK_PROVIDER: str = "krutrim"
-    CONVERSATION_VALIDATION_FALLBACK_MODEL: str = "gpt-oss-20b"
+    CONVERSATION_VALIDATION_FALLBACK_MODEL: str = "gpt-oss-120b"
 
     QDRANT_API_KEY: SecretStr | str = ""
     QDRANT_URL: str = "http://localhost:6333"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     VECTOR_SIZE: int = Field(default=1536, gt=0)
     QDRANT_COLLECTION: str = "speech_chunks"
+    MEETING_CHAT_QDRANT_COLLECTION: str = "meeting_transcript_chunks"
+    MEETING_CHAT_CHUNK_CHARS: int = Field(default=900, ge=200, le=4000)
+    MEETING_CHAT_FULL_CONTEXT_CHARS: int = Field(default=24000, ge=0, le=200000)
+    MEETING_CHAT_TOP_K: int = Field(default=10, ge=1, le=50)
 
     REDIS_AUDIO_STREAM: str = "buddy:audio:ingestion"
     REDIS_STT_STREAM: str = "buddy:stt:jobs"
@@ -129,8 +142,40 @@ class Settings(BaseSettings):
     DAILY_BRIEFING_SCAN_INTERVAL_SECONDS: int = Field(default=20, ge=5, le=3600)
     DAILY_BRIEFING_WINDOW_TARGET_TOKENS: int = Field(default=5000, ge=200, le=100000)
     DAILY_BRIEFING_WINDOW_MAX_TOKENS: int = Field(default=7000, ge=200, le=120000)
+    # "v2" = work-planning briefing (chat + backlog + next-day agenda, grounded output).
+    DAILY_BRIEFING_PIPELINE_VERSION: str = "v2"
+    # Briefing-only model chains as "provider:model" lists, tried in order.
+    DAILY_BRIEFING_SYNTHESIS_MODELS: str = "krutrim:gpt-oss-120b,krutrim:gemma-4-31b-it"
+    DAILY_BRIEFING_WINDOW_MODELS: str = "krutrim:gpt-oss-120b,krutrim:gemma-4-31b-it"
+    DAILY_BRIEFING_SYNTHESIS_MAX_OUTPUT_TOKENS: int = Field(default=8000, ge=1000, le=32000)
+    DAILY_BRIEFING_WINDOW_MAX_OUTPUT_TOKENS: int = Field(default=4000, ge=500, le=16000)
+    # Below this many timeline tokens the raw day goes straight to synthesis (no map stage).
+    DAILY_BRIEFING_DIRECT_SYNTHESIS_TOKENS: int = Field(default=12000, ge=0, le=60000)
+    DAILY_BRIEFING_OPEN_TASK_LIMIT: int = Field(default=40, ge=5, le=200)
+    DAILY_BRIEFING_CHAT_MESSAGE_LIMIT: int = Field(default=300, ge=0, le=2000)
+    DAILY_BRIEFING_REASONING_EFFORT: str = "low"
     # Temporary test hook for the mobile "Generate now" button. Disable in real prod.
+    # Post-recording calendar event + reminder extraction (two independent LLM pipelines).
+    SCHEDULE_EXTRACTION_ENABLED: bool = True
+    REDIS_SCHEDULE_EXTRACTION_STREAM: str = "buddy:conversation:schedule-extraction"
+    REDIS_SCHEDULE_EXTRACTION_GROUP: str = "schedule-extraction-workers"
+    SCHEDULE_EXTRACTION_CONCURRENCY: int = Field(default=4, ge=1, le=64)
+    SCHEDULE_EXTRACTION_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
+    SCHEDULE_EXTRACTION_MODELS: str = "krutrim:gpt-oss-120b,krutrim:gemma-4-31b-it"
+    SCHEDULE_EXTRACTION_MAX_OUTPUT_TOKENS: int = Field(default=3000, ge=500, le=16000)
+    SCHEDULE_EXTRACTION_REASONING_EFFORT: str = "low"
+    SCHEDULE_EXTRACTION_WINDOW_TOKENS: int = Field(default=6000, ge=500, le=60000)
+    SCHEDULE_EXTRACTION_MAX_WINDOWS: int = Field(default=24, ge=1, le=200)
+    SCHEDULE_EXTRACTION_WINDOW_CONCURRENCY: int = Field(default=4, ge=1, le=32)
+    SCHEDULE_EXTRACTION_MIN_CONFIDENCE: float = Field(default=0.6, ge=0.0, le=1.0)
+    SCHEDULE_EXTRACTION_MAX_ITEMS: int = Field(default=20, ge=1, le=200)
+    SCHEDULE_EXTRACTION_AI_CALLING: bool = True
+    SCHEDULE_EXTRACTION_MEETING_REMIND_BEFORE_MINUTES: int = Field(default=15, ge=0, le=1440)
+    SCHEDULE_EXTRACTION_DEADLINE_REMIND_BEFORE_MINUTES: int = Field(default=60, ge=0, le=1440)
+    REMINDER_PAYLOAD_TTL_SECONDS: int = Field(default=14 * 24 * 60 * 60, ge=60)
     DAILY_BRIEFING_ALLOW_FORCE_GENERATE: bool = True
+    # Each forced run is a paid LLM call; READY briefings are never regenerated.
+    DAILY_BRIEFING_FORCE_DAILY_LIMIT: int = Field(default=3, ge=1, le=50)
 
     REDIS_CLAIM_IDLE_MS: int = 60000
     REDIS_BLOCK_MS: int = 5000
@@ -285,7 +330,7 @@ class Settings(BaseSettings):
     SPARSE_WINDOW_MIN_USEFUL_TOKENS: int = Field(default=4, ge=1, le=500)
     LLM_PROVIDER_CONTEXT_TOKENS: str = "groq:8192,gemini:1048576,mistral:262144,sarvam:32768,openai:128000,anthropic:200000,krutrim:65536"
     # Model-specific context windows. Krutrim values come from GET /v1/models context_length.
-    LLM_MODEL_CONTEXT_TOKENS: str = "gemma-4-31b-it:131072,gpt-oss-20b:131072,ministral-14b-latest:262144,ministral-14b-2512:262144"
+    LLM_MODEL_CONTEXT_TOKENS: str = "gemma-4-31b-it:131072,gpt-oss-120b:131072,gpt-oss-20b:131072,ministral-14b-latest:262144,ministral-14b-2512:262144"
     WINDOW_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=180, ge=15, le=3600)
     STT_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=300, ge=30, le=3600)
     FINALIZATION_MAX_RETRIES: int = Field(default=8, ge=1, le=50)
@@ -328,7 +373,7 @@ class Settings(BaseSettings):
     LLM_MAX_CONCURRENCY: int = 8
     LLM_TEMPERATURE: float = 0.1
     LLM_STRUCTURED_MAX_TOKENS: int = 4096
-    LLM_EXTRACTION_OUTPUT_MAX_TOKENS: int = Field(default=4096, ge=512, le=16000)
+    LLM_EXTRACTION_OUTPUT_MAX_TOKENS: int = Field(default=8192, ge=512, le=16000)
     LLM_SYNTHESIS_OUTPUT_START_TOKENS: int = Field(default=8192, ge=512, le=32768)
     LLM_SYNTHESIS_OUTPUT_MAX_TOKENS: int = Field(default=16000, ge=512, le=32768)
 

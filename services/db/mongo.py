@@ -39,6 +39,26 @@ async def close_mongo_client() -> None:
         _client_loop_id = None
 
 
+async def _ensure_schedule_extraction_indexes(database: AsyncIOMotorDatabase) -> None:
+    # Optional hardening on top of fingerprint upserts; never block worker startup.
+    fingerprint = IndexModel(
+        [("sourceFingerprint", ASCENDING)],
+        unique=True,
+        partialFilterExpression={"sourceFingerprint": {"$type": "string"}},
+    )
+    try:
+        await database.reminders.create_indexes([fingerprint])
+        await database.calendar_events.create_indexes([fingerprint])
+        await database.schedule_extractions.create_indexes(
+            [
+                IndexModel([("conversationId", ASCENDING)], unique=True),
+                IndexModel([("status", ASCENDING), ("updatedAt", ASCENDING)]),
+            ]
+        )
+    except Exception as error:
+        print(f"Schedule extraction index creation failed: {type(error).__name__}: {error}", flush=True)
+
+
 async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
     database = db or get_database()
 
@@ -189,6 +209,7 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
             IndexModel([("scheduledOccurrenceId", ASCENDING)], sparse=True),
         ]
     )
+    await _ensure_schedule_extraction_indexes(database)
     await database.device_tokens.create_indexes(
         [
             IndexModel([("token", ASCENDING)], unique=True),

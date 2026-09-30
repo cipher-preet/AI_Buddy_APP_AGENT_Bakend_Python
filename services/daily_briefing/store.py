@@ -101,6 +101,12 @@ class DailyBriefingStore:
         result = await self.collection.delete_one({"userId": user_id, "dateKey": date_key})
         return bool(getattr(result, "deleted_count", 0))
 
+    async def set_force_count(self, user_id: str, date_key: str, count: int) -> None:
+        await self.collection.update_one(
+            {"userId": user_id, "dateKey": date_key},
+            {"$set": {"forceCount": count}},
+        )
+
     async def get(self, user_id: str, date_key: str) -> dict[str, Any] | None:
         return await self.collection.find_one(
             {"userId": user_id, "dateKey": date_key},
@@ -232,6 +238,7 @@ class DailyBriefingStore:
         period_end: datetime,
         synthesis: DailyBriefingSynthesis,
         stats: SourceStats,
+        pipeline_version: str = PIPELINE_VERSION,
     ) -> DailyBriefingDocument:
         now = utc_now()
         document = DailyBriefingDocument(
@@ -256,7 +263,13 @@ class DailyBriefingStore:
             tasks=synthesis.tasks,
             meetings=synthesis.meetings,
             missedCandidates=synthesis.missedCandidates,
+            focus=synthesis.focus,
+            agenda=synthesis.agenda,
+            risks=synthesis.risks,
+            stats=synthesis.stats,
+            planDateKey=synthesis.planDateKey,
             sourceStats=stats,
+            pipelineVersion=pipeline_version,
             generatedAt=now,
             updatedAt=now,
         )

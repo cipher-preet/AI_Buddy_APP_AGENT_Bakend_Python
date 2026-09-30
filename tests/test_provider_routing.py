@@ -114,44 +114,45 @@ def _candidate_models(router: LLMRouter, capability: LLMCapability) -> list[str]
     return [item.model for item in router._cost_optimized_candidates(capability)]
 
 
-def test_semantic_extraction_selects_krutrim_gemma():
+def test_semantic_extraction_selects_krutrim_gpt_oss_120b_with_gemma_fallback():
     router = _ci_router()
     for capability in (LLMCapability.HIGH_ACCURACY_REASONING, LLMCapability.SEMANTIC_EXTRACTION):
         names = _candidate_names(router, capability)
         models = _candidate_models(router, capability)
         provider, model = router.route(capability)
-        assert names == ["krutrim"]
-        assert models == ["gemma-4-31b-it"]
+        assert names == ["krutrim", "krutrim"]
+        assert models == ["gpt-oss-120b", "gemma-4-31b-it"]
         assert getattr(provider, "name", None) == "krutrim"
-        assert model == "gemma-4-31b-it"
-    assert conversation_route_spec(LLMCapability.SIMPLE_SUMMARY) == [("krutrim", "gemma-4-31b-it")]
-    assert conversation_route_spec(LLMCapability.SEMANTIC_EXTRACTION) == [("krutrim", "gemma-4-31b-it")]
+        assert model == "gpt-oss-120b"
+    expected = [("krutrim", "gpt-oss-120b"), ("krutrim", "gemma-4-31b-it")]
+    assert conversation_route_spec(LLMCapability.SIMPLE_SUMMARY) == expected
+    assert conversation_route_spec(LLMCapability.SEMANTIC_EXTRACTION) == expected
 
 
-def test_final_synthesis_selects_krutrim_gpt_oss_20b():
+def test_final_synthesis_selects_krutrim_gpt_oss_120b():
     router = _ci_router()
     names = _candidate_names(router, LLMCapability.FINAL_SYNTHESIS)
     models = _candidate_models(router, LLMCapability.FINAL_SYNTHESIS)
     provider, model = router.route(LLMCapability.FINAL_SYNTHESIS)
     assert names == ["krutrim", "krutrim"]
-    assert models == ["gpt-oss-20b", "gemma-4-31b-it"]
+    assert models == ["gpt-oss-120b", "gemma-4-31b-it"]
     assert getattr(provider, "name", None) == "krutrim"
-    assert model == "gpt-oss-20b"
+    assert model == "gpt-oss-120b"
     assert conversation_route_spec(LLMCapability.FINAL_SYNTHESIS) == [
-        ("krutrim", "gpt-oss-20b"),
+        ("krutrim", "gpt-oss-120b"),
         ("krutrim", "gemma-4-31b-it"),
     ]
 
 
-def test_default_validation_selects_krutrim_gpt_oss_20b():
+def test_default_validation_selects_krutrim_gpt_oss_120b():
     router = _ci_router()
     names = _candidate_names(router, LLMCapability.VALIDATION)
     models = _candidate_models(router, LLMCapability.VALIDATION)
     provider, model = router.route(LLMCapability.VALIDATION)
     assert names[0] == "krutrim"
-    assert models[0] == "gpt-oss-20b"
+    assert models[0] == "gpt-oss-120b"
     assert getattr(provider, "name", None) == "krutrim"
-    assert model == "gpt-oss-20b"
+    assert model == "gpt-oss-120b"
     assert conversation_route_spec(LLMCapability.VALIDATION)[0] == (
         settings.CONVERSATION_VALIDATION_FALLBACK_PROVIDER,
         settings.CONVERSATION_VALIDATION_FALLBACK_MODEL,
@@ -162,18 +163,18 @@ def test_default_validation_selects_krutrim_gpt_oss_20b():
     )
 
 
-def test_hard_validation_fallback_selects_krutrim_gpt_oss_20b():
+def test_hard_validation_fallback_selects_krutrim_gpt_oss_120b():
     router = _ci_router()
     validation = router._cost_optimized_candidates(LLMCapability.VALIDATION)
     fallback = router._cost_optimized_candidates(LLMCapability.FALLBACK)
     assert [(item.provider.name, item.model) for item in validation] == [
-        ("krutrim", "gpt-oss-20b"),
+        ("krutrim", "gpt-oss-120b"),
         ("mistral", "ministral-14b-latest"),
     ]
-    assert [(item.provider.name, item.model) for item in fallback] == [("krutrim", "gpt-oss-20b")]
+    assert [(item.provider.name, item.model) for item in fallback] == [("krutrim", "gpt-oss-120b")]
     provider, model = router.route(LLMCapability.FALLBACK)
     assert getattr(provider, "name", None) == "krutrim"
-    assert model == "gpt-oss-20b"
+    assert model == "gpt-oss-120b"
 
 
 def test_conversation_intelligence_never_selects_free_providers():
@@ -204,12 +205,11 @@ def test_short_and_long_meeting_keep_role_based_routing():
         reasoning_provider, reasoning_model = _route_for_input(router, LLMCapability.HIGH_ACCURACY_REASONING, estimated)
         synthesis_provider, synthesis_model = _route_for_input(router, LLMCapability.FINAL_SYNTHESIS, estimated)
         assert getattr(semantic_provider, "name", None) == "krutrim"
-        assert semantic_model == "gemma-4-31b-it"
+        assert semantic_model == "gpt-oss-120b"
         assert getattr(reasoning_provider, "name", None) == "krutrim"
-        assert reasoning_model == "gemma-4-31b-it"
+        assert reasoning_model == "gpt-oss-120b"
         assert getattr(synthesis_provider, "name", None) == "krutrim"
-        assert synthesis_model == "gpt-oss-20b"
-        assert semantic_model != synthesis_model
+        assert synthesis_model == "gpt-oss-120b"
 
 
 def test_canonical_task_note_schemas_unchanged():
@@ -235,11 +235,11 @@ def test_canonical_task_note_schemas_unchanged():
     assert understanding["properties"]["decisions"]["items"]["type"] == "string"
     plan = build_structured_plan("mistral", "ministral-14b-latest", FinalSynthesisLLMResponse, "FinalSynthesisLLMResponse")
     assert plan.attempts[0].mode == "json_schema"
-    krutrim_plan = build_structured_plan("krutrim", "gpt-oss-20b", FinalSynthesisLLMResponse, "FinalSynthesisLLMResponse")
+    krutrim_plan = build_structured_plan("krutrim", "gpt-oss-120b", FinalSynthesisLLMResponse, "FinalSynthesisLLMResponse")
     assert krutrim_plan.attempts[0].mode == "json_schema"
 
 
-def test_validator_failure_uses_gpt_oss_20b_not_obsolete_provider():
+def test_validator_failure_uses_gpt_oss_120b_not_obsolete_provider():
     mistral = _RecordingProvider("mistral", error=StructuredOutputError(SCHEMA_VALIDATION_FAILED))
     krutrim = _RecordingProvider("krutrim")
     groq = _RecordingProvider("groq")
@@ -249,7 +249,7 @@ def test_validator_failure_uses_gpt_oss_20b_not_obsolete_provider():
         "mistral",
         [
             LLMRouteCandidate(provider=mistral, model="ministral-14b-latest"),
-            LLMRouteCandidate(provider=krutrim, model="gpt-oss-20b"),
+            LLMRouteCandidate(provider=krutrim, model="gpt-oss-120b"),
             LLMRouteCandidate(provider=groq, model="openai/gpt-oss-20b"),
             LLMRouteCandidate(provider=gemini, model="gemini-3.5-flash-lite"),
             LLMRouteCandidate(provider=sarvam, model="sarvam-105b"),
@@ -268,7 +268,7 @@ def test_validator_failure_uses_gpt_oss_20b_not_obsolete_provider():
     parsed = asyncio.run(routed.generate_structured(_understanding_request(model), ConversationUnderstandingResponse))
     assert parsed.problems == ["Duplicate outlet appeared twice"]
     assert routed.last_successful_provider == "krutrim"
-    assert routed.last_successful_model == "gpt-oss-20b"
+    assert routed.last_successful_model == "gpt-oss-120b"
     assert groq.calls == 0
     assert gemini.calls == 0
     assert sarvam.calls == 0
@@ -338,7 +338,7 @@ def test_unconfigured_krutrim_does_not_fall_back_to_free_models():
     )
     provider, model = router.route(LLMCapability.HIGH_ACCURACY_REASONING)
     assert getattr(provider, "name", None) == "krutrim"
-    assert model == "gemma-4-31b-it"
+    assert model == "gpt-oss-120b"
     assert _candidate_names(router, LLMCapability.HIGH_ACCURACY_REASONING) == []
     assert _candidate_names(router, LLMCapability.SEMANTIC_EXTRACTION) == []
     assert _candidate_names(router, LLMCapability.FINAL_SYNTHESIS) == []
@@ -353,9 +353,9 @@ def test_unconfigured_krutrim_does_not_fall_back_to_free_models():
 def test_conversation_intelligence_order_includes_gemini():
     router = _ci_router()
     expected = {
-        LLMCapability.HIGH_ACCURACY_REASONING: ["krutrim"],
-        LLMCapability.SEMANTIC_EXTRACTION: ["krutrim"],
-        LLMCapability.SIMPLE_SUMMARY: ["krutrim"],
+        LLMCapability.HIGH_ACCURACY_REASONING: ["krutrim", "krutrim"],
+        LLMCapability.SEMANTIC_EXTRACTION: ["krutrim", "krutrim"],
+        LLMCapability.SIMPLE_SUMMARY: ["krutrim", "krutrim"],
         LLMCapability.FINAL_SYNTHESIS: ["krutrim", "krutrim"],
         LLMCapability.VALIDATION: ["krutrim", "mistral"],
         LLMCapability.FALLBACK: ["krutrim"],
@@ -567,7 +567,7 @@ def test_truncated_output_retries_higher_budget_then_falls_back_to_gemma():
     valid = json.dumps(_synthesis_payload())
     oss = _CannedProvider(
         "krutrim",
-        "gpt-oss-20b",
+        "gpt-oss-120b",
         [truncated, truncated],
         finish_reasons=["length", "length"],
         completion_tokens=[8192, 16000],
@@ -576,11 +576,11 @@ def test_truncated_output_retries_higher_budget_then_falls_back_to_gemma():
     wrapper = FallbackLLMProvider(
         "krutrim",
         [
-            LLMRouteCandidate(provider=oss, model="gpt-oss-20b"),
+            LLMRouteCandidate(provider=oss, model="gpt-oss-120b"),
             LLMRouteCandidate(provider=gemma, model="gemma-4-31b-it"),
         ],
     )
-    parsed = asyncio.run(wrapper.generate_structured(_synthesis_request("gpt-oss-20b"), FinalSynthesisLLMResponse))
+    parsed = asyncio.run(wrapper.generate_structured(_synthesis_request("gpt-oss-120b"), FinalSynthesisLLMResponse))
     assert len(parsed.tasks) == 2
     assert wrapper.last_successful_model == "gemma-4-31b-it"
     assert oss.seen_max_tokens == [8192, 16000]
@@ -593,7 +593,7 @@ def test_truncated_synthesis_succeeds_after_raising_max_tokens():
     valid = json.dumps(_synthesis_payload())
     oss = _CannedProvider(
         "krutrim",
-        "gpt-oss-20b",
+        "gpt-oss-120b",
         [truncated, valid],
         finish_reasons=["length", "stop"],
         completion_tokens=[8192, 1200],
@@ -602,13 +602,13 @@ def test_truncated_synthesis_succeeds_after_raising_max_tokens():
     wrapper = FallbackLLMProvider(
         "krutrim",
         [
-            LLMRouteCandidate(provider=oss, model="gpt-oss-20b"),
+            LLMRouteCandidate(provider=oss, model="gpt-oss-120b"),
             LLMRouteCandidate(provider=gemma, model="gemma-4-31b-it"),
         ],
     )
-    parsed = asyncio.run(wrapper.generate_structured(_synthesis_request("gpt-oss-20b"), FinalSynthesisLLMResponse))
+    parsed = asyncio.run(wrapper.generate_structured(_synthesis_request("gpt-oss-120b"), FinalSynthesisLLMResponse))
     assert len(parsed.tasks) == 2
-    assert wrapper.last_successful_model == "gpt-oss-20b"
+    assert wrapper.last_successful_model == "gpt-oss-120b"
     assert oss.seen_max_tokens == [8192, 16000]
     assert gemma.seen_formats == []
 
@@ -782,16 +782,16 @@ def test_json_object_cannot_bypass_canonical_schema():
         parse_structured_content(FinalSynthesisLLMResponse, invalid)
     assert caught.value.outcome == SCHEMA_VALIDATION_FAILED
 
-    plan = build_structured_plan("krutrim", "gpt-oss-20b", FinalSynthesisLLMResponse, "FinalSynthesisLLMResponse")
+    plan = build_structured_plan("krutrim", "gpt-oss-120b", FinalSynthesisLLMResponse, "FinalSynthesisLLMResponse")
     json_object = next(item for item in plan.attempts if item.mode == "json_object")
     assert json_object.response_format == {"type": "json_object"}
     assert json_object.parsing_strategy == "canonical_pydantic"
     assert "tasks" in (json_object.schema.get("properties") or {})
     assert "tasks" in json_object.instruction
 
-    provider = _CannedProvider("krutrim", "gpt-oss-20b", [invalid, invalid, invalid])
+    provider = _CannedProvider("krutrim", "gpt-oss-120b", [invalid, invalid, invalid])
     with pytest.raises(StructuredOutputError) as structured:
-        asyncio.run(provider.generate_structured(_synthesis_request("gpt-oss-20b"), FinalSynthesisLLMResponse))
+        asyncio.run(provider.generate_structured(_synthesis_request("gpt-oss-120b"), FinalSynthesisLLMResponse))
     assert structured.value.outcome == SCHEMA_VALIDATION_FAILED
     modes = [("plain_json_prompt" if item is None else item.get("type")) for item in provider.seen_formats]
     assert "json_object" in modes
@@ -805,7 +805,7 @@ def test_model_specific_context_limits_override_provider_wide_krutrim_budget(mon
     monkeypatch.setattr(
         settings,
         "LLM_MODEL_CONTEXT_TOKENS",
-        "gemma-4-31b-it:131072,gpt-oss-20b:65536,ministral-14b-latest:262144,ministral-14b-2512:262144",
+        "gemma-4-31b-it:131072,gpt-oss-120b:65536,ministral-14b-latest:262144,ministral-14b-2512:262144",
     )
     monkeypatch.setattr(
         settings,
@@ -813,10 +813,10 @@ def test_model_specific_context_limits_override_provider_wide_krutrim_budget(mon
         "groq:8192,gemini:1048576,mistral:262144,sarvam:32768,openai:128000,anthropic:200000,krutrim:65536",
     )
     assert provider_context_limit("krutrim", "gemma-4-31b-it") == 131072
-    assert provider_context_limit("krutrim", "gpt-oss-20b") == 65536
+    assert provider_context_limit("krutrim", "gpt-oss-120b") == 65536
     assert provider_context_limit("mistral", "ministral-14b-latest") == 262144
-    assert provider_context_limit("krutrim", "gpt-oss-20b") != provider_context_limit("krutrim", "gemma-4-31b-it")
-    assert safe_input_budget("krutrim", model="gpt-oss-20b") < safe_input_budget("krutrim", model="gemma-4-31b-it")
+    assert provider_context_limit("krutrim", "gpt-oss-120b") != provider_context_limit("krutrim", "gemma-4-31b-it")
+    assert safe_input_budget("krutrim", model="gpt-oss-120b") < safe_input_budget("krutrim", model="gemma-4-31b-it")
     assert provider_context_limit("krutrim") == 65536
 
 
@@ -824,4 +824,4 @@ def test_mistral_modes_are_bounded():
     assert structured_modes_for("mistral", "mistral-small-latest") == ["json_schema", "json_object"]
     assert structured_modes_for("gemini", "gemini-3.5-flash-lite")[0] == "json_schema"
     assert structured_modes_for("krutrim", "gemma-4-31b-it") == ["json_schema", "json_object", "plain_json_prompt"]
-    assert structured_modes_for("krutrim", "gpt-oss-20b") == ["json_schema", "json_object", "plain_json_prompt"]
+    assert structured_modes_for("krutrim", "gpt-oss-120b") == ["json_schema", "json_object", "plain_json_prompt"]

@@ -18,6 +18,7 @@ class ChatSessionDocument(BaseModel):
     id: Any = Field(default_factory=ObjectId, alias="_id")
     userId: Any
     spaceId: Any | None = None
+    meetingId: Any | None = None
     title: str | None = None
     status: str = "active"
     messageCount: int = 0

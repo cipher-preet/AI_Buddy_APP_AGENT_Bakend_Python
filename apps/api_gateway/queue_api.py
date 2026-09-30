@@ -143,6 +143,7 @@ def _stream_for_event(payload: dict[str, Any], event: EventEnvelope) -> str:
             settings.REDIS_PROCESSING_STREAM,
             settings.REDIS_RETRY_STREAM,
             settings.REDIS_DAILY_BRIEFING_STREAM,
+            settings.REDIS_SCHEDULE_EXTRACTION_STREAM,
             settings.REDIS_MEETING_VIDEO_STREAM,
             settings.REDIS_MEETING_MERGE_STREAM,
         }
@@ -165,6 +166,8 @@ def _stream_for_event(payload: dict[str, Any], event: EventEnvelope) -> str:
         return settings.REDIS_RETRY_STREAM
     if event.eventType == "daily.briefing.requested":
         return settings.REDIS_DAILY_BRIEFING_STREAM
+    if event.eventType == "conversation.schedule_extraction.requested":
+        return settings.REDIS_SCHEDULE_EXTRACTION_STREAM
     if event.eventType == "meeting.video.chunk.ready":
         return settings.REDIS_STT_STREAM
     if event.eventType == "meeting.video.merge.requested":

@@ -55,7 +55,14 @@ def conversation_route_spec(capability) -> list[tuple[str, str]]:
     """Role-specific (provider, model) pairs. Not a generic free-model chain."""
     role = conversation_role_for(capability)
     if role == "semantic":
-        return [(settings.CONVERSATION_SEMANTIC_PROVIDER, settings.CONVERSATION_SEMANTIC_MODEL)]
+        pairs = [(settings.CONVERSATION_SEMANTIC_PROVIDER, settings.CONVERSATION_SEMANTIC_MODEL)]
+        fallback = (
+            settings.CONVERSATION_SEMANTIC_FALLBACK_PROVIDER,
+            settings.CONVERSATION_SEMANTIC_FALLBACK_MODEL,
+        )
+        if fallback[0] and fallback[1] and fallback not in pairs:
+            pairs.append(fallback)
+        return pairs
     if role == "synthesis":
         pairs = [(settings.CONVERSATION_SYNTHESIS_PROVIDER, settings.CONVERSATION_SYNTHESIS_MODEL)]
         fallback = (
@@ -100,7 +107,7 @@ def provider_model_for(provider_name: str) -> str:
     if provider_name == "sarvam":
         return settings.SARVAM_DEFAULT_MODEL
     if provider_name == "krutrim":
-        return settings.CHAT_KRUTRIM_MODEL or settings.CONVERSATION_SEMANTIC_MODEL
+        return settings.CHAT_KRUTRIM_MODEL or settings.KRUTRIM_DEFAULT_MODEL
     return settings.LLM_DEFAULT_MODEL
 
 

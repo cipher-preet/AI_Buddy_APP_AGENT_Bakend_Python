@@ -816,8 +816,8 @@ def test_configured_cost_optimized_primary_is_not_xai_grok():
         }
     )
     candidates = router._cost_optimized_candidates(LLMCapability.SEMANTIC_EXTRACTION)
-    assert [item.provider.name for item in candidates] == ["krutrim"]
-    assert candidates[0].model == "gemma-4-31b-it"
+    assert [item.provider.name for item in candidates] == ["krutrim", "krutrim"]
+    assert [item.model for item in candidates] == ["gpt-oss-120b", "gemma-4-31b-it"]
     assert all(item.provider.name not in CONVERSATION_INTELLIGENCE_FREE_PROVIDERS for item in candidates)
     assert all(item.provider.name != "xai" for item in candidates)
     assert "xai" not in router.providers
