@@ -695,3 +695,64 @@ def test_concat_uses_stream_copy_without_h264_remux(tmp_path, monkeypatch):
     joined = " ".join(calls[0])
     assert "libx264" not in joined
     assert "-c" in calls[0] and "copy" in calls[0]
+
+
+def test_unify_resolution_reencodes_only_mismatched_fragments(tmp_path, monkeypatch):
+    from services.meeting_extension import ffmpeg_audio
+
+    sizes = {"a": ("vp9", 1280, 720), "b": ("vp9", 1920, 1080), "c": ("vp9", 1280, 720)}
+    encoded: list[list[str]] = []
+
+    async def fake_probe(path):
+        return sizes[path.name.split(".")[0]]
+
+    async def fake_run(command, *, timeout, allow_failure):
+        encoded.append(command)
+        Path(command[-1]).write_bytes(WEBM_EBML_ID + b"\x00" * 4_096)
+        return None
+
+    monkeypatch.setattr(ffmpeg_audio, "_probe_video_stream", fake_probe)
+    monkeypatch.setattr(ffmpeg_audio, "_run_ffmpeg", fake_run)
+    fragments = []
+    for name in ("a", "b", "c"):
+        path = tmp_path / f"{name}.webm"
+        path.write_bytes(WEBM_EBML_ID + b"\x01" * 100)
+        fragments.append(path)
+
+    result = asyncio.run(ffmpeg_audio._unify_fragment_resolution(fragments))
+
+    assert [path.name for path in result] == ["a.webm", "b.1280x720.webm", "c.webm"]
+    assert len(encoded) == 1
+    joined = " ".join(encoded[0])
+    assert "libvpx-vp9" in joined
+    assert "pad=1280:720" in joined
+
+
+def test_concat_drops_corrupt_fragment_and_keeps_merging(tmp_path, monkeypatch):
+    from services.meeting_extension import ffmpeg_audio
+    from services.meeting_extension.ffmpeg_audio import MeetingAudioExtractionError
+
+    concat_inputs: list[str] = []
+
+    async def fake_run(command, *, timeout, allow_failure):
+        source = command[command.index("-i") + 1]
+        if source.endswith("b.webm"):
+            return MeetingAudioExtractionError("bad", corrupt=True)
+        if "concat" in command:
+            concat_inputs.append(Path(source).read_text(encoding="utf-8"))
+        Path(command[-1]).write_bytes(WEBM_EBML_ID + b"\x00" * 10_000)
+        return None
+
+    monkeypatch.setattr(ffmpeg_audio, "_run_ffmpeg", fake_run)
+    monkeypatch.setattr(ffmpeg_audio.settings, "MEETING_MERGE_ALLOW_REENCODE", False)
+    chunks = []
+    for name in ("a", "b", "c"):
+        path = tmp_path / f"{name}.webm"
+        path.write_bytes(WEBM_EBML_ID + WEBM_CLUSTER_ID + b"\x01" * 100)
+        chunks.append(path)
+    result = asyncio.run(ffmpeg_audio.concat_webm_chunks(chunks, tmp_path / "meeting.webm"))
+    assert result.exists()
+    assert concat_inputs
+    assert "a.clean.webm" in concat_inputs[0]
+    assert "c.clean.webm" in concat_inputs[0]
+    assert "b." not in concat_inputs[0]

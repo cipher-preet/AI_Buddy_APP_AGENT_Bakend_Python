@@ -20,7 +20,7 @@ class MotorMongoChatMessageHistory(BaseChatMessageHistory):
         history_size: int = MAX_CHAT_MESSAGES,
     ):
         self.session_id = session_id
-        self.db = db or get_database()
+        self.db = db if db is not None else get_database()
         self.collection = self.db[collection_name]
         self.history_size = history_size
 

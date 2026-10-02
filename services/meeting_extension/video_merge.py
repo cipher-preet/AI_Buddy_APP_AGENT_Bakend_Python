@@ -13,6 +13,9 @@ from services.observability.diagnostics import diag_log
 from services.queue.streams import EventEnvelope, NonRetryableQueueError
 from services.storage.s3_audio_storage import get_s3_audio_storage, temp_audio_root
 
+# Late chunks can land while a merge runs; re-run a bounded number of times so they are included.
+MAX_MERGE_PASSES = 3
+
 
 async def process_meeting_video_merge(event: EventEnvelope) -> None:
     if not settings.MEETING_VIDEO_FINALIZATION_ENABLED:
@@ -24,14 +27,33 @@ async def process_meeting_video_merge(event: EventEnvelope) -> None:
     final_key = str(payload.get("finalRecordingS3Key") or meeting_final_object_key(user_id, meeting_session_id))
     validate_meeting_object_key(object_key=final_key, user_id=user_id, meeting_session_id=meeting_session_id)
     db = get_database_safe()
+    for merge_pass in range(1, MAX_MERGE_PASSES + 1):
+        await _merge_once(db, meeting_session_id, user_id, expected, final_key)
+        # Clear the flag atomically; only loop if a late chunk asked for it during this pass.
+        rerun = await db.meeting_sessions.find_one_and_update(
+            {"_id": _oid(meeting_session_id), "videoRemergeRequested": True},
+            {"$set": {"videoRemergeRequested": False}},
+        )
+        if not rerun:
+            return
+        diag_log(
+            "meeting_video_remerge_pass",
+            meetingSessionId=meeting_session_id,
+            userId=user_id,
+            nextPass=merge_pass + 1,
+        )
+
+
+async def _merge_once(db, meeting_session_id: str, user_id: str, expected: int, final_key: str) -> None:
     job_dir = temp_audio_root() / f"meeting-merge-{meeting_session_id}-{uuid4().hex[:8]}"
     job_dir.mkdir(parents=True, exist_ok=True)
     diag_log("meeting_video_merge_started", meetingSessionId=meeting_session_id, userId=user_id)
     try:
-        await db.meeting_sessions.update_one(
+        previous = await db.meeting_sessions.find_one_and_update(
             {"_id": _oid(meeting_session_id)},
             {"$set": {"videoMergeStatus": "RUNNING", "updatedAt": datetime.now(timezone.utc)}},
         )
+        previous = previous or {}
         storage = get_s3_audio_storage()
         chunk_paths = []
         missing_sequences: list[int] = []
@@ -56,6 +78,27 @@ async def process_meeting_video_merge(event: EventEnvelope) -> None:
             present_sequences.append(sequence)
         if not chunk_paths:
             raise MeetingAudioExtractionError("No uploaded video chunks available to merge", corrupt=True)
+
+        previous_count = previous.get("mergePresentChunkCount")
+        if (
+            previous.get("finalRecordingS3Key")
+            and isinstance(previous_count, int)
+            and len(chunk_paths) < previous_count
+        ):
+            # Source chunks expired from S3 since the last merge — never replace a fuller recording.
+            await db.meeting_sessions.update_one(
+                {"_id": _oid(meeting_session_id)},
+                {"$set": {"videoMergeStatus": "COMPLETED", "updatedAt": datetime.now(timezone.utc)}},
+            )
+            diag_log(
+                "meeting_video_remerge_skipped_fewer_chunks",
+                meetingSessionId=meeting_session_id,
+                userId=user_id,
+                presentCount=len(chunk_paths),
+                previousCount=previous_count,
+            )
+            return
+
         # Gap-tolerant: concat only present chunks in sequence order (already ascending).
         if missing_sequences:
             diag_log(

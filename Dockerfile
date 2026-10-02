@@ -20,8 +20,9 @@ RUN apt-get update \
 
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir --prefer-binary -r requirements.txt \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    PIP_CACHE_DIR=/root/.cache/pip pip install --upgrade pip \
+    && PIP_CACHE_DIR=/root/.cache/pip pip install --prefer-binary -r requirements.txt \
     && python -c "import firebase_admin; print(f'firebase-admin={firebase_admin.__version__}')" \
     && test -x /usr/bin/ffmpeg
 

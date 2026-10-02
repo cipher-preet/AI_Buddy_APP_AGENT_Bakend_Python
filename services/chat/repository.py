@@ -26,7 +26,7 @@ except ImportError:
 
 class ChatRepository:
     def __init__(self, db: AsyncIOMotorDatabase | None = None):
-        self.db = db or get_database()
+        self.db = db if db is not None else get_database()
 
     async def get_session(self, chat_id: str) -> ChatSessionDocument | None:
         document = await self.db.chat_sessions.find_one(_id_query(chat_id))

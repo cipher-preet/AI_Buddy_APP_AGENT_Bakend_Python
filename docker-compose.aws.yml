@@ -22,6 +22,7 @@ services:
 
   queue-api:
     build: .
+    image: buddy-app:latest
     restart: unless-stopped
     command: ["uvicorn", "apps.api_gateway.queue_api:app", "--host", "0.0.0.0", "--port", "8080"]
     env_file:
@@ -48,6 +49,7 @@ services:
 
   buddy-worker:
     build: .
+    image: buddy-app:latest
     restart: unless-stopped
     init: true
     command: ["python", "-m", "apps.api_gateway.workers.main"]

@@ -120,7 +120,7 @@ class MeetingTranscriptIndex:
     """Meeting-scoped vector index stored in its own Qdrant collection."""
 
     def __init__(self, db: AsyncIOMotorDatabase | None = None):
-        self.db = db or get_database()
+        self.db = db if db is not None else get_database()
 
     async def ensure_corpus(self, context: MeetingContext) -> MeetingCorpus:
         chunks = build_chunks(context.segments, settings.MEETING_CHAT_CHUNK_CHARS)

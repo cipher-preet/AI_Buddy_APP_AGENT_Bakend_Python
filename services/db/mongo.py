@@ -60,7 +60,7 @@ async def _ensure_schedule_extraction_indexes(database: AsyncIOMotorDatabase) ->
 
 
 async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
-    database = db or get_database()
+    database = db if db is not None else get_database()
 
     await database.conversations.create_indexes(
         [

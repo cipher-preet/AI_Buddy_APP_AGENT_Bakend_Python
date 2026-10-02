@@ -59,7 +59,7 @@ class MeetingContextLoader:
     """Read-only loader for everything Buddy knows about one meeting."""
 
     def __init__(self, db: AsyncIOMotorDatabase | None = None):
-        self.db = db or get_database()
+        self.db = db if db is not None else get_database()
 
     async def load(self, user_id: str, meeting_id: str) -> MeetingContext:
         ids = mongo_id_candidates(meeting_id)

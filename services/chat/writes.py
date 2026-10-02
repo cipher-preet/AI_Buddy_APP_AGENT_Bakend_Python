@@ -18,7 +18,7 @@ class ChatWriteStore:
     """Chat write tools that create/update/delete documents through the Node home APIs."""
 
     def __init__(self, database=None, auth_token: str | None = None):
-        self.db = database or get_database()
+        self.db = database if database is not None else get_database()
         self.client = NodeHomeClient(auth_token=auth_token)
 
     async def create_task(

@@ -206,6 +206,10 @@ async def concat_webm_chunks(chunk_paths: list[Path], output_path: Path) -> Path
             )
             return final
 
+    normalized = await _sanitize_webm_fragments(normalized)
+    if getattr(settings, "MEETING_MERGE_ALLOW_REENCODE", True):
+        normalized = await _unify_fragment_resolution(normalized)
+
     list_file = output_path.parent / "concat.txt"
     list_file.write_text(
         "".join(f"file '{path.as_posix()}'\n" for path in normalized),
@@ -382,6 +386,143 @@ def _normalize_webm_fragments(chunk_paths: list[Path]) -> list[Path]:
         repaired.write_bytes(init + data)
         normalized.append(repaired)
     return normalized
+
+
+async def _sanitize_webm_fragments(fragments: list[Path]) -> list[Path]:
+    """Remux each fragment alone so corrupt packets / truncated tails are dropped.
+
+    A single damaged fragment stream-copied into the concat makes browsers stop with a
+    decode error at that point. Fragments ffmpeg cannot read at all are left out.
+    """
+    cleaned: list[Path] = []
+    for fragment in fragments:
+        target = fragment.with_name(f"{fragment.stem}.clean.webm")
+        error = await _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                *_FFMPEG_INPUT_FLAGS,
+                "-i",
+                str(fragment),
+                "-map",
+                "0",
+                "-c",
+                "copy",
+                "-f",
+                "webm",
+                str(target),
+            ],
+            timeout=settings.MEETING_FFMPEG_TIMEOUT_SECONDS,
+            allow_failure=True,
+        )
+        if error is None and target.exists() and target.stat().st_size > 1_024 and has_webm_header(target.read_bytes()[:4]):
+            cleaned.append(target)
+            continue
+        if error is not None and error.corrupt:
+            diag_log("meeting_video_merge_fragment_dropped", fragment=fragment.name)
+            continue
+        cleaned.append(fragment)
+    # Never fail harder than before: if every fragment was rejected, fall back to the originals.
+    return cleaned or fragments
+
+
+_VIDEO_STREAM_RE = re.compile(r"Video:\s*(\w+)[^\n]*?\s(\d{2,5})x(\d{2,5})")
+
+
+async def _probe_video_stream(path: Path) -> tuple[str, int, int] | None:
+    """Return (codec, width, height) from ffmpeg's input banner, or None if unknown."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            resolve_ffmpeg_bin(),
+            "-hide_banner",
+            "-i",
+            str(path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=settings.MEETING_FFMPEG_TIMEOUT_SECONDS
+        )
+    except Exception:
+        return None
+    # With no output file ffmpeg exits non-zero by design; the stream info is in stderr.
+    match = _VIDEO_STREAM_RE.search((stderr or b"").decode("utf-8", errors="replace"))
+    if not match:
+        return None
+    return match.group(1).lower(), int(match.group(2)), int(match.group(3))
+
+
+async def _unify_fragment_resolution(fragments: list[Path]) -> list[Path]:
+    """Re-encode only fragments whose frame size differs from the majority.
+
+    Tab resizes and the audio-only placeholder change resolution between segments; stream-copying
+    mixed sizes into one file makes browsers stop with a decode error at the switch.
+    """
+    if len(fragments) < 2:
+        return fragments
+    probes = [await _probe_video_stream(fragment) for fragment in fragments]
+    sizes = [(probe[1], probe[2]) for probe in probes if probe]
+    if not sizes or len(set(sizes)) == 1:
+        return fragments
+    target = max(set(sizes), key=sizes.count)
+    target_codec = next(probe[0] for probe in probes if probe and (probe[1], probe[2]) == target)
+    width, height = target
+    unified: list[Path] = []
+    for fragment, probe in zip(fragments, probes):
+        if probe is None or (probe[1], probe[2]) == target:
+            unified.append(fragment)
+            continue
+        destination = fragment.with_name(f"{fragment.stem}.{width}x{height}.webm")
+        codec_args = (
+            ["-c:v", "libvpx-vp9", "-row-mt", "1"]
+            if target_codec == "vp9"
+            else ["-c:v", "libvpx", "-auto-alt-ref", "0"]
+        )
+        error = await _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                *_FFMPEG_INPUT_FLAGS,
+                "-i",
+                str(fragment),
+                "-vf",
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1",
+                *codec_args,
+                "-b:v",
+                "1200k",
+                "-deadline",
+                "realtime",
+                "-cpu-used",
+                "8",
+                "-threads",
+                "2",
+                "-c:a",
+                "copy",
+                "-f",
+                "webm",
+                str(destination),
+            ],
+            timeout=settings.MEETING_MERGE_TIMEOUT_SECONDS,
+            allow_failure=True,
+        )
+        if error is None and destination.exists() and destination.stat().st_size > 1_024:
+            unified.append(destination)
+            continue
+        # A mismatched fragment left in would break playback from that point on.
+        diag_log(
+            "meeting_video_merge_fragment_resolution_dropped",
+            fragment=fragment.name,
+            size=f"{probe[1]}x{probe[2]}",
+            target=f"{width}x{height}",
+        )
+    diag_log(
+        "meeting_video_merge_resolution_unified",
+        target=f"{width}x{height}",
+        fragmentCount=len(fragments),
+        reencoded=sum(1 for probe in probes if probe and (probe[1], probe[2]) != target),
+    )
+    return unified or fragments
 
 
 def _is_corrupt(stderr: str) -> bool:
