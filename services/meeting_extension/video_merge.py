@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from bson import ObjectId
@@ -10,11 +11,18 @@ from apps.api_gateway.config.setting import settings
 from services.meeting_extension.ffmpeg_audio import MeetingAudioExtractionError, concat_webm_chunks
 from services.meeting_extension.s3_keys import meeting_chunk_object_key, meeting_final_object_key, validate_meeting_object_key
 from services.observability.diagnostics import diag_log
-from services.queue.streams import EventEnvelope, NonRetryableQueueError
+from services.queue.streams import EventEnvelope, NonRetryableQueueError, RedisStreamProducer
 from services.storage.s3_audio_storage import get_s3_audio_storage, temp_audio_root
 
 # Late chunks can land while a merge runs; re-run a bounded number of times so they are included.
 MAX_MERGE_PASSES = 3
+# Stop only after FFmpeg itself has timed out this many times. A killed worker is not that case.
+_MAX_TIMEOUT_ATTEMPTS = 2
+# Meetings left RUNNING by a dead process are picked up again on the next worker start.
+_STUCK_RESUME_LIMIT = 5
+# This process is actually concatenating these meetings. A RUNNING row in Mongo is not
+# proof of that: the last worker may have been killed and left the row behind.
+_ACTIVE_MERGES: set[str] = set()
 
 
 async def process_meeting_video_merge(event: EventEnvelope) -> None:
@@ -27,6 +35,16 @@ async def process_meeting_video_merge(event: EventEnvelope) -> None:
     final_key = str(payload.get("finalRecordingS3Key") or meeting_final_object_key(user_id, meeting_session_id))
     validate_meeting_object_key(object_key=final_key, user_id=user_id, meeting_session_id=meeting_session_id)
     db = get_database_safe()
+    if await _merge_should_stand_down(db, meeting_session_id):
+        return
+    _ACTIVE_MERGES.add(meeting_session_id)
+    try:
+        await _merge_passes(db, meeting_session_id, user_id, expected, final_key)
+    finally:
+        _ACTIVE_MERGES.discard(meeting_session_id)
+
+
+async def _merge_passes(db, meeting_session_id: str, user_id: str, expected: int, final_key: str) -> None:
     for merge_pass in range(1, MAX_MERGE_PASSES + 1):
         # The server can raise expectedFinalSequence after enqueue (late/auto-finalized STOP).
         expected = await _current_expected_sequence(db, meeting_session_id, expected)
@@ -46,14 +64,38 @@ async def process_meeting_video_merge(event: EventEnvelope) -> None:
         )
 
 
+def merge_work_root() -> Path:
+    """Video chunks must not land on the worker's RAM disk.
+
+    The AWS worker mounts /tmp as a 1GB tmpfs. A meeting's chunks, their cleaned
+    copies, and the concat output all counted as memory and the kernel killed the
+    worker (exit 137) before the recording could be saved.
+    """
+    configured = str(getattr(settings, "MEETING_MERGE_WORK_ROOT", "") or "").strip()
+    if configured:
+        root = Path(configured)
+    else:
+        root = Path("/var/tmp/buddy-merge")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    except OSError:
+        fallback = temp_audio_root() / "meeting-merge"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
 async def _merge_once(db, meeting_session_id: str, user_id: str, expected: int, final_key: str) -> None:
-    job_dir = temp_audio_root() / f"meeting-merge-{meeting_session_id}-{uuid4().hex[:8]}"
+    job_dir = merge_work_root() / f"meeting-merge-{meeting_session_id}-{uuid4().hex[:8]}"
     job_dir.mkdir(parents=True, exist_ok=True)
     diag_log("meeting_video_merge_started", meetingSessionId=meeting_session_id, userId=user_id)
     try:
         previous = await db.meeting_sessions.find_one_and_update(
             {"_id": _oid(meeting_session_id)},
-            {"$set": {"videoMergeStatus": "RUNNING", "updatedAt": datetime.now(timezone.utc)}},
+            {
+                "$set": {"videoMergeStatus": "RUNNING", "updatedAt": datetime.now(timezone.utc)},
+                "$inc": {"videoMergeAttempts": 1},
+            },
         )
         previous = previous or {}
         storage = get_s3_audio_storage()
@@ -119,7 +161,8 @@ async def _merge_once(db, meeting_session_id: str, user_id: str, expected: int, 
                 "Merged recording is empty or too small to play",
                 corrupt=True,
             )
-        probe = output.read_bytes()[:64]
+        with output.open("rb") as recorded:
+            probe = recorded.read(64)
         is_webm = probe.startswith(bytes([0x1A, 0x45, 0xDF, 0xA3]))
         is_mp4 = b"ftyp" in probe
         if is_webm:
@@ -144,6 +187,7 @@ async def _merge_once(db, meeting_session_id: str, user_id: str, expected: int, 
                     "mergeMissingSequences": missing_sequences,
                     "mergePresentChunkCount": len(chunk_paths),
                     "mergeExpectedSequence": expected,
+                    "videoMergeAttempts": 0,
                 }
             },
         )
@@ -171,6 +215,80 @@ async def _merge_once(db, meeting_session_id: str, user_id: str, expected: int, 
         raise
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def _merge_should_stand_down(db, meeting_session_id: str) -> bool:
+    """Skip only a merge this process is already doing.
+
+    A RUNNING status left by a killed worker must be resumed. Treating that row as
+    busy acknowledges the queue message and the recording stays on "processing" forever.
+    Repeated FFmpeg timeouts are the one case that stops, so a bad file cannot fill the disk.
+    """
+    if meeting_session_id in _ACTIVE_MERGES:
+        diag_log("meeting_video_merge_skipped_busy", meetingSessionId=meeting_session_id)
+        return True
+    try:
+        existing = await db.meeting_sessions.find_one(
+            {"_id": _oid(meeting_session_id)},
+            {"videoMergeAttempts": 1, "lastErrorMessage": 1},
+        )
+    except Exception:
+        return False
+    if not existing:
+        return False
+    attempts = int(existing.get("videoMergeAttempts") or 0)
+    message = str(existing.get("lastErrorMessage") or "")
+    if attempts >= _MAX_TIMEOUT_ATTEMPTS and "timed out" in message.casefold():
+        diag_log(
+            "meeting_video_merge_stopped",
+            meetingSessionId=meeting_session_id,
+            attempts=attempts,
+        )
+        raise NonRetryableQueueError("Meeting merge timed out repeatedly; leaving the server alone")
+    return False
+
+
+async def resume_stuck_video_merges() -> int:
+    """Put meetings stuck on RUNNING back on the merge queue.
+
+    The worker that was concatenating them was killed, and the queue message was
+    already acknowledged, so nothing else will finish the recording.
+    """
+    if not settings.MEETING_VIDEO_FINALIZATION_ENABLED:
+        return 0
+    db = get_database_safe()
+    try:
+        cursor = db.meeting_sessions.find(
+            {"videoMergeStatus": "RUNNING"},
+            {"userId": 1, "spaceId": 1, "expectedFinalSequence": 1},
+        )
+        docs = await cursor.to_list(_STUCK_RESUME_LIMIT)
+    except Exception as error:
+        diag_log("meeting_video_merge_resume_failed", error=type(error).__name__)
+        return 0
+    producer = RedisStreamProducer()
+    resumed = 0
+    for doc in docs:
+        session_id = str(doc.get("_id") or "")
+        user_id = str(doc.get("userId") or "")
+        if not session_id or not user_id or session_id in _ACTIVE_MERGES:
+            continue
+        event = EventEnvelope(
+            eventType="meeting.video.merge.requested",
+            correlationId=session_id,
+            userId=user_id,
+            spaceId=str(doc.get("spaceId") or ""),
+            conversationId=session_id,
+            payload={
+                "meetingSessionId": session_id,
+                "userId": user_id,
+                "expectedFinalSequence": int(doc.get("expectedFinalSequence") or 0),
+            },
+        )
+        await producer.publish(settings.REDIS_MEETING_MERGE_STREAM, event)
+        diag_log("meeting_video_merge_resumed", meetingSessionId=session_id, userId=user_id)
+        resumed += 1
+    return resumed
 
 
 async def _current_expected_sequence(db, meeting_session_id: str, fallback: int) -> int:

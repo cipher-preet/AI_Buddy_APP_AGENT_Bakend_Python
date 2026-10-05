@@ -756,3 +756,126 @@ def test_concat_drops_corrupt_fragment_and_keeps_merging(tmp_path, monkeypatch):
     assert "a.clean.webm" in concat_inputs[0]
     assert "c.clean.webm" in concat_inputs[0]
     assert "b." not in concat_inputs[0]
+
+
+def test_ffmpeg_timeout_on_one_fragment_does_not_abort(monkeypatch):
+    from services.meeting_extension.ffmpeg_audio import MeetingAudioExtractionError, _run_ffmpeg
+
+    class Hung:
+        def __init__(self):
+            self.returncode = None
+
+        def kill(self):
+            raise ProcessLookupError
+
+        async def wait(self):
+            return -9
+
+        async def communicate(self):
+            await asyncio.sleep(30)
+
+    async def fake_exec(*args, **kwargs):
+        return Hung()
+
+    monkeypatch.setattr("services.meeting_extension.ffmpeg_audio.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("services.meeting_extension.ffmpeg_audio.resolve_ffmpeg_bin", lambda: "ffmpeg")
+    failure = asyncio.run(_run_ffmpeg(["ffmpeg", "-i", "x"], timeout=0.05, allow_failure=True))
+    assert isinstance(failure, MeetingAudioExtractionError)
+    assert "timed out" in str(failure)
+
+
+def test_killed_merge_is_resumed_and_repeated_timeouts_stop():
+    from datetime import datetime, timezone
+
+    from services.meeting_extension import video_merge
+    from services.meeting_extension.video_merge import _merge_should_stand_down
+    from services.queue.streams import NonRetryableQueueError
+
+    class Sessions:
+        def __init__(self, doc):
+            self.doc = doc
+
+        async def find_one(self, query, projection=None):
+            return self.doc
+
+    class DB:
+        def __init__(self, doc):
+            self.meeting_sessions = Sessions(doc)
+
+    session_id = "6ac3f69712362e18f6c689a6"
+    now = datetime.now(timezone.utc)
+    video_merge._ACTIVE_MERGES.discard(session_id)
+    # A RUNNING row is what a killed worker leaves behind. The next job must finish it.
+    resumed = asyncio.run(
+        _merge_should_stand_down(
+            DB({"videoMergeStatus": "RUNNING", "updatedAt": now, "videoMergeAttempts": 1}),
+            session_id,
+        )
+    )
+    assert resumed is False
+    video_merge._ACTIVE_MERGES.add(session_id)
+    try:
+        busy = asyncio.run(
+            _merge_should_stand_down(
+                DB({"videoMergeStatus": "RUNNING", "updatedAt": now, "videoMergeAttempts": 1}),
+                session_id,
+            )
+        )
+    finally:
+        video_merge._ACTIVE_MERGES.discard(session_id)
+    assert busy is True
+    try:
+        asyncio.run(
+            _merge_should_stand_down(
+                DB(
+                    {
+                        "videoMergeStatus": "FAILED",
+                        "updatedAt": now,
+                        "videoMergeAttempts": 2,
+                        "lastErrorMessage": "FFmpeg timed out",
+                    }
+                ),
+                session_id,
+            )
+        )
+        raise AssertionError("repeated timeouts must stop")
+    except NonRetryableQueueError:
+        pass
+
+
+def test_stuck_running_merge_is_published_again(monkeypatch):
+    from services.meeting_extension import video_merge
+
+    published = []
+
+    class Cursor:
+        async def to_list(self, limit):
+            return [
+                {
+                    "_id": "6ac3f69712362e18f6c689a6",
+                    "userId": "6a95868e4b6225ff9933a2b7",
+                    "expectedFinalSequence": 24,
+                }
+            ][:limit]
+
+    class Sessions:
+        def find(self, query, projection=None):
+            assert query["videoMergeStatus"] == "RUNNING"
+            return Cursor()
+
+    class DB:
+        meeting_sessions = Sessions()
+
+    class Producer:
+        async def publish(self, stream, event):
+            published.append((stream, event))
+            return event.eventId
+
+    monkeypatch.setattr(video_merge, "get_database_safe", lambda: DB())
+    monkeypatch.setattr(video_merge, "RedisStreamProducer", Producer)
+    monkeypatch.setattr(video_merge.settings, "MEETING_VIDEO_FINALIZATION_ENABLED", True)
+    count = asyncio.run(video_merge.resume_stuck_video_merges())
+    assert count == 1
+    assert published[0][1].eventType == "meeting.video.merge.requested"
+    assert published[0][1].payload["meetingSessionId"] == "6ac3f69712362e18f6c689a6"
+    assert published[0][1].payload["expectedFinalSequence"] == 24

@@ -195,19 +195,23 @@ async def concat_webm_chunks(chunk_paths: list[Path], output_path: Path) -> Path
     # Single complete WebM cluster file: ship as-is (no ffmpeg).
     if len(normalized) == 1:
         source = normalized[0]
-        payload = source.read_bytes()
-        if has_webm_header(payload) and len(payload) > 8_192:
+        with source.open("rb") as recorded:
+            header = recorded.read(4)
+        if has_webm_header(header) and source.stat().st_size > 8_192:
             final = _webm_output_path(output_path)
-            final.write_bytes(payload)
+            if final.resolve() != source.resolve():
+                shutil.copyfile(source, final)
+            else:
+                final = source
             diag_log(
                 "meeting_video_merge_single_chunk_copy",
-                bytes=len(payload),
+                bytes=final.stat().st_size,
                 output=str(final.name),
             )
             return final
 
     normalized = await _sanitize_webm_fragments(normalized)
-    if getattr(settings, "MEETING_MERGE_ALLOW_REENCODE", True):
+    if getattr(settings, "MEETING_MERGE_ALLOW_REENCODE", False):
         normalized = await _unify_fragment_resolution(normalized)
 
     list_file = output_path.parent / "concat.txt"
@@ -228,6 +232,8 @@ async def concat_webm_chunks(chunk_paths: list[Path], output_path: Path) -> Path
             str(list_file),
             "-c",
             "copy",
+            "-threads",
+            "1",
             str(intermediate),
         ],
         timeout=settings.MEETING_MERGE_TIMEOUT_SECONDS,
@@ -239,11 +245,11 @@ async def concat_webm_chunks(chunk_paths: list[Path], output_path: Path) -> Path
         copy_error is None
         and intermediate.exists()
         and intermediate.stat().st_size > 8_192
-        and has_webm_header(intermediate.read_bytes()[:4])
+        and _file_has_webm_header(intermediate)
     ):
         final = _webm_output_path(output_path)
-        if final != intermediate:
-            final.write_bytes(intermediate.read_bytes())
+        if final.resolve() != intermediate.resolve():
+            intermediate.replace(final)
         diag_log(
             "meeting_video_merge_stream_copy",
             bytes=final.stat().st_size,
@@ -253,7 +259,7 @@ async def concat_webm_chunks(chunk_paths: list[Path], output_path: Path) -> Path
         return final
 
     # Last resort: light VP8 re-encode (still cheaper than H.264). Skip if OOM likely.
-    if getattr(settings, "MEETING_MERGE_ALLOW_REENCODE", True):
+    if getattr(settings, "MEETING_MERGE_ALLOW_REENCODE", False):
         reencode_target = _webm_output_path(output_path)
         reencode_error = await _run_ffmpeg(
             [
@@ -301,12 +307,10 @@ async def concat_webm_chunks(chunk_paths: list[Path], output_path: Path) -> Path
             return reencode_target
 
     # If concat produced anything with a WebM header, prefer that over hard failure.
-    if intermediate.exists() and intermediate.stat().st_size > 0:
-        head = intermediate.read_bytes()[:4]
-        if has_webm_header(head):
-            final = _webm_output_path(output_path)
-            if final != intermediate:
-                final.write_bytes(intermediate.read_bytes())
+    if intermediate.exists() and intermediate.stat().st_size > 0 and _file_has_webm_header(intermediate):
+        final = _webm_output_path(output_path)
+        if final.resolve() != intermediate.resolve():
+            intermediate.replace(final)
             diag_log(
                 "meeting_video_merge_concat_fallback",
                 bytes=final.stat().st_size,
@@ -319,6 +323,19 @@ async def concat_webm_chunks(chunk_paths: list[Path], output_path: Path) -> Path
         corrupt=True,
         stderr=str(copy_error.stderr if copy_error else "")[:1000],
     )
+
+
+async def _stop_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        process.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except (ProcessLookupError, asyncio.TimeoutError):
+        return
 
 
 def _webm_output_path(output_path: Path) -> Path:
@@ -349,9 +366,12 @@ async def _run_ffmpeg(
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError as error:
-        process.kill()
-        await process.wait()
-        raise MeetingAudioExtractionError("FFmpeg timed out", corrupt=False) from error
+        await _stop_process(process)
+        failure = MeetingAudioExtractionError("FFmpeg timed out", corrupt=False)
+        # A single slow fragment must not abort the whole recording or retry forever.
+        if allow_failure:
+            return failure
+        raise failure from error
 
     stderr_text = (stderr or b"").decode("utf-8", errors="replace")[-4000:]
     if process.returncode == 0:
@@ -373,17 +393,31 @@ async def _run_ffmpeg(
     raise failure
 
 
+def _file_has_webm_header(path: Path) -> bool:
+    try:
+        with path.open("rb") as recorded:
+            return has_webm_header(recorded.read(4))
+    except OSError:
+        return False
+
+
+def _read_prefix(path: Path, limit: int = 262_144) -> bytes:
+    with path.open("rb") as recorded:
+        return recorded.read(limit)
+
+
 def _normalize_webm_fragments(chunk_paths: list[Path]) -> list[Path]:
-    first = chunk_paths[0].read_bytes()
-    init = extract_webm_init(first) if has_webm_header(first) else b""
+    first = _read_prefix(chunk_paths[0])
+    init = extract_webm_init(first) if has_webm_header(first) and WEBM_CLUSTER_ID in first else b""
     normalized: list[Path] = []
     for index, path in enumerate(chunk_paths):
-        data = path.read_bytes() if index else first
-        if index == 0 or has_webm_header(data) or not init:
+        if index == 0 or not init or _file_has_webm_header(path):
             normalized.append(path)
             continue
         repaired = path.with_name(f"{path.stem}.hdr.webm")
-        repaired.write_bytes(init + data)
+        with repaired.open("wb") as destination, path.open("rb") as source:
+            destination.write(init)
+            shutil.copyfileobj(source, destination)
         normalized.append(repaired)
     return normalized
 
@@ -412,10 +446,10 @@ async def _sanitize_webm_fragments(fragments: list[Path]) -> list[Path]:
                 "webm",
                 str(target),
             ],
-            timeout=settings.MEETING_FFMPEG_TIMEOUT_SECONDS,
+            timeout=min(20.0, float(settings.MEETING_FFMPEG_TIMEOUT_SECONDS)),
             allow_failure=True,
         )
-        if error is None and target.exists() and target.stat().st_size > 1_024 and has_webm_header(target.read_bytes()[:4]):
+        if error is None and target.exists() and target.stat().st_size > 1_024 and _file_has_webm_header(target):
             cleaned.append(target)
             continue
         if error is not None and error.corrupt:

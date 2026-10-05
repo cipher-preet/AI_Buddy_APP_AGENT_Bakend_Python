@@ -26,6 +26,7 @@ from apps.api_gateway.workers.daily_briefing_worker import (
 from services.db.mongo import close_mongo_client, ensure_mongo_indexes
 from services.llm.router import close_llm_runtime, log_llm_provider_status
 from services.meeting_extension.ffmpeg_audio import probe_ffmpeg
+from services.meeting_extension.video_merge import resume_stuck_video_merges
 from services.observability.diagnostics import (
     diag_log,
     run_event_loop_lag_monitor,
@@ -91,6 +92,7 @@ async def main():
     print("Conversation workers starting...")
     log_llm_provider_status("conversation-worker-startup")
     probe_ffmpeg()
+    await resume_stuck_video_merges()
 
     stt_consumer = build_stt_consumer()
     audio_consumer = build_audio_consumer()
