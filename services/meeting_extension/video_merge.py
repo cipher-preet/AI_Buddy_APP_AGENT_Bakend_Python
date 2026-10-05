@@ -28,6 +28,8 @@ async def process_meeting_video_merge(event: EventEnvelope) -> None:
     validate_meeting_object_key(object_key=final_key, user_id=user_id, meeting_session_id=meeting_session_id)
     db = get_database_safe()
     for merge_pass in range(1, MAX_MERGE_PASSES + 1):
+        # The server can raise expectedFinalSequence after enqueue (late/auto-finalized STOP).
+        expected = await _current_expected_sequence(db, meeting_session_id, expected)
         await _merge_once(db, meeting_session_id, user_id, expected, final_key)
         # Clear the flag atomically; only loop if a late chunk asked for it during this pass.
         rerun = await db.meeting_sessions.find_one_and_update(
@@ -141,6 +143,7 @@ async def _merge_once(db, meeting_session_id: str, user_id: str, expected: int, 
                     "updatedAt": now,
                     "mergeMissingSequences": missing_sequences,
                     "mergePresentChunkCount": len(chunk_paths),
+                    "mergeExpectedSequence": expected,
                 }
             },
         )
@@ -168,6 +171,15 @@ async def _merge_once(db, meeting_session_id: str, user_id: str, expected: int, 
         raise
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def _current_expected_sequence(db, meeting_session_id: str, fallback: int) -> int:
+    try:
+        doc = await db.meeting_sessions.find_one({"_id": _oid(meeting_session_id)}, {"expectedFinalSequence": 1})
+        latest = int((doc or {}).get("expectedFinalSequence") or 0)
+    except Exception:
+        return fallback
+    return max(latest, fallback)
 
 
 def get_database_safe():

@@ -5,9 +5,28 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from services.conversation.models import ExtractedNote, ExtractedTask
+
+
+def _require_every_property(schema: dict[str, Any]) -> None:
+    properties = schema.get("properties") or {}
+    if properties:
+        schema["required"] = list(properties)
+
+
+class WireModel(BaseModel):
+    """LLM-facing response model.
+
+    Constrained decoders (json_schema / guided decoding) routinely skip
+    properties that are not listed as required, silently dropping fields that
+    carry defaults. The wire schema therefore marks every property required,
+    while Python-side defaults keep parsing lenient for providers that still
+    omit a field.
+    """
+
+    model_config = ConfigDict(json_schema_extra=_require_every_property)
 
 
 class CandidateKind(str, Enum):
@@ -52,47 +71,94 @@ class MeetingCandidate(BaseModel):
     evidenceSequences: list[int] = Field(default_factory=list)
     owner: str | None = None
     dueDate: str | None = None
+    topic: str | None = None
     sourceWindowId: str = ""
     sourceWindowIndex: int = 0
 
 
-class CandidateLLMItem(BaseModel):
+class CandidateLLMItem(WireModel):
     candidateId: str | None = None
     kind: CandidateKind = CandidateKind.FACT
+    topic: str | None = None
     meaning: str
     evidenceSequences: list[int] = Field(min_length=1)
     owner: str | None = None
     dueDate: str | None = None
 
 
-class MeetingCandidateExtractorResponse(BaseModel):
+class MeetingCandidateExtractorResponse(WireModel):
     candidates: list[CandidateLLMItem] = Field(default_factory=list)
 
 
-class ConsolidatedTaskItem(BaseModel):
+class ConsolidatedTaskItem(WireModel):
     title: str
     description: str = ""
+    acceptanceCriteria: str = ""
+    priority: str | None = None
+    topic: str | None = None
     owner: str | None = None
     dueDate: str | None = None
     sourceCandidateIds: list[str] = Field(default_factory=list)
     evidenceSequences: list[int] = Field(default_factory=list)
 
 
-class ConsolidatedNoteItem(BaseModel):
+class ConsolidatedNoteItem(WireModel):
     title: str
     body: str
+    topic: str | None = None
     sourceCandidateIds: list[str] = Field(default_factory=list)
     evidenceSequences: list[int] = Field(default_factory=list)
 
 
-class MeetingConsolidatorResponse(BaseModel):
+class MeetingConsolidatorResponse(WireModel):
     tasks: list[ConsolidatedTaskItem] = Field(default_factory=list)
     notes: list[ConsolidatedNoteItem] = Field(default_factory=list)
+    discardedCandidateIds: list[str] = Field(default_factory=list)
     summary: str = ""
     topics: list[str] = Field(default_factory=list)
 
 
-class MeetingTaskEligibilityResponse(BaseModel):
+class CoverageAttachment(WireModel):
+    artifactId: str
+    candidateIds: list[str] = Field(default_factory=list)
+    addition: str = ""
+
+
+class MeetingCoverageResponse(WireModel):
+    attachments: list[CoverageAttachment] = Field(default_factory=list)
+    tasks: list[ConsolidatedTaskItem] = Field(default_factory=list)
+    notes: list[ConsolidatedNoteItem] = Field(default_factory=list)
+    discardedCandidateIds: list[str] = Field(default_factory=list)
+
+
+class OutlineSection(WireModel):
+    title: str = ""
+    noteIds: list[str] = Field(default_factory=list)
+
+
+class OutlineTaskMerge(WireModel):
+    title: str = ""
+    taskIds: list[str] = Field(default_factory=list)
+
+
+class OutlinePriority(WireModel):
+    taskId: str = ""
+    priority: str = ""
+
+
+class MeetingLogisticsResponse(WireModel):
+    offTopicIds: list[str] = Field(default_factory=list)
+
+
+class MeetingOutlineResponse(WireModel):
+    offTopicIds: list[str] = Field(default_factory=list)
+    rankedTaskIds: list[str] = Field(default_factory=list)
+    priorities: list[OutlinePriority] = Field(default_factory=list)
+    taskMerges: list[OutlineTaskMerge] = Field(default_factory=list)
+    sections: list[OutlineSection] = Field(default_factory=list)
+
+
+class MeetingTaskEligibilityResponse(WireModel):
     tasks: list[ConsolidatedTaskItem] = Field(default_factory=list)
 
 
@@ -103,6 +169,9 @@ class ArtifactClaim(BaseModel):
     body: str = ""
     owner: str | None = None
     dueDate: str | None = None
+    priority: str | None = None
+    acceptanceCriteria: str = ""
+    topic: str | None = None
     sourceCandidateIds: list[str] = Field(default_factory=list)
     evidenceSequences: list[int] = Field(default_factory=list)
 
@@ -114,14 +183,14 @@ class FieldSupport(BaseModel):
     dueDate: bool | None = None
 
 
-class VerifierFieldSupport(BaseModel):
+class VerifierFieldSupport(WireModel):
     title: bool
     description: bool
     owner: bool
     dueDate: bool
 
 
-class VerifierItem(BaseModel):
+class VerifierItem(WireModel):
     artifactKey: str
     verdict: VerifierVerdict
     unsupportedFields: list[str] = Field(default_factory=list)
@@ -136,13 +205,14 @@ class VerifierItem(BaseModel):
         return self
 
 
-class MeetingVerifierResponse(BaseModel):
+class MeetingVerifierResponse(WireModel):
     items: list[VerifierItem] = Field(default_factory=list)
 
 
-class MeetingArtifactRepairResponse(BaseModel):
+class MeetingArtifactRepairResponse(WireModel):
     title: str
     body: str = ""
+    acceptanceCriteria: str | None = None
     owner: str | None = None
     dueDate: str | None = None
 
@@ -153,6 +223,9 @@ class VerifiedArtifact(BaseModel):
     body: str = ""
     owner: str | None = None
     dueDate: str | None = None
+    priority: str | None = None
+    acceptanceCriteria: str = ""
+    topic: str | None = None
     sourceCandidateIds: list[str] = Field(default_factory=list)
     evidenceSequences: list[int] = Field(default_factory=list)
     verdict: VerifierVerdict = VerifierVerdict.UNSUPPORTED

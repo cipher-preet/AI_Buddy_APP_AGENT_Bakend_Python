@@ -23,6 +23,7 @@ from services.chat.models import MAX_CHAT_MESSAGES
 from services.chat.node_client import NodeApiError
 from services.chat.planner import ChatQueryPlan, plan_chat_query
 from services.chat.repository import ChatRepository, to_mongo_id
+from services.chat.text_utils import match_option, strip_tool_call_markup
 from services.chat.writes import ChatWriteStore
 from services.daily_briefing.timezones import DEFAULT_TIMEZONE, date_key_for
 from services.llm.models import LLMMessage, LLMRequest, StructuredLLMRequest
@@ -663,7 +664,7 @@ def _resolve_option(reply: str, options: list[dict[str, Any]]) -> dict[str, Any]
     matches = [option for option in options if str(option.get("label") or "").strip().lower() in normalized]
     if len(matches) == 1:
         return matches[0]
-    return None
+    return match_option(reply, options)
 
 
 _SOURCE_MARKERS = {"source", "sources", "references", "context", "retrieved context", "evidence"}
@@ -671,7 +672,7 @@ _SOURCE_MARKERS = {"source", "sources", "references", "context", "retrieved cont
 
 def _clean_answer(answer: str) -> str:
     cleaned = []
-    for line in (answer or "").splitlines():
+    for line in strip_tool_call_markup(answer or "").splitlines():
         if line.strip().strip("*#:- ").lower() in _SOURCE_MARKERS:
             break
         cleaned.append(line)

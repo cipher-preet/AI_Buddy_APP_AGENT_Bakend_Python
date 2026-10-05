@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from services.conversation.meeting_pipeline.flags import verifier_batch_chars
+from services.conversation.meeting_pipeline.harness import clean_inline, clean_multiline
 from services.conversation.meeting_pipeline.llm import generate_structured
 from services.conversation.meeting_pipeline.schemas import (
     ArtifactClaim,
@@ -11,10 +13,31 @@ from services.conversation.meeting_pipeline.schemas import (
     VerifiedArtifact,
     VerifierVerdict,
 )
+from services.llm.async_runtime import reraise_if_hard_runtime
 from services.llm.router import LLMCapability, LLMRouter
 
 _BATCH_SIZE = 8
 _METADATA_FIELDS = {"owner", "dueDate", "ownerText", "dueDateText"}
+
+
+def _size_batches(artifacts: list[ArtifactClaim], sequence_text: dict[int, str]) -> list[list[ArtifactClaim]]:
+    """Batch by payload size as well as count so rich notes never truncate verifier output."""
+    budget = verifier_batch_chars()
+    batches: list[list[ArtifactClaim]] = []
+    current: list[ArtifactClaim] = []
+    size = 0
+    for item in artifacts:
+        cost = len(item.title) + len(item.body) + len(item.acceptanceCriteria or "") + sum(
+            len(sequence_text.get(sequence, "")) for sequence in item.evidenceSequences
+        )
+        if current and (len(current) >= _BATCH_SIZE or size + cost > budget):
+            batches.append(current)
+            current, size = [], 0
+        current.append(item)
+        size += cost
+    if current:
+        batches.append(current)
+    return batches
 
 
 class ArtifactEvidenceVerifier:
@@ -36,13 +59,10 @@ class ArtifactEvidenceVerifier:
     ) -> list[VerifiedArtifact]:
         self._meeting_at = meeting_at
         verified: list[VerifiedArtifact] = []
-        for offset in range(0, len(artifacts), _BATCH_SIZE):
-            batch = artifacts[offset : offset + _BATCH_SIZE]
-            items = await self._review_batch(batch, sequence_text)
-            by_key = {item.artifactKey: item for item in items}
+        for batch in _size_batches(artifacts, sequence_text):
+            rows = await self._review_resilient(batch, sequence_text)
             for claim in batch:
-                row = by_key.get(claim.artifactKey)
-                verified.append(apply_field_support(_apply_verdict(claim, row)))
+                verified.append(apply_field_support(_apply_verdict(claim, rows.get(claim.artifactKey))))
         repaired: list[VerifiedArtifact] = []
         for item in verified:
             if item.verdict == VerifierVerdict.SUPPORTED:
@@ -62,6 +82,41 @@ class ArtifactEvidenceVerifier:
             repaired.append(once)
         return repaired
 
+    async def _review_resilient(self, batch: list[ArtifactClaim], sequence_text: dict[int, str]) -> dict:
+        """Verify a batch; split on failure and re-ask for rows the model omitted.
+
+        A single artifact that still fails raises, preserving fail-fast
+        semantics for a genuinely unavailable verifier.
+        """
+        try:
+            items = await self._review_batch(batch, sequence_text)
+        except Exception as error:
+            reraise_if_hard_runtime(error)
+            if len(batch) <= 1:
+                raise
+            middle = len(batch) // 2
+            left = await self._review_resilient(batch[:middle], sequence_text)
+            right = await self._review_resilient(batch[middle:], sequence_text)
+            return {**left, **right}
+        keys = {claim.artifactKey for claim in batch}
+        rows = {str(getattr(item, "artifactKey", "")): item for item in items}
+        missing = [claim for claim in batch if claim.artifactKey not in rows]
+        stray = [item for item in items if str(getattr(item, "artifactKey", "")) not in keys]
+        if missing and len(stray) == len(missing):
+            for claim, item in zip(missing, stray):
+                rows[claim.artifactKey] = item
+            missing = []
+        if missing:
+            for claim in missing:
+                try:
+                    retry = await self._review_batch([claim], sequence_text)
+                except Exception as error:
+                    reraise_if_hard_runtime(error)
+                    continue
+                if retry:
+                    rows[claim.artifactKey] = retry[0]
+        return rows
+
     async def _review_batch(self, batch: list[ArtifactClaim], sequence_text: dict[int, str]) -> list:
         self.calls += 1
         meeting = getattr(self, "_meeting_at", None)
@@ -73,6 +128,7 @@ class ArtifactEvidenceVerifier:
                     "kind": item.kind,
                     "title": item.title,
                     "body": item.body,
+                    "acceptanceCriteria": item.acceptanceCriteria or None,
                     "owner": item.owner,
                     "dueDate": item.dueDate,
                     "evidence": {
@@ -114,6 +170,9 @@ class ArtifactEvidenceVerifier:
             body=repaired.body,
             owner=repaired.owner,
             dueDate=repaired.dueDate,
+            priority=repaired.priority,
+            acceptanceCriteria=repaired.acceptanceCriteria,
+            topic=repaired.topic,
             sourceCandidateIds=repaired.sourceCandidateIds,
             evidenceSequences=repaired.evidenceSequences,
         )
@@ -130,8 +189,10 @@ class ArtifactEvidenceVerifier:
         self.calls += 1
         self.repair_calls += 1
         payload = {
+            "kind": item.kind,
             "title": item.title,
             "body": item.body,
+            "acceptanceCriteria": item.acceptanceCriteria or None,
             "owner": item.owner,
             "dueDate": item.dueDate,
             "unsupportedFields": item.unsupportedFields,
@@ -148,12 +209,14 @@ class ArtifactEvidenceVerifier:
         )
         self.last_provider = str(getattr(provider, "name", None) or provider or "unknown")
         self.last_model = str(model or "unknown")
-        title = " ".join(str(response.title or item.title).split()) or item.title
-        body = " ".join(str(response.body or item.body).split())
+        title = clean_inline(response.title or item.title) or item.title
+        body = clean_multiline(response.body or item.body)
+        criteria = response.acceptanceCriteria if response.acceptanceCriteria is not None else item.acceptanceCriteria
         return item.model_copy(
             update={
                 "title": title,
                 "body": body or item.body,
+                "acceptanceCriteria": clean_inline(criteria),
                 "owner": _optional_text(response.owner),
                 "dueDate": _optional_text(response.dueDate),
                 "repaired": True,
@@ -203,6 +266,9 @@ def _apply_verdict(claim: ArtifactClaim, row) -> VerifiedArtifact:
         body=claim.body,
         owner=claim.owner,
         dueDate=claim.dueDate,
+        priority=claim.priority,
+        acceptanceCriteria=claim.acceptanceCriteria,
+        topic=claim.topic,
         sourceCandidateIds=list(claim.sourceCandidateIds),
         evidenceSequences=list(claim.evidenceSequences),
         verdict=verdict,

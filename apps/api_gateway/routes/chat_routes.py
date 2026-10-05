@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
+from pymongo.errors import AutoReconnect, ServerSelectionTimeoutError
 
 from apps.api_gateway.controllers.chat_controller import (
     ask_chat_controller,
@@ -95,3 +96,8 @@ async def _call(awaitable):
         raise HTTPException(status_code=403, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    except (AutoReconnect, ServerSelectionTimeoutError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Database connection was interrupted. Please try again.",
+        ) from error

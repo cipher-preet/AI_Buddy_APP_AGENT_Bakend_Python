@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, TypedDict
 
@@ -19,10 +20,12 @@ from services.chat.models import MAX_CHAT_MESSAGES
 from services.chat.planner import ChatQueryPlan, plan_chat_query
 from services.chat.repository import ChatRepository, encode_sessions_cursor
 from services.chat.retrieval import ChatRetriever, format_context
+from services.chat.text_utils import match_option, strip_tool_call_markup
 from services.chat.tools import ChatToolRunner
 from services.llm.models import LLMMessage, LLMRequest, StructuredLLMRequest
 from services.llm.router import LLMCapability, get_llm_router
 
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are Buddy — the user's personal companion and workspace co-pilot.
 You have access to their spaces, tasks, notes, meeting transcripts, embeddings, calendar events, reminders, and past chat turns when those tools return context.
@@ -41,6 +44,7 @@ How to answer:
 - Never invent tasks, meetings, notes, or quotes. If evidence is thin, say so briefly and ask one precise follow-up.
 - Be direct, warm, and optimized for action. Prefer short sections and bullets when summarizing.
 - Never return an empty response.
+- You cannot call tools yourself; all tool results are already included in the context. Never output tool-call syntax such as <tool_call>, call:..., or function JSON. If a needed detail (like which space) is missing, ask the user in plain words.
 - Never include raw source IDs, chunk numbers, citations, source lists, or verbatim retrieved context dumps.
 - Do not add a Source, Sources, Evidence, Context, or References section."""
 
@@ -417,12 +421,18 @@ class ChatService:
         if plan and not plan.useVectorSearch:
             state["context_text"] = "Vector retrieval skipped by query plan."
             return state
-        contexts = await self.retriever.retrieve_many(
-            state["search_queries"],
-            state["user_id"],
-            state["space_id"],
-            space_ids=state.get("space_ids") or [],
-        )
+        try:
+            contexts = await self.retriever.retrieve_many(
+                state["search_queries"],
+                state["user_id"],
+                state["space_id"],
+                space_ids=state.get("space_ids") or [],
+            )
+        except Exception as error:
+            # Embedding/vector outages must not fail the whole chat turn; structured tools still answer.
+            logger.warning("Vector retrieval failed, continuing without it: %s: %s", type(error).__name__, error)
+            state["context_text"] = "Vector retrieval is temporarily unavailable."
+            return state
         state["context_text"] = format_context(contexts)
         return state
 
@@ -477,7 +487,8 @@ class ChatService:
                         LLMMessage(
                             role="user",
                             content=(
-                                "Your previous answer was empty. Return a helpful English answer now. "
+                                "Your previous answer was empty. Return a helpful English answer now as plain text. "
+                                "You cannot call tools; never output tool-call syntax. "
                                 "If the retrieved context is insufficient, say that clearly and ask one follow-up question. "
                                 "Do not include sources, source IDs, chunk numbers, citations, or raw context text."
                             ),
@@ -593,21 +604,7 @@ def _message_response(message: BaseMessage) -> dict[str, Any]:
 
 
 def _resolve_pending_option(selection: str, options: list[dict[str, Any]]) -> dict[str, Any] | None:
-    normalized = selection.strip().lower()
-    if not normalized:
-        return None
-    if normalized.isdigit():
-        requested_index = int(normalized)
-        for option in options:
-            if int(option.get("index") or 0) == requested_index:
-                return option
-
-    for option in options:
-        label = str(option.get("label") or "").strip().lower()
-        value = str(option.get("value") or "").strip().lower()
-        if normalized in {label, value}:
-            return option
-    return None
+    return match_option(selection, options)
 
 
 def _space_options(spaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -732,7 +729,7 @@ def _merge_pending_space_action(
 
 
 def _sanitize_public_answer(answer: str) -> str:
-    lines = answer.splitlines()
+    lines = strip_tool_call_markup(answer).splitlines()
     cleaned = []
     stop_markers = {
         "source:",

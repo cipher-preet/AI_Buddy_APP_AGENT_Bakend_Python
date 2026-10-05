@@ -8,6 +8,7 @@ from typing import Any
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo import ASCENDING, IndexModel
+from pymongo.errors import AutoReconnect
 
 from apps.api_gateway.config.setting import settings
 from services.chat.langchain_history import MotorMongoChatMessageHistory
@@ -128,7 +129,11 @@ class ChatRepository:
             spaceId=to_mongo_id(space_id),
             meetingId=to_mongo_id(meeting_id),
         )
-        await self.db.chat_sessions.insert_one(session.model_dump(by_alias=True))
+        document = session.model_dump(by_alias=True)
+        try:
+            await self.db.chat_sessions.insert_one(document)
+        except AutoReconnect:
+            await self.db.chat_sessions.insert_one(document)
         return session
 
     async def archive_session(self, chat_id: Any) -> None:

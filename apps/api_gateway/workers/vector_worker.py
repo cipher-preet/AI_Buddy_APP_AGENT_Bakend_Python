@@ -1,6 +1,7 @@
 # apps/api_gateway/workers/vector_worker.py
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 
 from apps.api_gateway.config.setting import settings
@@ -10,6 +11,8 @@ from services.queue.redis_queue import (
     delete_speech_job,
     get_job_result,
     pop_completed_speech_job,
+    push_completed_speech_job,
+    redis_client,
 )
 from services.queue.streams import EventEnvelope, RedisStreamProducer
 
@@ -69,7 +72,9 @@ async def process_completed_speech_job(job_id: str) -> None:
 
     conversation_id = str(job.get("conversation_id") or "").strip()
     sequence_number = job.get("sequence_number")
-    if conversation_id and sequence_number is not None:
+    # A vector retry re-enters here; the transcript chunk was already completed on the first pass.
+    is_vector_retry = bool(job.get("vector_attempts"))
+    if conversation_id and sequence_number is not None and not is_vector_retry:
         repository = ConversationRepository(get_database())
         await repository.complete_transcript_chunk(
             conversation_id=conversation_id,
@@ -110,14 +115,21 @@ async def process_completed_speech_job(job_id: str) -> None:
         await delete_speech_job(job_id)
         return
 
-    await store_transcript_in_vector_db(
-        user_id=user_id,
-        space_id=space_id,
-        job_id=job_id,
-        transcript=transcript,
-        language_code=language_code,
-        request_id=request_id,
-    )
+    try:
+        await store_transcript_in_vector_db(
+            user_id=user_id,
+            space_id=space_id,
+            job_id=job_id,
+            transcript=transcript,
+            language_code=language_code,
+            request_id=request_id,
+        )
+    except Exception as error:
+        if await _schedule_vector_retry(job_id, job, error):
+            return
+        # Out of retries: keep the transcript durable for re-indexing; chat falls back to
+        # lexical search over transcript_chunks meanwhile.
+        await _record_vector_failure(job_id, user_id, space_id, conversation_id, transcript, error)
     audio_removed = _remove_processed_audio_file(job.get("file_path"))
 
     print(
@@ -134,6 +146,67 @@ async def process_completed_speech_job(job_id: str) -> None:
     )
 
     await delete_speech_job(job_id)
+
+
+VECTOR_MAX_ATTEMPTS = 5
+VECTOR_RETRY_DELAYS_SECONDS = (5, 30, 120, 300)
+_retry_tasks: set[asyncio.Task] = set()
+
+
+async def _schedule_vector_retry(job_id: str, job: dict, error: Exception) -> bool:
+    attempts = int(job.get("vector_attempts") or 0) + 1
+    if attempts >= VECTOR_MAX_ATTEMPTS:
+        return False
+    try:
+        await redis_client.hset(f"speech_job:{job_id}", mapping={"vector_attempts": attempts})
+    except Exception:
+        return False
+    delay = VECTOR_RETRY_DELAYS_SECONDS[min(attempts - 1, len(VECTOR_RETRY_DELAYS_SECONDS) - 1)]
+    print(
+        "Transcript vector job failed, retrying:",
+        {"job_id": job_id, "attempt": attempts, "retry_in_seconds": delay, "error": str(error)[:300]},
+    )
+    task = asyncio.create_task(_requeue_after(job_id, delay))
+    _retry_tasks.add(task)
+    task.add_done_callback(_retry_tasks.discard)
+    return True
+
+
+async def _requeue_after(job_id: str, delay_seconds: float) -> None:
+    await asyncio.sleep(delay_seconds)
+    try:
+        await push_completed_speech_job(job_id)
+    except Exception as error:
+        print("Transcript vector retry requeue failed:", {"job_id": job_id, "error": str(error)[:300]})
+
+
+async def _record_vector_failure(
+    job_id: str,
+    user_id: str,
+    space_id: str,
+    conversation_id: str,
+    transcript: str,
+    error: Exception,
+) -> None:
+    print("Transcript vector job failed permanently:", {"job_id": job_id, "error": str(error)[:300]})
+    try:
+        await get_database().vector_index_failures.update_one(
+            {"_id": job_id},
+            {
+                "$set": {
+                    "userId": user_id,
+                    "spaceId": space_id,
+                    "conversationId": conversation_id or None,
+                    "transcript": transcript,
+                    "error": str(error)[:500],
+                    "failedAt": datetime.now(timezone.utc),
+                    "status": "PENDING_REINDEX",
+                }
+            },
+            upsert=True,
+        )
+    except Exception as record_error:
+        print("Transcript vector failure record failed:", {"job_id": job_id, "error": str(record_error)[:300]})
 
 
 async def start_vector_consumer():

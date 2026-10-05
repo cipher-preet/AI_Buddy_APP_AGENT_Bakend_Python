@@ -7,8 +7,18 @@ from typing import Any
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
 from services.chat.models import RetrievedContext
+from services.conversation.repository import mongo_id_candidates
+from services.db.mongo import get_database
+from services.observability.diagnostics import diag_log
 from services.vector.embedding_service import generate_embedding
 from services.vector.qdrant_client import QDRANT_COLLECTION, ensure_collection_exists, qdrant_client
+
+LEXICAL_FALLBACK_SCAN_LIMIT = 400
+_FALLBACK_STOPWORDS = {
+    "the", "and", "for", "are", "was", "were", "who", "what", "when", "where", "why", "how", "did",
+    "does", "about", "this", "that", "with", "from", "said", "tell", "please", "can", "could",
+    "would", "should", "there", "their", "any", "all", "you", "our", "has", "have", "had",
+}
 
 
 class ChatRetriever:
@@ -31,6 +41,80 @@ class ChatRetriever:
         user_id: str,
         space_id: str | None = None,
         space_ids: list[str] | None = None,
+    ) -> list[RetrievedContext]:
+        try:
+            contexts = await self._vector_retrieve(queries, user_id, space_id, space_ids)
+        except Exception as error:
+            diag_log("chat_vector_retrieval_failed", userId=user_id, error=f"{type(error).__name__}: {error}"[:300])
+            contexts = []
+        if contexts:
+            return contexts
+        # Embeddings missing (never created / provider down): search stored transcripts by keywords.
+        return await self._lexical_transcript_fallback(queries, user_id, space_id, space_ids)
+
+    async def _lexical_transcript_fallback(
+        self,
+        queries: list[str],
+        user_id: str,
+        space_id: str | None,
+        space_ids: list[str] | None,
+    ) -> list[RetrievedContext]:
+        terms = _query_terms(queries) - _FALLBACK_STOPWORDS
+        if not terms:
+            return []
+        query: dict[str, Any] = {"userId": {"$in": mongo_id_candidates(user_id)}}
+        spaces = list(dict.fromkeys(sid for sid in [*(space_ids or []), space_id] if sid))
+        if spaces:
+            query["spaceId"] = {"$in": [candidate for sid in spaces for candidate in mongo_id_candidates(sid)]}
+        try:
+            rows = (
+                await get_database()
+                .transcript_chunks.find(
+                    query,
+                    {"rawText": 1, "normalizedText": 1, "conversationId": 1, "sequenceNumber": 1, "spaceId": 1},
+                )
+                .sort("createdAt", -1)
+                .limit(LEXICAL_FALLBACK_SCAN_LIMIT)
+                .to_list(LEXICAL_FALLBACK_SCAN_LIMIT)
+            )
+        except Exception as error:
+            diag_log("chat_lexical_fallback_failed", userId=user_id, error=str(error)[:300])
+            return []
+
+        scored: list[tuple[int, RetrievedContext]] = []
+        for row in rows:
+            text = str(row.get("normalizedText") or row.get("rawText") or "").strip()
+            overlap = _lexical_overlap(text, terms)
+            if not text or overlap <= 0:
+                continue
+            scored.append(
+                (
+                    overlap,
+                    RetrievedContext(
+                        text=text,
+                        score=overlap / (len(terms) + 1),
+                        sourceId=str(row.get("_id")),
+                        chunkIndex=row.get("sequenceNumber"),
+                        payload={
+                            "source": "transcript_lexical_fallback",
+                            "conversationId": str(row.get("conversationId") or ""),
+                            "spaceId": str(row.get("spaceId") or ""),
+                        },
+                    ),
+                )
+            )
+        scored.sort(key=lambda item: item[0], reverse=True)
+        contexts = [context for _, context in scored[: self.child_limit]]
+        if contexts:
+            diag_log("chat_lexical_fallback_used", userId=user_id, hits=len(contexts))
+        return contexts
+
+    async def _vector_retrieve(
+        self,
+        queries: list[str],
+        user_id: str,
+        space_id: str | None,
+        space_ids: list[str] | None,
     ) -> list[RetrievedContext]:
         await ensure_collection_exists()
         search_filter = _user_space_filter(user_id, space_id, space_ids)

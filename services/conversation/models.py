@@ -301,6 +301,7 @@ class ExtractedTask(BaseModel):
     dueDateText: str | None = None
     dueDateResolved: str | None = None
     dueDateStatus: Literal["resolved", "ambiguous", "none"] = "none"
+    priority: Literal["High", "Medium", "Low"] | None = None
     confidence: float = Field(ge=0, le=1)
     needsConfirmation: bool = False
     sourceConversationId: str
@@ -311,6 +312,17 @@ class ExtractedTask(BaseModel):
     parentTitle: str | None = None
     sourceWindowId: str | None = None
     origin: Literal["explicit", "strongly_inferred", "unknown"] = "unknown"
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def normalize_priority(cls, value: Any) -> str | None:
+        text = str(value or "").strip().casefold()
+        if not text:
+            return None
+        for label in ("High", "Medium", "Low"):
+            if text.startswith(label.casefold()):
+                return label
+        return None
 
 
 class ExtractedNote(BaseModel):

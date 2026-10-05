@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
+from datetime import timezone
 from hashlib import sha1
 from typing import Any
 
@@ -125,16 +126,27 @@ class MeetingTranscriptIndex:
     async def ensure_corpus(self, context: MeetingContext) -> MeetingCorpus:
         chunks = build_chunks(context.segments, settings.MEETING_CHAT_CHUNK_CHARS)
         if not chunks:
-            # Raw transcript chunks expire via TTL; the vector index is the durable copy.
+            # Raw transcript chunks expire via TTL. The vector index is the durable copy;
+            # the Mongo text copy covers meetings whose embeddings were never created.
             stored = await self._load_stored_chunks(context.meeting_id, context.user_id)
-            return MeetingCorpus(chunks=stored, vector_ready=bool(stored))
+            if stored:
+                return MeetingCorpus(chunks=stored, vector_ready=True)
+            saved = await self._load_text_copy(context.meeting_id, context.user_id)
+            if saved:
+                diag_log("meeting_chat_text_fallback", meetingId=context.meeting_id, chunkCount=len(saved))
+            return MeetingCorpus(chunks=saved, vector_ready=False)
 
         fingerprint = _fingerprint(chunks)
         lock = _meeting_locks.setdefault(context.meeting_id, asyncio.Lock())
         async with lock:
-            state = await self.db.meeting_chat_index.find_one({"_id": context.meeting_id})
-            if state and state.get("fingerprint") == fingerprint:
+            state = await self._load_state(context.meeting_id) or {}
+            if state.get("fingerprint") == fingerprint:
                 return MeetingCorpus(chunks=chunks, vector_ready=True)
+            if state.get("textFingerprint") != fingerprint:
+                await self._save_text_copy(context, chunks, fingerprint)
+            if _recent_index_failure(state, fingerprint):
+                # Embedding provider is failing — answer lexically instead of stalling every turn.
+                return MeetingCorpus(chunks=chunks, vector_ready=False)
             try:
                 await self._index(context, chunks, fingerprint)
                 return MeetingCorpus(chunks=chunks, vector_ready=True)
@@ -145,7 +157,56 @@ class MeetingTranscriptIndex:
                     chunkCount=len(chunks),
                     error=str(error)[:300],
                 )
+                await self._record_index_failure(context, fingerprint, error)
                 return MeetingCorpus(chunks=chunks, vector_ready=False)
+
+    async def _load_state(self, meeting_id: str) -> dict[str, Any] | None:
+        try:
+            return await self.db.meeting_chat_index.find_one({"_id": meeting_id})
+        except Exception as error:
+            diag_log("meeting_chat_index_state_failed", meetingId=meeting_id, error=str(error)[:300])
+            return None
+
+    async def _save_text_copy(self, context: MeetingContext, chunks: list[MeetingChunk], fingerprint: str) -> None:
+        """Embedding-independent copy of the chunk text, so chat survives transcript TTL."""
+        try:
+            await self.db.meeting_chat_index.update_one(
+                {"_id": context.meeting_id},
+                {
+                    "$set": {
+                        "userId": context.user_id,
+                        "textFingerprint": fingerprint,
+                        "textChunks": [_chunk_to_doc(chunk) for chunk in chunks],
+                        "textSavedAt": utc_now(),
+                    }
+                },
+                upsert=True,
+            )
+        except Exception as error:
+            diag_log("meeting_chat_text_copy_failed", meetingId=context.meeting_id, error=str(error)[:300])
+
+    async def _load_text_copy(self, meeting_id: str, user_id: str) -> list[MeetingChunk]:
+        state = await self._load_state(meeting_id)
+        if not state or str(state.get("userId")) != str(user_id):
+            return []
+        return [_chunk_from_doc(doc) for doc in state.get("textChunks") or [] if isinstance(doc, dict)]
+
+    async def _record_index_failure(self, context: MeetingContext, fingerprint: str, error: Exception) -> None:
+        try:
+            await self.db.meeting_chat_index.update_one(
+                {"_id": context.meeting_id},
+                {
+                    "$set": {
+                        "userId": context.user_id,
+                        "lastIndexError": str(error)[:300],
+                        "lastIndexErrorAt": utc_now(),
+                        "lastIndexErrorFingerprint": fingerprint,
+                    }
+                },
+                upsert=True,
+            )
+        except Exception:
+            pass
 
     async def search(
         self,
@@ -280,6 +341,61 @@ class MeetingTranscriptIndex:
             limit=limit,
             with_payload=True,
         )
+
+
+INDEX_RETRY_BACKOFF_SECONDS = 300
+
+
+def _recent_index_failure(state: dict[str, Any], fingerprint: str) -> bool:
+    failed_at = state.get("lastIndexErrorAt")
+    if not failed_at or state.get("lastIndexErrorFingerprint") != fingerprint:
+        return False
+    if failed_at.tzinfo is None:
+        failed_at = failed_at.replace(tzinfo=timezone.utc)
+    return (utc_now() - failed_at).total_seconds() < INDEX_RETRY_BACKOFF_SECONDS
+
+
+def _chunk_to_doc(chunk: MeetingChunk) -> dict[str, Any]:
+    return {
+        "index": chunk.index,
+        "text": chunk.text,
+        "startMs": chunk.start_ms,
+        "endMs": chunk.end_ms,
+        "speakers": chunk.speakers,
+    }
+
+
+def _chunk_from_doc(doc: dict[str, Any]) -> MeetingChunk:
+    return MeetingChunk(
+        index=int(doc.get("index") or 0),
+        text=str(doc.get("text") or ""),
+        start_ms=doc.get("startMs"),
+        end_ms=doc.get("endMs"),
+        speakers=list(doc.get("speakers") or []),
+    )
+
+
+async def prepare_meeting_chat_index(user_id: str, meeting_id: str) -> bool:
+    """Build the chat corpus as soon as a meeting is processed, before transcripts expire.
+
+    Best-effort: returns whether embeddings were created. The text copy is saved either way.
+    """
+    from services.chat.meeting.context import MeetingContextLoader
+
+    try:
+        db = get_database()
+        context = await MeetingContextLoader(db).load(user_id, meeting_id)
+        corpus = await MeetingTranscriptIndex(db).ensure_corpus(context)
+        diag_log(
+            "meeting_chat_index_prepared",
+            meetingId=meeting_id,
+            chunkCount=len(corpus.chunks),
+            vectorReady=corpus.vector_ready,
+        )
+        return corpus.vector_ready
+    except Exception as error:
+        diag_log("meeting_chat_index_prepare_failed", meetingId=meeting_id, error=str(error)[:300])
+        return False
 
 
 def _embedding_text(context: MeetingContext, chunk: MeetingChunk) -> str:

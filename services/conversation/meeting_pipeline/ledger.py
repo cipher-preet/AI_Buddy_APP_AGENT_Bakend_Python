@@ -33,6 +33,7 @@ class CandidateLedger:
             {
                 "candidateId": item.candidateId,
                 "kind": item.kind.value if hasattr(item.kind, "value") else str(item.kind),
+                "topic": item.topic,
                 "meaning": item.meaning,
                 "evidenceSequences": list(item.evidenceSequences),
                 "owner": item.owner,

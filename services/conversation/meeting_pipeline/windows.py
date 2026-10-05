@@ -17,7 +17,7 @@ from services.conversation.windowing import useful_transcript_text
 
 
 _SPEAKER_PREFIX = re.compile(
-    r"^(?:\[)?(?:speaker[\s_:-]*)(\d+)(?:\])?\s*[:\-]\s*(.*)$",
+    r"^\[?\s*speaker[\s_:-]*(\d+)\s*\]?\s*[:\-]?\s*(.*)$",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -32,13 +32,10 @@ def turns_from_chunks(chunks: Iterable) -> list[TranscriptTurn]:
         seen.add(sequence)
         raw = useful_transcript_text(chunk) if hasattr(chunk, "rawText") or hasattr(chunk, "normalizedText") else str(getattr(chunk, "raw_text", "") or "")
         speaker = str(getattr(chunk, "speaker", None) or "") or None
-        text = raw
-        parsed_speaker, parsed_text = split_speaker_label(raw)
+        parsed_speaker, text = _parse_chunk_speakers(raw)
         if parsed_speaker and not speaker:
             speaker = parsed_speaker
-        if parsed_text:
-            text = parsed_text
-        turns.append(TranscriptTurn(sequence_id=sequence, speaker=speaker, raw_text=text))
+        turns.append(TranscriptTurn(sequence_id=sequence, speaker=speaker, raw_text=text or raw))
     return turns
 
 
@@ -47,15 +44,43 @@ def split_speaker_label(text: str) -> tuple[str | None, str]:
     if not value:
         return None, ""
     match = _SPEAKER_PREFIX.match(value)
-    if not match:
+    if not match or not (match.group(2) or "").strip():
         return None, value
     return f"Speaker {match.group(1)}", (match.group(2) or "").strip()
 
 
+def _parse_chunk_speakers(raw: str) -> tuple[str | None, str]:
+    """One STT chunk may hold several diarized lines.
+
+    Single-speaker chunks drop the label (the turn carries it). Multi-speaker
+    chunks keep a per-line label so the extractor can tell who said what.
+    """
+    lines = [line.strip() for line in (raw or "").splitlines() if line.strip()]
+    if not lines:
+        return None, ""
+    parsed = [split_speaker_label(line) for line in lines]
+    speakers = {speaker for speaker, _ in parsed if speaker}
+    if len(speakers) <= 1:
+        speaker = next(iter(speakers), None)
+        return speaker, "\n".join(text for _, text in parsed if text)
+    rendered: list[str] = []
+    current: str | None = None
+    for speaker, text in parsed:
+        current = speaker or current
+        rendered.append(f"[{current}] {text}" if current else text)
+    return None, "\n".join(rendered)
+
+
 def format_window_line(turn: TranscriptTurn) -> str:
-    speaker = turn.speaker or "Speaker"
-    body = (turn.raw_text or "").strip()
-    return f"[{turn.sequence_id}][{speaker}] {body}".rstrip()
+    default = turn.speaker or "Speaker"
+    lines = [line.strip() for line in (turn.raw_text or "").splitlines() if line.strip()]
+    if not lines:
+        return f"[{turn.sequence_id}][{default}]"
+    rendered: list[str] = []
+    for line in lines:
+        speaker, text = split_speaker_label(line)
+        rendered.append(f"[{turn.sequence_id}][{speaker or default}] {text}".rstrip())
+    return "\n".join(rendered)
 
 
 def useful_token_count(turn: TranscriptTurn) -> int:

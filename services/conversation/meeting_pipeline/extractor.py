@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from services.conversation.event_pipeline.textutil import stable_id
+from services.conversation.meeting_pipeline.flags import output_language
+from services.conversation.meeting_pipeline.harness import normalize_topic
 from services.conversation.meeting_pipeline.llm import generate_structured
 from services.conversation.meeting_pipeline.schemas import (
     CandidateKind,
@@ -39,11 +41,18 @@ class MeetingCandidateExtractor:
             "sequenceStart": window.sequence_start,
             "sequenceEnd": window.sequence_end,
             "transcript": window.text,
+            "outputLanguage": output_language(),
             "extractionContract": {
                 "meaning": "Complete standalone sentence a later reader can understand without the transcript.",
+                "subject": "Name the concrete subject (feature, module, rule, document, person's deliverable). Never write 'Speaker N said/will'; speakers are diarization labels, not people.",
+                "detail": "Keep concrete values: fields, options, thresholds, numbers, examples, sequences, statuses, conditions, and who/what they apply to.",
+                "topic": "Short 2-5 word subject label. Reuse the exact same label for every candidate about the same subject.",
+                "noisySpeech": "Transcript is noisy speech-to-text. Recover the intended word only when surrounding context makes it unambiguous; otherwise omit the detail.",
+                "openVsDecided": "Unresolved debate or options still being weighed is QUESTION (state the options). A settled choice is DECISION.",
                 "split": "A turn that both commits to work and explains how/why/what to include is several candidates, not one ACTION.",
                 "recall": "Missing a real commitment, requirement, decision, or important fact is worse than extracting it twice.",
                 "action": "Intended work is ACTION in any language. Do not require English or a specific verb form.",
+                "skip": "Do not emit greetings, phone-call chatter, screen/navigation narration, comprehension checks, or fragments whose object cannot be identified.",
             },
         }
         response, provider, model = await generate_structured(
@@ -104,6 +113,7 @@ class MeetingCandidateExtractor:
                     evidenceSequences=evidence,
                     owner=owner,
                     dueDate=due,
+                    topic=normalize_topic(getattr(item, "topic", None)),
                     sourceWindowId=window.window_id,
                     sourceWindowIndex=window.window_index,
                 )

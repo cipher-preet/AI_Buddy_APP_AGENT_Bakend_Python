@@ -23,5 +23,31 @@ def extraction_window_overlap_ratio() -> float:
     return min(0.5, max(0.0, ratio))
 
 
+def output_language() -> str:
+    return str(getattr(settings, "MEETING_OUTPUT_LANGUAGE", "") or "English").strip() or "English"
+
+
+def consolidation_partition_tokens() -> int:
+    """Ledger payload size above which consolidation is partitioned by topic."""
+    return max(2000, int(getattr(settings, "MEETING_CONSOLIDATION_PARTITION_TOKENS", 24000) or 24000))
+
+
+def consolidation_max_candidates() -> int:
+    """Candidate count above which one consolidation call loses coverage."""
+    return max(8, int(getattr(settings, "MEETING_CONSOLIDATION_MAX_CANDIDATES", 40) or 40))
+
+
+def coverage_batch_candidates() -> int:
+    return max(4, int(getattr(settings, "MEETING_COVERAGE_BATCH_CANDIDATES", 30) or 30))
+
+
+def outline_organizer_enabled() -> bool:
+    return bool(getattr(settings, "MEETING_OUTLINE_ORGANIZER", True))
+
+
+def verifier_batch_chars() -> int:
+    return max(2000, int(getattr(settings, "MEETING_VERIFIER_BATCH_CHARS", 14000) or 14000))
+
+
 def max_extraction_concurrency() -> int:
     return max(1, min(16, int(getattr(settings, "MAX_EXTRACTION_CONCURRENCY", 4) or 4)))

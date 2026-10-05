@@ -16,6 +16,15 @@ Reject only when the artifact adds a materially unsupported fact, action, owner,
 
 Understand paraphrases, Hindi, Hinglish, code-switching, grammatical STT noise, equivalent verbs, and implicit but clear references.
 
+Speech-to-text noise: cited lines often contain mis-heard words (a similar-sounding word replacing the intended one). Accept the claim's reading when the cited lines, taken together, consistently discuss that concept and the substitution is the only sensible interpretation. Do not accept a reading that requires facts absent from every cited line.
+`[Speaker N]` labels are diarization only; they never make an owner supported.
+
+Structured artifacts:
+- A note body may be a lead sentence plus `- ` bullet lines covering one topic, drawn from many cited lines. Judge each line against the cited lines as a whole. Lines marked `Open decision:` are supported when the cited lines show the question was discussed without being settled. `Tentative:` / `Deferred:` lines are supported when the cited lines show that hedging or deferral.
+- A task's `acceptanceCriteria` is the observable outcome of doing the supported work. Treat it as supported when it follows directly from the cited requirement and adds no new facts, numbers, owners, or scope.
+- Implementation tasks derived from agreed requirements ("Add X", "Implement Y rule") are supported when the cited lines establish that X/Y is needed; the work itself need not be literally assigned.
+- If the core claim holds but a minority of bullet lines or details are unsupported, return PARTIALLY_SUPPORTED with unsupportedFields ["description"] so the repair step can remove them. Reserve UNSUPPORTED for claims whose core meaning is not in the cited lines.
+
 Examples of SUPPORTED (same meaning, different words):
 - Evidence: "candidate apni details link ke through fill karega"
   Claim: "Candidate submits information through the generated link"

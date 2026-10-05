@@ -11,7 +11,16 @@ from __future__ import annotations
 
 import re
 
-from services.conversation.meeting_pipeline.consolidator import _clip_evidence, _optional_text
+from services.conversation.meeting_pipeline.consolidator import _clip_evidence, _dominant_topic, _optional_text
+from services.conversation.meeting_pipeline.flags import output_language
+from services.conversation.meeting_pipeline.harness import (
+    CandidateAliases,
+    clean_inline,
+    clean_multiline,
+    normalize_priority,
+    normalize_topic,
+    strip_internal_references,
+)
 from services.conversation.meeting_pipeline.ledger import CandidateLedger
 from services.conversation.meeting_pipeline.llm import generate_structured
 from services.conversation.meeting_pipeline.observability import log_pipeline
@@ -92,19 +101,21 @@ class TaskEligibilityReviewer:
             for sequence in candidate.evidenceSequences
             if sequence in sequence_text
         }
+        aliases = CandidateAliases(pending)
         payload = {
             "existingTasks": [
                 {
                     "title": item.title,
                     "description": item.body,
-                    "sourceCandidateIds": list(item.sourceCandidateIds),
+                    "topic": item.topic,
                 }
                 for item in existing_tasks
             ],
             "unpublishedCandidates": [
                 {
-                    "candidateId": candidate.candidateId,
+                    "candidateId": aliases.alias(candidate.candidateId),
                     "kind": candidate.kind.value if hasattr(candidate.kind, "value") else str(candidate.kind),
+                    "topic": candidate.topic,
                     "meaning": candidate.meaning,
                     "owner": candidate.owner,
                     "dueDate": candidate.dueDate,
@@ -113,14 +124,16 @@ class TaskEligibilityReviewer:
                 for candidate in pending
             ],
             "citedTranscript": lookup,
+            "outputLanguage": output_language(),
             "writingContract": {
-                "taskTitle": "One concrete action with a specific object.",
+                "taskTitle": "Imperative verb + specific object. Never 'Speaker will...'.",
                 "taskDescription": "2-4 grounded sentences. Never copy the title.",
+                "acceptanceCriteria": "One sentence: the observable result that proves completion.",
+                "priority": "High | Medium | Low relative to this meeting's main objective; Low when explicitly deferred.",
                 "language": "Judge meaning in whatever language the transcript uses. Do not require English.",
                 "dedupe": "Do not emit a task that repeats an existing task or another approved task.",
             },
         }
-        # HIGH_ACCURACY_REASONING → Krutrim gemma-4-31b-it (31B, temperature 0, json_schema).
         response, provider, model = await generate_structured(
             self.router,
             LLMCapability.HIGH_ACCURACY_REASONING,
@@ -133,6 +146,7 @@ class TaskEligibilityReviewer:
         self.last_model = str(model or "unknown")
         approved: list[ArtifactClaim] = []
         for index, item in enumerate(response.tasks or []):
+            item.sourceCandidateIds = aliases.resolve_many(item.sourceCandidateIds, item.evidenceSequences)
             claim = _eligibility_task_claim(item, index, known_ids, ledger, meeting_sequences)
             if claim is None:
                 continue
@@ -145,6 +159,7 @@ class TaskEligibilityReviewer:
 def unpublished_review_candidates(
     artifacts: list[ArtifactClaim],
     ledger: CandidateLedger,
+    discarded: set[str] | None = None,
 ) -> list[MeetingCandidate]:
     cited_by_tasks = {
         str(candidate_id)
@@ -152,9 +167,10 @@ def unpublished_review_candidates(
         if item.kind == "task"
         for candidate_id in item.sourceCandidateIds
     }
+    skip = set(discarded or ())
     pending: list[MeetingCandidate] = []
     for candidate in ledger.candidates:
-        if candidate.candidateId in cited_by_tasks:
+        if candidate.candidateId in cited_by_tasks or candidate.candidateId in skip:
             continue
         if not _is_review_kind(candidate):
             continue
@@ -183,13 +199,15 @@ async def recover_unpublished_actions(
     sequence_text: dict[int, str],
     *,
     reviewer: TaskEligibilityReviewer | None = None,
+    discarded: set[str] | None = None,
 ) -> tuple[list[ArtifactClaim], dict[str, int]]:
     """Recover intended work the consolidator under-published.
 
     The reviewer LLM is the only publisher of recovered tasks. No keyword
-    fallback and no blind ACTION→Task conversion. Does not modify notes.
+    fallback and no blind ACTIONâ†’Task conversion. Does not modify notes.
+    Candidates the consolidator discarded as noise are not re-reviewed.
     """
-    pending = unpublished_review_candidates(artifacts, ledger)
+    pending = unpublished_review_candidates(artifacts, ledger, discarded)
     stats = {
         "pendingActionCandidates": len(pending),
         "recoveredTaskCount": 0,
@@ -234,8 +252,8 @@ def _eligibility_task_claim(
     ledger: CandidateLedger,
     meeting_sequences: set[int],
 ) -> ArtifactClaim | None:
-    title = " ".join(str(item.title or "").split())
-    body = " ".join(str(item.description or "").split())
+    title = strip_internal_references(clean_inline(item.title))
+    body = strip_internal_references(clean_multiline(item.description))
     if not title:
         return None
     source_ids = [str(value) for value in (item.sourceCandidateIds or []) if str(value) in known_ids]
@@ -259,6 +277,9 @@ def _eligibility_task_claim(
         body=body,
         owner=_optional_text(item.owner),
         dueDate=_optional_text(item.dueDate),
+        priority=normalize_priority(getattr(item, "priority", None)),
+        acceptanceCriteria=strip_internal_references(clean_inline(getattr(item, "acceptanceCriteria", ""))),
+        topic=normalize_topic(getattr(item, "topic", None)) or _dominant_topic(source_ids, ledger),
         sourceCandidateIds=source_ids,
         evidenceSequences=evidence,
     )

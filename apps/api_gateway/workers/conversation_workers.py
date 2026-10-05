@@ -10,6 +10,7 @@ from redis.exceptions import ConnectionError, RedisError, TimeoutError as RedisT
 
 from apps.api_gateway.config.setting import settings
 from apps.api_gateway.workers.schedule_extraction_worker import request_schedule_extraction
+from services.chat.meeting.index import prepare_meeting_chat_index
 from services.conversation.finalization import ConversationFinalizationCoordinator
 from services.conversation.inactivity import ConversationInactivityScanner
 from services.conversation.incremental import IncrementalMeetingProcessor
@@ -402,6 +403,8 @@ async def handle_processing_event(event: EventEnvelope) -> None:
         print("Meeting processing completed:", {"conversationId": event.conversationId, "provider": getattr(provider, "name", None), "model": model})
         conversation = await repository.get_conversation(event.conversationId)
         if conversation and conversation.status in {ConversationStatus.COMPLETED, ConversationStatus.PARTIAL}:
+            if getattr(conversation, "sourceType", None) == "meeting_extension":
+                _prepare_chat_index_in_background(event.userId, event.conversationId)
             await request_schedule_extraction(event.conversationId, event.userId, event.spaceId, event.eventId)
     except asyncio.TimeoutError as error:
         message = f"Conversation processing timed out after {settings.CONVERSATION_PROCESSING_TIMEOUT_SECONDS} seconds."
@@ -411,6 +414,16 @@ async def handle_processing_event(event: EventEnvelope) -> None:
             event.conversationId,
             message,
         )
+
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _prepare_chat_index_in_background(user_id: str, conversation_id: str) -> None:
+    """Embed the meeting for chat while the raw transcript still exists; never blocks processing."""
+    task = asyncio.create_task(prepare_meeting_chat_index(user_id, conversation_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def _provider_configured(name: str) -> bool:

@@ -22,7 +22,15 @@ def get_mongo_client() -> AsyncIOMotorClient:
         _client = None
         _client_loop_id = None
     if _client is None:
-        _client = AsyncIOMotorClient(settings.MONGODB_URL, uuidRepresentation="standard")
+        # Remote hosts/firewalls silently drop idle sockets; recycle pooled connections before that happens.
+        _client = AsyncIOMotorClient(
+            settings.MONGODB_URL,
+            uuidRepresentation="standard",
+            maxIdleTimeMS=60_000,
+            serverSelectionTimeoutMS=10_000,
+            retryWrites=True,
+            retryReads=True,
+        )
         _client_loop_id = loop_id
     return _client
 

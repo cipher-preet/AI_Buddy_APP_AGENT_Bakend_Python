@@ -12,11 +12,17 @@ from services.conversation.meeting_pipeline.composer import compose_artifacts
 from services.conversation.meeting_pipeline.consolidator import GlobalArtifactConsolidator, recover_unpublished_notes
 from services.conversation.meeting_pipeline.dates import normalize_supported_due_date
 from services.conversation.meeting_pipeline.extractor import MeetingCandidateExtractor
-from services.conversation.meeting_pipeline.flags import max_extraction_concurrency
+from services.conversation.meeting_pipeline.flags import max_extraction_concurrency, outline_organizer_enabled
+from services.conversation.meeting_pipeline.harness import (
+    artifact_confidence,
+    normalize_priority,
+    strip_internal_references,
+)
 from services.conversation.meeting_pipeline.llm import bind_usage, reset_usage
 from services.conversation.meeting_pipeline.invariants import apply_invariant_gate
 from services.conversation.meeting_pipeline.ledger import CandidateLedger
 from services.conversation.meeting_pipeline.observability import log_artifact, log_pipeline
+from services.conversation.meeting_pipeline.organizer import MeetingOutlineOrganizer
 from services.conversation.meeting_pipeline.schemas import (
     MeetingCandidate,
     MeetingPipelineResult,
@@ -41,8 +47,9 @@ from services.llm.router import LLMRouter
 
 PIPELINE_VERSION = "meeting-extract-compose-verify-v1"
 _MAX_WINDOW_ATTEMPTS = 3
-# API/schema compatibility only. Persistence uses verificationVerdict == SUPPORTED.
+# Floor for artifacts without verifier signals. Persistence uses verificationVerdict == SUPPORTED.
 COMPAT_CONFIDENCE = 0.5
+_PRIORITY_RANK = {"High": 0, "Medium": 1, "Low": 2}
 
 
 async def run_meeting_pipeline(
@@ -56,6 +63,7 @@ async def run_meeting_pipeline(
     consolidator: GlobalArtifactConsolidator | None = None,
     verifier: ArtifactEvidenceVerifier | None = None,
     task_eligibility: TaskEligibilityReviewer | None = None,
+    organizer: MeetingOutlineOrganizer | None = None,
     meeting_at: datetime | None = None,
 ) -> MeetingPipelineResult:
     started = time.perf_counter()
@@ -69,6 +77,8 @@ async def run_meeting_pipeline(
     verifier = verifier or ArtifactEvidenceVerifier(router)
     if task_eligibility is None and callable(getattr(router, "route", None)):
         task_eligibility = TaskEligibilityReviewer(router)
+    if organizer is None and outline_organizer_enabled() and callable(getattr(router, "route", None)):
+        organizer = MeetingOutlineOrganizer(router)
     ledger = CandidateLedger()
     retries = 0
     window_counts: list[int] = []
@@ -125,15 +135,20 @@ async def run_meeting_pipeline(
         consolidated_note_count = sum(1 for item in claims if item.kind == "note")
         # Recover unpublished intended work as Tasks before note recovery so ACTION
         # candidates are not left stranded while notes stay on their own path.
+        discarded = set(getattr(consolidator, "last_discarded_ids", None) or ())
         claims, action_recovery = await recover_unpublished_actions(
             claims,
             ledger,
             sequence_text,
             reviewer=task_eligibility,
+            discarded=discarded,
         )
         claims = unique_task_claims(claims)
-        claims, recovered_notes = recover_unpublished_notes(claims, ledger, set(sequence_text))
+        claims, recovered_notes = recover_unpublished_notes(claims, ledger, set(sequence_text), discarded=discarded)
         claims, composition = compose_artifacts(claims, ledger, set(sequence_text))
+        outline: dict[str, int] = {}
+        if organizer is not None:
+            claims, outline = await organizer.organize(claims, sequence_text)
         verified = await verifier.verify(claims, sequence_text, meeting_at=meeting_at) if claims else []
         accepted, rejected = apply_invariant_gate(
             verified,
@@ -143,13 +158,17 @@ async def run_meeting_pipeline(
         )
         tasks = [
             _to_task(item, conversation_id, space_id, sequence_text, meeting_at)
-            for item in accepted
-            if item.kind == "task"
+            for item in sorted(
+                (item for item in accepted if item.kind == "task"),
+                key=lambda item: (_PRIORITY_RANK.get(item.priority or "", 1), min(item.evidenceSequences or [0])),
+            )
         ]
         notes = [
             _to_note(item, conversation_id, space_id, sequence_text)
-            for item in accepted
-            if item.kind == "note"
+            for item in sorted(
+                (item for item in accepted if item.kind == "note"),
+                key=lambda item: min(item.evidenceSequences or [0]),
+            )
         ]
         duration_ms = int((time.perf_counter() - started) * 1000)
         provider = consolidator.last_provider or extractor.last_provider
@@ -158,6 +177,7 @@ async def run_meeting_pipeline(
         input_tokens = sum(int(item.get("inputTokens") or 0) for item in usage_records)
         output_tokens = sum(int(item.get("outputTokens") or 0) for item in usage_records)
         eligibility_calls = int(getattr(task_eligibility, "calls", 0) or 0)
+        organizer_calls = int(getattr(organizer, "calls", 0) or 0)
         observability = {
             "session_id": conversation_id,
             "window_count": len(windows),
@@ -202,10 +222,28 @@ async def run_meeting_pipeline(
             "processing_duration_ms": duration_ms,
             "extractor_calls": extractor.calls,
             "consolidator_calls": consolidator.calls,
+            "consolidator_partitions": int(getattr(consolidator, "last_partition_count", 0) or 0),
+            "consolidator_discarded_count": len(discarded),
+            "consolidator_unresolved_ids": int(getattr(consolidator, "unresolved_ids", 0) or 0),
+            "consolidator_evidence_fallbacks": int(getattr(consolidator, "evidence_fallbacks", 0) or 0),
+            "consolidator_dropped_claims": int(getattr(consolidator, "dropped_claims", 0) or 0),
+            "coverage_calls": int(getattr(consolidator, "coverage_calls", 0) or 0),
+            "coverage_uncovered": int(getattr(consolidator, "coverage_uncovered", 0) or 0),
+            "coverage_attached": int(getattr(consolidator, "coverage_attached", 0) or 0),
+            "redundant_notes_dropped": composition.get("redundantNotesDropped", 0),
+            "outline_calls": organizer_calls,
+            "outline_sections_merged": outline.get("sectionsMerged", 0),
+            "outline_tasks_merged": outline.get("tasksMerged", 0),
+            "outline_near_duplicates_merged": outline.get("nearDuplicatesMerged", 0),
+            "outline_off_topic_dropped": outline.get("offTopicDropped", 0),
+            "outline_priorities_set": outline.get("prioritiesSet", 0),
+            "outline_priorities_banded": outline.get("prioritiesBanded", 0),
+            "outline_logistics_dropped": outline.get("logisticsDropped", 0),
+            "outline_failed": outline.get("failed", 0),
             "task_eligibility_calls": eligibility_calls,
             "verifier_calls": verifier.calls,
             "repair_calls": getattr(verifier, "repair_calls", 0),
-            "model_calls": extractor.calls + consolidator.calls + eligibility_calls + verifier.calls,
+            "model_calls": extractor.calls + consolidator.calls + eligibility_calls + organizer_calls + verifier.calls,
             "transcript_sequence_count": len(sequence_text),
             "consolidator_cited_sequence_count": len(
                 {sequence for item in ledger.candidates for sequence in item.evidenceSequences}
@@ -253,7 +291,7 @@ async def run_meeting_pipeline(
             "artifactPipelineVersion": PIPELINE_VERSION,
             "pipelineMode": "meeting_pipeline",
             "eventSchemaVersion": "meeting-candidate-v1",
-            "promptVersion": "meeting-candidate-extractor-v1,meeting-artifact-consolidator-v1,meeting-task-eligibility-v1,meeting-evidence-verifier-v1",
+            "promptVersion": "meeting-candidate-extractor-v1,meeting-artifact-consolidator-v1,meeting-artifact-coverage-v1,meeting-task-eligibility-v1,meeting-outline-organizer-v1,meeting-logistics-review-v1,meeting-evidence-verifier-v1",
             "finalSynthesisInvoked": bool(ledger.candidates),
             "finalSynthesisVerdict": "PUBLISH" if tasks or notes else "NO_PUBLISHABLE_ARTIFACTS",
             "qualityAcceptedTaskCount": len(tasks),
@@ -354,18 +392,21 @@ def _to_task(
     evidence = _evidence_spans(item.evidenceSequences, sequence_text)
     resolved = normalize_supported_due_date(item.dueDate, meeting_at)
     task = ExtractedTask(
-        title=item.title,
-        body=item.body,
+        title=strip_internal_references(item.title),
+        body=strip_internal_references(_task_body(item)),
         operation="CREATE",
         ownerText=item.owner,
         dueDateText=item.dueDate,
         dueDateResolved=resolved,
         dueDateStatus="resolved" if resolved else ("ambiguous" if item.dueDate else "none"),
-        confidence=COMPAT_CONFIDENCE,
+        priority=normalize_priority(item.priority),
+        confidence=_confidence(item),
         sourceConversationId=conversation_id,
         evidence=evidence,
         origin="explicit",
         changes={
+            "acceptanceCriteria": item.acceptanceCriteria or None,
+            "topic": item.topic,
             "sourceCandidateIds": list(item.sourceCandidateIds),
             "evidenceVerified": item.verdict == VerifierVerdict.SUPPORTED,
             "verificationVerdict": item.verdict.value,
@@ -383,12 +424,13 @@ def _to_task(
 def _to_note(item: VerifiedArtifact, conversation_id: str, space_id: str, sequence_text: dict[int, str]) -> ExtractedNote:
     evidence = _evidence_spans(item.evidenceSequences, sequence_text)
     note = ExtractedNote(
-        title=item.title,
-        body=item.body,
-        confidence=COMPAT_CONFIDENCE,
+        title=strip_internal_references(item.title),
+        body=strip_internal_references(item.body),
+        confidence=_confidence(item),
         sourceConversationId=conversation_id,
         evidence=evidence,
         debug={
+            "topic": item.topic,
             "sourceCandidateIds": list(item.sourceCandidateIds),
             "evidenceVerified": item.verdict == VerifierVerdict.SUPPORTED,
             "verificationVerdict": item.verdict.value,
@@ -401,6 +443,26 @@ def _to_note(item: VerifiedArtifact, conversation_id: str, space_id: str, sequen
     )
     note.fingerprint = note_fingerprint(space_id, note)
     return note
+
+
+def _task_body(item: VerifiedArtifact) -> str:
+    body = (item.body or "").strip()
+    criteria = (item.acceptanceCriteria or "").strip()
+    if not criteria or criteria.casefold() in body.casefold():
+        return body
+    return f"{body}\n\nExpected result: {criteria}" if body else f"Expected result: {criteria}"
+
+
+def _confidence(item: VerifiedArtifact) -> float:
+    if item.fieldSupport is None:
+        return COMPAT_CONFIDENCE
+    return artifact_confidence(
+        supported=item.verdict == VerifierVerdict.SUPPORTED,
+        field_support=item.fieldSupport.model_dump(),
+        repaired=item.repaired,
+        source_count=len(item.sourceCandidateIds),
+        evidence_count=len(item.evidenceSequences),
+    )
 
 
 def _evidence_spans(sequences: list[int], sequence_text: dict[int, str]) -> list[EvidenceSpan]:
