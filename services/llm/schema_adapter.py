@@ -120,7 +120,7 @@ class StructuredProviderPlan:
 
 def structured_capabilities(provider: str, model: str) -> StructuredOutputCapability:
     provider_name = str(provider or "").strip().casefold()
-    if provider_name in {"openai", "krutrim"}:
+    if provider_name in {"openai", "openrouter", "krutrim"}:
         return StructuredOutputCapability(True, True, True, "high")
     if provider_name in {"mistral", "groq", "gemini", "sarvam"}:
         return StructuredOutputCapability(True, True, True, "medium")

@@ -14,6 +14,7 @@ from services.llm.providers import (
     build_krutrim_provider,
     build_mistral_provider,
     build_openai_provider,
+    build_openrouter_provider,
     build_sarvam_provider,
     NotConfiguredProvider,
 )
@@ -134,6 +135,7 @@ def get_llm_router() -> LLMRouter:
             {
                 "sarvam": build_sarvam_provider(),
                 "openai": build_openai_provider(),
+                "openrouter": build_openrouter_provider(),
                 "anthropic": build_anthropic_provider(),
                 "gemini": build_gemini_provider(),
                 "groq": build_groq_provider(),
@@ -165,7 +167,7 @@ async def close_llm_runtime() -> None:
 def llm_provider_status() -> list[dict]:
     router = get_llm_router()
     status = []
-    for name in ("krutrim", "mistral", "gemini", "groq", "sarvam", "openai"):
+    for name in ("krutrim", "mistral", "gemini", "groq", "openrouter", "sarvam", "openai"):
         provider = router.providers.get(name)
         configured = bool(provider) and getattr(provider, "configured", True) is not False
         status.append(
@@ -182,7 +184,7 @@ def log_llm_provider_status(source: str = "worker") -> None:
     status = llm_provider_status()
     print("LLM provider status:", {"source": source, "providers": status})
     for item in status:
-        if item["provider"] in {"krutrim", "mistral", "gemini", "groq"}:
+        if item["provider"] in {"krutrim", "mistral", "gemini", "groq", "openrouter"}:
             state = "READY" if item["configured"] else "NOT CONFIGURED (missing API key)"
             print(
                 "LLM provider check:",

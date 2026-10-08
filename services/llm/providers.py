@@ -38,6 +38,31 @@ def build_openai_provider() -> OpenAICompatibleProvider:
     )
 
 
+def build_openrouter_provider() -> OpenAICompatibleProvider | NotConfiguredProvider:
+    """OpenRouter adapter — OpenAI-compatible chat completions for shared AI features."""
+    if not settings.secret_value(settings.OPENROUTER_API_KEY):
+        return NotConfiguredProvider("openrouter")
+
+    headers: dict[str, str] = {}
+    site_url = str(settings.OPENROUTER_SITE_URL or "").strip()
+    site_name = str(settings.OPENROUTER_SITE_NAME or "").strip()
+    if site_url:
+        headers["HTTP-Referer"] = site_url
+    if site_name:
+        headers["X-Title"] = site_name
+
+    return OpenAICompatibleProvider(
+        name="openrouter",
+        api_key=settings.secret_value(settings.OPENROUTER_API_KEY),
+        base_url=settings.OPENROUTER_BASE_URL,
+        default_model=settings.OPENROUTER_DEFAULT_MODEL,
+        timeout_seconds=settings.LLM_TIMEOUT_SECONDS,
+        max_retries=settings.SARVAM_MAX_RETRIES,
+        max_concurrency=settings.LLM_MAX_CONCURRENCY,
+        default_headers=headers or None,
+    )
+
+
 def build_gemini_provider() -> OpenAICompatibleProvider | NotConfiguredProvider:
     if not settings.secret_value(settings.GEMINI_API_KEY):
         return NotConfiguredProvider("gemini")

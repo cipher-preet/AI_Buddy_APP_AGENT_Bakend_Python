@@ -235,6 +235,14 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
             IndexModel([("userId", ASCENDING), ("status", ASCENDING), ("dateKey", DESCENDING)]),
         ]
     )
+    await database.spaceMindmaps.create_indexes(
+        [
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("version", DESCENDING)]),
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("status", ASCENDING), ("updatedAt", DESCENDING)]),
+            IndexModel([("jobId", ASCENDING)]),
+            IndexModel([("status", ASCENDING), ("updatedAt", ASCENDING)]),
+        ]
+    )
     await database.meeting_sessions.create_indexes(
         [
             IndexModel([("userId", ASCENDING), ("createdAt", DESCENDING)]),

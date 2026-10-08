@@ -315,6 +315,34 @@ async def emit_redis_queue_health() -> None:
                 error_type=type(error).__name__,
             )
 
+    # Mindmap jobs use cloud Redis (MINDMAP_REDIS_URL → REMINDER_REDIS_URL).
+    try:
+        from services.mindmap.redis_client import get_mindmap_redis_client
+
+        mindmap_client = get_mindmap_redis_client()
+        stream = settings.REDIS_MINDMAP_STREAM
+        length = int(await mindmap_client.xlen(stream))
+        pending = None
+        try:
+            groups = await mindmap_client.xinfo_groups(stream)
+            pending = sum(int(group.get("pending") or 0) for group in groups or [])
+        except Exception:
+            pending = None
+        diag_log(
+            "redis_queue_health",
+            stream=stream,
+            redis="mindmap",
+            length=length,
+            pending=pending,
+        )
+    except Exception as error:
+        diag_log(
+            "redis_queue_health",
+            stream=settings.REDIS_MINDMAP_STREAM,
+            redis="mindmap",
+            error_type=type(error).__name__,
+        )
+
 
 async def run_worker_heartbeat(interval_seconds: float = 30.0) -> None:
     sampler = _CpuSampler()

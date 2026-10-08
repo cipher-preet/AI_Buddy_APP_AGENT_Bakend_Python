@@ -23,6 +23,7 @@ from apps.api_gateway.workers.daily_briefing_worker import (
     build_daily_briefing_consumer,
     run_daily_briefing_scheduler,
 )
+from apps.api_gateway.workers.mindmap_worker import build_mindmap_consumer, ensure_mindmap_redis
 from services.db.mongo import close_mongo_client, ensure_mongo_indexes
 from services.llm.router import close_llm_runtime, log_llm_provider_status
 from services.meeting_extension.ffmpeg_audio import probe_ffmpeg
@@ -88,6 +89,7 @@ async def _run_supervised(name: str, factory) -> None:
 
 async def main():
     await test_redis_connection()
+    await ensure_mindmap_redis()
     await ensure_mongo_indexes()
     print("Conversation workers starting...")
     log_llm_provider_status("conversation-worker-startup")
@@ -101,6 +103,7 @@ async def main():
     transcript_ready_consumer = build_transcript_ready_consumer()
     window_extraction_consumer = build_window_extraction_consumer()
     daily_briefing_consumer = build_daily_briefing_consumer()
+    mindmap_consumer = build_mindmap_consumer()
     meeting_video_consumer = build_meeting_video_consumer()
     meeting_merge_consumer = build_meeting_merge_consumer()
     schedule_extraction_consumer = build_schedule_extraction_consumer()
@@ -114,6 +117,7 @@ async def main():
             finalization_consumer,
             processing_consumer,
             daily_briefing_consumer,
+            mindmap_consumer,
             meeting_video_consumer,
             meeting_merge_consumer,
             schedule_extraction_consumer,

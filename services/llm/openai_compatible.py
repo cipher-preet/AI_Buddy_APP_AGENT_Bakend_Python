@@ -46,6 +46,7 @@ class OpenAICompatibleProvider:
         auth_header: str = "Authorization",
         auth_prefix: str = "Bearer ",
         max_tokens_limit: int | None = None,
+        default_headers: dict[str, str] | None = None,
     ):
         self.name = name
         self.configured = True
@@ -55,6 +56,7 @@ class OpenAICompatibleProvider:
         self.last_structured_diagnostics: dict[str, Any] = {}
         self._auth_header = auth_header
         self._auth_value = f"{auth_prefix}{api_key}" if auth_prefix else api_key
+        self._default_headers = dict(default_headers or {})
         self._timeout_seconds = timeout_seconds
         self._base_url = base_url.rstrip("/")
         self._semaphore = LoopLocalSemaphore(max_concurrency)
@@ -317,9 +319,10 @@ class OpenAICompatibleProvider:
         for attempt in range(self.max_retries + 1):
             try:
                 client = await self._http_client()
+                headers = {**self._default_headers, self._auth_header: self._auth_value}
                 response = await client.post(
                     path,
-                    headers={self._auth_header: self._auth_value},
+                    headers=headers,
                     json=payload,
                 )
                 if response.status_code < 400:

@@ -13,6 +13,8 @@ class Settings(BaseSettings):
 
     REDIS_URL: str = "redis://127.0.0.1:6379"
     REMINDER_REDIS_URL: str = ""
+    # Cloud Redis for mindmap jobs. Falls back to REMINDER_REDIS_URL when empty.
+    MINDMAP_REDIS_URL: str = ""
     REDIS_MAX_RETRIES: int | None = None
     REDIS_EVENT_RETENTION: int = Field(default=86400, ge=60)
     MONGODB_URI: str = ""
@@ -47,6 +49,15 @@ class Settings(BaseSettings):
 
     OPENAI_API_KEY: SecretStr | str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
+
+    # OpenRouter (OpenAI-compatible). Default free model: Nemotron 3 Ultra.
+    OPENROUTER_API_KEY: SecretStr | str = ""
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_DEFAULT_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    OPENROUTER_SITE_URL: str = ""
+    OPENROUTER_SITE_NAME: str = "KukuNotes"
+    OPENROUTER_MAX_RPM: int = 20
+    OPENROUTER_MAX_RPD: int = 200
 
     GEMINI_API_KEY: SecretStr | str = ""
     GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -121,6 +132,7 @@ class Settings(BaseSettings):
     REDIS_DAILY_BRIEFING_STREAM: str = "buddy:daily-briefing:jobs"
     REDIS_MEETING_VIDEO_STREAM: str = "buddy:stt:jobs"
     REDIS_MEETING_MERGE_STREAM: str = "buddy:meeting:video-merge"
+    REDIS_MINDMAP_STREAM: str = "buddy:mindmap:jobs"
 
     REDIS_AUDIO_GROUP: str = "audio-workers"
     REDIS_STT_GROUP: str = "stt-workers"
@@ -131,6 +143,19 @@ class Settings(BaseSettings):
     REDIS_DAILY_BRIEFING_GROUP: str = "daily-briefing-workers"
     REDIS_MEETING_VIDEO_GROUP: str = "meeting-video-workers"
     REDIS_MEETING_MERGE_GROUP: str = "meeting-merge-workers"
+    REDIS_MINDMAP_GROUP: str = "mindmap-workers"
+
+    # Space mindmap generation (OpenRouter Nemotron by default).
+    MINDMAP_MODELS: str = "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"
+    MINDMAP_MAX_CONCURRENCY: int = Field(default=2, ge=1, le=16)
+    MINDMAP_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
+    MINDMAP_MAX_OUTPUT_TOKENS: int = Field(default=6000, ge=1000, le=32000)
+    MINDMAP_CONTEXT_TOKEN_BUDGET: int = Field(default=12000, ge=1000, le=100000)
+    MINDMAP_MAX_TASKS: int = Field(default=80, ge=5, le=500)
+    MINDMAP_MAX_NOTES: int = Field(default=80, ge=5, le=500)
+    MINDMAP_MAX_TRANSCRIPTS: int = Field(default=40, ge=5, le=500)
+    MINDMAP_ITEM_BODY_CHARS: int = Field(default=280, ge=40, le=4000)
+    MINDMAP_TRANSCRIPT_CHARS: int = Field(default=1200, ge=100, le=20000)
 
     DAILY_BRIEFING_ENABLED: bool = True
     DAILY_BRIEFING_TRIGGER_HOUR: int = Field(default=0, ge=0, le=23)
