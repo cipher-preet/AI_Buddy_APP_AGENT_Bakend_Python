@@ -63,6 +63,24 @@ def build_openrouter_provider() -> OpenAICompatibleProvider | NotConfiguredProvi
     )
 
 
+def build_nvidia_provider() -> OpenAICompatibleProvider | NotConfiguredProvider:
+    """NVIDIA NIM cloud — OpenAI-compatible chat completions (integrate.api.nvidia.com)."""
+    if not settings.secret_value(settings.NVIDIA_API_KEY):
+        return NotConfiguredProvider("nvidia")
+    base_url = settings.NVIDIA_BASE_URL.rstrip("/")
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+    return OpenAICompatibleProvider(
+        name="nvidia",
+        api_key=settings.secret_value(settings.NVIDIA_API_KEY),
+        base_url=base_url,
+        default_model=settings.NVIDIA_DEFAULT_MODEL,
+        timeout_seconds=max(settings.LLM_TIMEOUT_SECONDS, 180),
+        max_retries=settings.SARVAM_MAX_RETRIES,
+        max_concurrency=settings.LLM_MAX_CONCURRENCY,
+    )
+
+
 def build_gemini_provider() -> OpenAICompatibleProvider | NotConfiguredProvider:
     if not settings.secret_value(settings.GEMINI_API_KEY):
         return NotConfiguredProvider("gemini")

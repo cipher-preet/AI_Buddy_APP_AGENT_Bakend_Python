@@ -13,8 +13,10 @@ class Settings(BaseSettings):
 
     REDIS_URL: str = "redis://127.0.0.1:6379"
     REMINDER_REDIS_URL: str = ""
-    # Cloud Redis for mindmap jobs. Falls back to REMINDER_REDIS_URL when empty.
+    # Cloud Redis for mindmap/document jobs. Falls back to REMINDER_REDIS_URL when empty.
     MINDMAP_REDIS_URL: str = ""
+    # Redis Cloud Essentials connection quota is small — share one tight pool.
+    MINDMAP_REDIS_MAX_CONNECTIONS: int = Field(default=6, ge=2, le=32)
     REDIS_MAX_RETRIES: int | None = None
     REDIS_EVENT_RETENTION: int = Field(default=86400, ge=60)
     MONGODB_URI: str = ""
@@ -50,7 +52,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: SecretStr | str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
 
-    # OpenRouter (OpenAI-compatible). Default free model: Nemotron 3 Ultra.
+    # OpenRouter (OpenAI-compatible). Kept for optional shared routes.
     OPENROUTER_API_KEY: SecretStr | str = ""
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     OPENROUTER_DEFAULT_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
@@ -58,6 +60,14 @@ class Settings(BaseSettings):
     OPENROUTER_SITE_NAME: str = "KukuNotes"
     OPENROUTER_MAX_RPM: int = 20
     OPENROUTER_MAX_RPD: int = 200
+
+    # NVIDIA NIM cloud (OpenAI-compatible). Docs: https://docs.api.nvidia.com/
+    # Model page: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b
+    NVIDIA_API_KEY: SecretStr | str = ""
+    NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
+    NVIDIA_DEFAULT_MODEL: str = "nvidia/nemotron-3-super-120b-a12b"
+    NVIDIA_MAX_RPM: int = 20
+    NVIDIA_MAX_RPD: int = 200
 
     GEMINI_API_KEY: SecretStr | str = ""
     GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -134,9 +144,11 @@ class Settings(BaseSettings):
     REDIS_MEETING_MERGE_STREAM: str = "buddy:meeting:video-merge"
     REDIS_MINDMAP_STREAM: str = "buddy:mindmap:jobs"
     REDIS_DOCUMENT_STREAM: str = "buddy:document:jobs"
-    # Approximate MAXLEN so finished/acked entries cannot grow unbounded.
-    REDIS_MINDMAP_STREAM_MAXLEN: int = Field(default=2000, ge=100, le=100000)
-    REDIS_DOCUMENT_STREAM_MAXLEN: int = Field(default=2000, ge=100, le=100000)
+    # Tight MAXLEN for Redis Cloud Essentials (30MB). Finished jobs are also XDEL'd.
+    REDIS_MINDMAP_STREAM_MAXLEN: int = Field(default=200, ge=20, le=100000)
+    REDIS_DOCUMENT_STREAM_MAXLEN: int = Field(default=200, ge=20, le=100000)
+    # Dead-letter retention on the same tiny cloud Redis (keep near-empty).
+    REDIS_CLOUD_DEAD_LETTER_MAXLEN: int = Field(default=50, ge=10, le=1000)
 
     REDIS_AUDIO_GROUP: str = "audio-workers"
     REDIS_STT_GROUP: str = "stt-workers"
@@ -150,12 +162,11 @@ class Settings(BaseSettings):
     REDIS_MINDMAP_GROUP: str = "mindmap-workers"
     REDIS_DOCUMENT_GROUP: str = "document-workers"
 
-    # Mindmap: Krutrim first (reliable structured JSON). OpenRouter free Nemotron last —
-    # Nvidia free often returns HTTP 200 with upstream 502/503 (OpenRouter free-model docs).
+    # Mindmap: official NVIDIA Nemotron 3 Super first, then Krutrim fallbacks.
     MINDMAP_MODELS: str = (
+        "nvidia:nvidia/nemotron-3-super-120b-a12b,"
         "krutrim:gemma-4-31b-it,"
-        "krutrim:gpt-oss-20b,"
-        "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"
+        "krutrim:gpt-oss-20b"
     )
     MINDMAP_MAX_CONCURRENCY: int = Field(default=2, ge=1, le=16)
     MINDMAP_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
@@ -167,12 +178,11 @@ class Settings(BaseSettings):
     MINDMAP_ITEM_BODY_CHARS: int = Field(default=280, ge=40, le=4000)
     MINDMAP_TRANSCRIPT_CHARS: int = Field(default=1200, ge=100, le=20000)
 
-    # Document-it: Krutrim first. OpenRouter :free Nvidia is capacity-limited and often
-    # returns embedded upstream errors (see OpenRouter free-model / rate-limit docs).
+    # Document-it: official NVIDIA Nemotron 3 Super first, then Krutrim fallbacks.
     DOCUMENT_MODELS: str = (
+        "nvidia:nvidia/nemotron-3-super-120b-a12b,"
         "krutrim:gemma-4-31b-it,"
-        "krutrim:gpt-oss-20b,"
-        "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"
+        "krutrim:gpt-oss-20b"
     )
     DOCUMENT_MAX_CONCURRENCY: int = Field(default=2, ge=1, le=16)
     DOCUMENT_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
@@ -376,7 +386,7 @@ class Settings(BaseSettings):
     INCREMENTAL_WINDOW_MAX_DURATION_MS: int = Field(default=60 * 60 * 1000, ge=1000, le=8 * 60 * 60 * 1000)
     SPARSE_WINDOW_MAX_WALL_CLOCK_MS: int = Field(default=0, ge=0, le=8 * 60 * 60 * 1000)
     SPARSE_WINDOW_MIN_USEFUL_TOKENS: int = Field(default=4, ge=1, le=500)
-    LLM_PROVIDER_CONTEXT_TOKENS: str = "groq:8192,gemini:1048576,mistral:262144,sarvam:32768,openai:128000,anthropic:200000,krutrim:65536"
+    LLM_PROVIDER_CONTEXT_TOKENS: str = "groq:8192,gemini:1048576,mistral:262144,sarvam:32768,openai:128000,anthropic:200000,krutrim:65536,nvidia:1048576,openrouter:1048576"
     # Model-specific context windows. Krutrim values come from GET /v1/models context_length.
     LLM_MODEL_CONTEXT_TOKENS: str = "gemma-4-31b-it:131072,gpt-oss-120b:131072,gpt-oss-20b:131072,ministral-14b-latest:262144,ministral-14b-2512:262144"
     WINDOW_PROCESSING_STALE_TIMEOUT_SECONDS: int = Field(default=180, ge=15, le=3600)

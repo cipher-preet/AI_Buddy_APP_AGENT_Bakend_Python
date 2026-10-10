@@ -104,6 +104,8 @@ def provider_model_for(provider_name: str) -> str:
         return settings.GEMINI_FREE_MODEL
     if provider_name == "openrouter":
         return settings.OPENROUTER_DEFAULT_MODEL
+    if provider_name == "nvidia":
+        return settings.NVIDIA_DEFAULT_MODEL
     if provider_name == "mistral":
         return settings.CHAT_MISTRAL_MODEL or settings.MISTRAL_CHEAP_MODEL
     if provider_name == "sarvam":
@@ -125,4 +127,6 @@ def provider_quota_for(provider_name: str) -> ProviderQuota | None:
         return ProviderQuota(rpm=settings.GEMINI_MAX_RPM, rpd=settings.GEMINI_MAX_RPD)
     if provider_name == "openrouter":
         return ProviderQuota(rpm=settings.OPENROUTER_MAX_RPM, rpd=settings.OPENROUTER_MAX_RPD)
+    if provider_name == "nvidia":
+        return ProviderQuota(rpm=settings.NVIDIA_MAX_RPM, rpd=settings.NVIDIA_MAX_RPD)
     return None

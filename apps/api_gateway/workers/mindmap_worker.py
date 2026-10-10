@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from uuid import uuid4
+import os
+import socket
 
 from apps.api_gateway.config.setting import settings
 from services.db.mongo import get_database
@@ -16,16 +17,24 @@ async def handle_mindmap_event(event: EventEnvelope) -> None:
         await handler.handle(event)
 
 
+def _stable_consumer_name(prefix: str) -> str:
+    # Stable names avoid orphan consumers piling up on Redis Cloud after restarts.
+    host = (socket.gethostname() or "worker").split(".")[0][:24]
+    pid = os.getpid()
+    return f"{prefix}-{host}-{pid}"
+
+
 def build_mindmap_consumer() -> RedisStreamConsumer:
     return RedisStreamConsumer(
         stream=settings.REDIS_MINDMAP_STREAM,
         group=settings.REDIS_MINDMAP_GROUP,
-        consumer_name=f"mindmap-{uuid4().hex[:8]}",
+        consumer_name=_stable_consumer_name("mindmap"),
         handler=handle_mindmap_event,
         concurrency=settings.MINDMAP_MAX_CONCURRENCY,
         max_retries=settings.MINDMAP_MAX_RETRIES,
         redis=get_mindmap_redis_client(),
         delete_after_ack=True,
+        stream_maxlen=settings.REDIS_MINDMAP_STREAM_MAXLEN,
     )
 
 

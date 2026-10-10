@@ -46,12 +46,17 @@ _reminder_redis_client: redis.Redis | None = None
 def get_reminder_redis_client() -> redis.Redis:
     global _reminder_redis_client
     if _reminder_redis_client is None:
+        # Essentials plans have a low connection cap — keep the pool tiny.
+        max_connections = max(2, int(getattr(settings, "MINDMAP_REDIS_MAX_CONNECTIONS", 6) or 6))
         _reminder_redis_client = redis.from_url(
             get_reminder_redis_url(),
             decode_responses=True,
+            max_connections=max_connections,
             socket_connect_timeout=10,
             socket_timeout=30,
+            socket_keepalive=True,
             health_check_interval=30,
+            retry_on_timeout=True,
         )
     return _reminder_redis_client
 

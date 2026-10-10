@@ -96,6 +96,7 @@ class RedisStreamConsumer:
         redis=None,
         *,
         delete_after_ack: bool = False,
+        stream_maxlen: int | None = None,
     ):
         self.stream = stream
         self.group = group
@@ -105,6 +106,7 @@ class RedisStreamConsumer:
         self.max_retries = max_retries or settings.WORKER_MAX_RETRIES
         self.on_dead_letter = on_dead_letter
         self.delete_after_ack = delete_after_ack
+        self.stream_maxlen = int(stream_maxlen) if stream_maxlen and stream_maxlen > 0 else None
         self._redis = redis or redis_client
         self._uses_default_redis = redis is None
         self._shutdown = asyncio.Event()
@@ -115,7 +117,7 @@ class RedisStreamConsumer:
         if not self.delete_after_ack:
             return
         try:
-            # Drop finished entries so Redis memory does not retain acked jobs.
+            # Drop finished entries immediately so Redis Cloud memory stays free.
             await self._redis.xdel(self.stream, message_id)
         except Exception as error:
             print(
@@ -127,6 +129,26 @@ class RedisStreamConsumer:
                 },
                 flush=True,
             )
+        if self.stream_maxlen:
+            try:
+                # Exact trim after each finished job — critical on Essentials 30MB.
+                await self._redis.xtrim(self.stream, maxlen=self.stream_maxlen, approximate=False)
+            except Exception as error:
+                print(
+                    "Redis stream xtrim after ack failed:",
+                    {
+                        "stream": self.stream,
+                        "maxlen": self.stream_maxlen,
+                        "error": str(error),
+                    },
+                    flush=True,
+                )
+
+    async def _xadd_bounded(self, stream: str, fields: dict[str, Any], *, maxlen: int | None = None) -> str:
+        limit = maxlen if maxlen and maxlen > 0 else self.stream_maxlen
+        if limit and limit > 0:
+            return await self._redis.xadd(stream, fields, maxlen=limit, approximate=True)
+        return await self._redis.xadd(stream, fields)
 
     async def ensure_group(self) -> None:
         try:
@@ -138,6 +160,29 @@ class RedisStreamConsumer:
         except ResponseError as error:
             if "BUSYGROUP" not in str(error):
                 raise
+        if self.stream_maxlen and self.delete_after_ack:
+            try:
+                trimmed = await self._redis.xtrim(
+                    self.stream,
+                    maxlen=self.stream_maxlen,
+                    approximate=False,
+                )
+                if trimmed:
+                    print(
+                        "Redis stream trimmed on startup:",
+                        {
+                            "stream": self.stream,
+                            "maxlen": self.stream_maxlen,
+                            "removed": int(trimmed),
+                        },
+                        flush=True,
+                    )
+            except Exception as error:
+                print(
+                    "Redis stream startup trim failed:",
+                    {"stream": self.stream, "error": str(error)},
+                    flush=True,
+                )
 
     async def stop(self) -> None:
         self._shutdown.set()
@@ -233,9 +278,10 @@ class RedisStreamConsumer:
                     "reason": "invalid_event_payload",
                 },
             )
-            await self._redis.xadd(
+            await self._xadd_bounded(
                 settings.REDIS_DEAD_LETTER_STREAM,
                 {"event": json.dumps({"raw": fields, "error": str(error)})},
+                maxlen=settings.REDIS_CLOUD_DEAD_LETTER_MAXLEN if not self._uses_default_redis else None,
             )
             await self._ack_and_cleanup(message_id)
             return
@@ -255,13 +301,14 @@ class RedisStreamConsumer:
                     "retryable": not isinstance(error, NonRetryableQueueError),
                 },
             )
-            await self._redis.xadd(
+            await self._xadd_bounded(
                 settings.REDIS_DEAD_LETTER_STREAM,
                 {
                     "event": event.model_dump_json(),
                     "error": str(error),
                     "sourceStream": self.stream,
                 },
+                maxlen=settings.REDIS_CLOUD_DEAD_LETTER_MAXLEN if not self._uses_default_redis else None,
             )
             await self._ack_and_cleanup(message_id)
             if self.on_dead_letter is not None:
@@ -304,8 +351,8 @@ class RedisStreamConsumer:
                 },
             )
         else:
-            # Dedicated Redis (e.g. cloud mindmap) has no shared retry relay — re-queue on same stream.
-            await self._redis.xadd(self.stream, {"event": retry.model_dump_json()})
+            # Dedicated Redis (e.g. cloud mindmap) has no shared retry relay — re-queue bounded.
+            await self._xadd_bounded(self.stream, {"event": retry.model_dump_json()})
         await self._ack_and_cleanup(message_id)
 
 

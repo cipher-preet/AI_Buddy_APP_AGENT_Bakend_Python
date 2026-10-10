@@ -63,7 +63,7 @@ def _route() -> list[tuple[Any, str]]:
         route.append((provider, model))
     if not route:
         raise DocumentGenerateError(
-            "Document generation LLM route is not configured (set OPENROUTER_API_KEY)."
+            "Document generation LLM route is not configured (set NVIDIA_API_KEY or KRUTRIM_API_KEY)."
         )
     return route
 

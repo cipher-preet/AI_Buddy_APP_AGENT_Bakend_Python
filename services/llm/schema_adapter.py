@@ -158,7 +158,7 @@ def structured_capabilities(provider: str, model: str) -> StructuredOutputCapabi
     # never attach json_schema / json_object (avoids MALFORMED_STRUCTURED_OUTPUT).
     if provider_name == "openrouter" and openrouter_prefers_plain_json(model):
         return StructuredOutputCapability(False, False, True, "medium")
-    if provider_name in {"openai", "openrouter", "krutrim"}:
+    if provider_name in {"openai", "openrouter", "krutrim", "nvidia"}:
         return StructuredOutputCapability(True, True, True, "high")
     if provider_name in {"mistral", "groq", "gemini", "sarvam"}:
         return StructuredOutputCapability(True, True, True, "medium")

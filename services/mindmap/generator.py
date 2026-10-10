@@ -48,7 +48,9 @@ def _route() -> list[tuple[Any, str]]:
         if name in router.providers and getattr(router.providers[name], "configured", True) is not False
     ]
     if not route:
-        raise MindmapGenerateError("Mind map LLM route is not configured (set OPENROUTER_API_KEY).")
+        raise MindmapGenerateError(
+            "Mind map LLM route is not configured (set NVIDIA_API_KEY or KRUTRIM_API_KEY)."
+        )
     return route
 
 

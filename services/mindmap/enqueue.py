@@ -46,7 +46,7 @@ async def enqueue_mindmap_generation(database, *, user_id: str, space_id: str) -
 
     if not openrouter_configured():
         raise PermissionError(
-            "Mind map generation is unavailable: configure OPENROUTER_API_KEY (or MINDMAP_MODELS)."
+            "Mind map generation is unavailable: configure NVIDIA_API_KEY or KRUTRIM_API_KEY (or MINDMAP_MODELS)."
         )
 
     job_id = str(uuid4())

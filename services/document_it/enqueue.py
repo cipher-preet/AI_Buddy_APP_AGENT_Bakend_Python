@@ -62,7 +62,7 @@ async def enqueue_document_generation(
 
     if not openrouter_configured():
         raise PermissionError(
-            "Document generation is unavailable: configure OPENROUTER_API_KEY (or DOCUMENT_MODELS)."
+            "Document generation is unavailable: configure NVIDIA_API_KEY or KRUTRIM_API_KEY (or DOCUMENT_MODELS)."
         )
 
     job_id = str(uuid4())
