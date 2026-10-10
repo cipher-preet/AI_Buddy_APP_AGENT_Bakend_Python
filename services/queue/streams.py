@@ -64,13 +64,23 @@ class RedisStreamProducer:
         self._redis = redis or redis_client
         self._force_direct = force_direct
 
-    async def publish(self, stream: str, event: EventEnvelope) -> str:
+    async def publish(
+        self,
+        stream: str,
+        event: EventEnvelope,
+        *,
+        maxlen: int | None = None,
+    ) -> str:
         if use_queue_api() and not self._force_direct:
             payload = event.model_dump(mode="json")
             payload["targetStream"] = stream
             await QueueApiPublisher().publish(payload)
             return event.eventId
-        return await self._redis.xadd(stream, {"event": event.model_dump_json()})
+        fields = {"event": event.model_dump_json()}
+        if maxlen and maxlen > 0:
+            # Approximate trim keeps memory bounded without blocking every XADD.
+            return await self._redis.xadd(stream, fields, maxlen=maxlen, approximate=True)
+        return await self._redis.xadd(stream, fields)
 
 
 class RedisStreamConsumer:
@@ -84,6 +94,8 @@ class RedisStreamConsumer:
         max_retries: int | None = None,
         on_dead_letter: Callable[[EventEnvelope, Exception], Awaitable[None]] | None = None,
         redis=None,
+        *,
+        delete_after_ack: bool = False,
     ):
         self.stream = stream
         self.group = group
@@ -92,10 +104,29 @@ class RedisStreamConsumer:
         self.concurrency = concurrency or settings.WORKER_CONCURRENCY
         self.max_retries = max_retries or settings.WORKER_MAX_RETRIES
         self.on_dead_letter = on_dead_letter
+        self.delete_after_ack = delete_after_ack
         self._redis = redis or redis_client
         self._uses_default_redis = redis is None
         self._shutdown = asyncio.Event()
         self._semaphore = asyncio.Semaphore(self.concurrency)
+
+    async def _ack_and_cleanup(self, message_id: str) -> None:
+        await self._redis.xack(self.stream, self.group, message_id)
+        if not self.delete_after_ack:
+            return
+        try:
+            # Drop finished entries so Redis memory does not retain acked jobs.
+            await self._redis.xdel(self.stream, message_id)
+        except Exception as error:
+            print(
+                "Redis stream xdel after ack failed:",
+                {
+                    "stream": self.stream,
+                    "message_id": message_id,
+                    "error": str(error),
+                },
+                flush=True,
+            )
 
     async def ensure_group(self) -> None:
         try:
@@ -182,7 +213,7 @@ class RedisStreamConsumer:
         try:
             event = EventEnvelope.model_validate_json(fields["event"])
             await self.handler(event)
-            await self._redis.xack(self.stream, self.group, message_id)
+            await self._ack_and_cleanup(message_id)
         except Exception as error:
             await self._handle_failure(message_id, fields, error)
         finally:
@@ -206,7 +237,7 @@ class RedisStreamConsumer:
                 settings.REDIS_DEAD_LETTER_STREAM,
                 {"event": json.dumps({"raw": fields, "error": str(error)})},
             )
-            await self._redis.xack(self.stream, self.group, message_id)
+            await self._ack_and_cleanup(message_id)
             return
 
         if isinstance(error, NonRetryableQueueError) or event.attempt >= self.max_retries:
@@ -232,7 +263,7 @@ class RedisStreamConsumer:
                     "sourceStream": self.stream,
                 },
             )
-            await self._redis.xack(self.stream, self.group, message_id)
+            await self._ack_and_cleanup(message_id)
             if self.on_dead_letter is not None:
                 try:
                     await self.on_dead_letter(event, error)
@@ -275,7 +306,7 @@ class RedisStreamConsumer:
         else:
             # Dedicated Redis (e.g. cloud mindmap) has no shared retry relay — re-queue on same stream.
             await self._redis.xadd(self.stream, {"event": retry.model_dump_json()})
-        await self._redis.xack(self.stream, self.group, message_id)
+        await self._ack_and_cleanup(message_id)
 
 
 def retry_delay(attempt: int) -> float:

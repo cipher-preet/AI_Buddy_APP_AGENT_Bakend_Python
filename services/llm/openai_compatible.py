@@ -29,6 +29,8 @@ from services.llm.schema_adapter import (
     build_structured_plan,
     classify_validation_error,
     is_schema_echo,
+    openrouter_json_reasoning_body,
+    openrouter_prefers_plain_json,
     provider_local_recovery_eligible,
 )
 
@@ -89,6 +91,12 @@ class OpenAICompatibleProvider:
             "temperature": request.temperature,
         }
         payload.update(request.metadata.get("extra_body") or {})
+        # OpenRouter free/Nemotron: never send response_format; cap reasoning.max_tokens
+        # (OpenRouter forbids sending effort and max_tokens together).
+        if self.name == "openrouter" and openrouter_prefers_plain_json(model):
+            payload.pop("response_format", None)
+            if "reasoning" not in payload:
+                payload.update(openrouter_json_reasoning_body())
         payload = _without_none_values(payload)
         max_tokens = self._bounded_max_tokens(request.max_tokens)
         if max_tokens:
@@ -98,11 +106,32 @@ class OpenAICompatibleProvider:
             response = await self._post_with_retries("/chat/completions", payload)
         latency_ms = int((time.perf_counter() - started) * 1000)
         data = response.json()
-        choice = (data.get("choices") or [{}])[0]
+        # OpenRouter may return HTTP 200 with an upstream provider error and empty choices
+        # (e.g. Nvidia free 502/503). Treat that as a provider failure so callers can fall back.
+        _raise_if_openrouter_error_payload(data, provider=self.name, model=model)
+        choices = data.get("choices") or []
+        if not choices:
+            raise LLMProviderError(
+                f"{self.name}:{model} returned no choices",
+                retryable=True,
+                status_code=502,
+                failure_reason=HTTP_ERROR,
+            )
+        choice = choices[0] if isinstance(choices[0], dict) else {}
         message = choice.get("message") or {}
         usage = data.get("usage") or {}
+        content = _assistant_message_text(message)
+        finish_reason = str(choice.get("finish_reason") or "") or None
+        if not str(content or "").strip() and finish_reason not in {"tool_calls", "function_call"}:
+            raise LLMProviderError(
+                f"{self.name}:{model} returned empty assistant content"
+                f" (finish_reason={finish_reason!r})",
+                retryable=True,
+                status_code=502,
+                failure_reason=HTTP_ERROR,
+            )
         return LLMResponse(
-            content=_assistant_message_text(message),
+            content=content,
             provider=self.name,
             model=model,
             usage=LLMUsage(
@@ -111,7 +140,7 @@ class OpenAICompatibleProvider:
                 totalTokens=int(usage.get("total_tokens") or 0),
             ),
             latencyMs=latency_ms,
-            finishReason=str(choice.get("finish_reason") or "") or None,
+            finishReason=finish_reason,
         )
 
     async def generate_structured(
@@ -169,8 +198,16 @@ class OpenAICompatibleProvider:
         extra_body = dict(structured_request.metadata.get("extra_body") or {})
         extra_body.pop("response_format", None)
         extra_body.update(attempt.extra_body or {})
-        if attempt.response_format is not None:
-            extra_body["response_format"] = attempt.response_format
+        model = structured_request.model or self.default_model
+        if self.name == "openrouter" and openrouter_prefers_plain_json(model):
+            # Force prompt-only JSON — never attach response_format for free/Nemotron.
+            attempt_response_format = None
+            if "reasoning" not in extra_body:
+                extra_body.update(openrouter_json_reasoning_body())
+        else:
+            attempt_response_format = attempt.response_format
+        if attempt_response_format is not None:
+            extra_body["response_format"] = attempt_response_format
         if self.name == "sarvam":
             extra_body["reasoning_effort"] = None
         structured_request.metadata["extra_body"] = extra_body
@@ -210,8 +247,14 @@ class OpenAICompatibleProvider:
         structured_request.metadata.setdefault("extra_body", {})
         extra_body = dict(structured_request.metadata.get("extra_body") or {})
         extra_body.pop("response_format", None)
-        if response_format is not None:
-            extra_body["response_format"] = response_format
+        model = structured_request.model or self.default_model
+        effective_format = response_format
+        if self.name == "openrouter" and openrouter_prefers_plain_json(model):
+            effective_format = None
+            if "reasoning" not in extra_body:
+                extra_body.update(openrouter_json_reasoning_body())
+        if effective_format is not None:
+            extra_body["response_format"] = effective_format
         if self.name == "sarvam":
             extra_body["reasoning_effort"] = None
         structured_request.metadata["extra_body"] = extra_body
@@ -326,6 +369,43 @@ class OpenAICompatibleProvider:
                     json=payload,
                 )
                 if response.status_code < 400:
+                    # OpenRouter free providers may return HTTP 200 with an embedded error
+                    # (e.g. Nvidia 502/503). Do not log that as success.
+                    embedded_error = None
+                    try:
+                        body_json = response.json()
+                        if isinstance(body_json, dict) and body_json.get("error"):
+                            embedded_error = body_json.get("error")
+                    except Exception:
+                        body_json = None
+                    if embedded_error is not None:
+                        if isinstance(embedded_error, dict):
+                            message = str(embedded_error.get("message") or embedded_error)
+                            try:
+                                status = int(embedded_error.get("code") or 502)
+                            except (TypeError, ValueError):
+                                status = 502
+                        else:
+                            message = str(embedded_error)
+                            status = 502
+                        print(
+                            "LLM HTTP call failed:",
+                            {
+                                "provider": self.name,
+                                "model": payload.get("model"),
+                                "statusCode": status,
+                                "attempt": attempt + 1,
+                                "retryable": is_retryable_status(status),
+                                "embeddedError": True,
+                                "detail": message[:240],
+                            },
+                        )
+                        raise LLMProviderError(
+                            f"{self.name}:{payload.get('model')} upstream error: {message}",
+                            retryable=is_retryable_status(status) or status in {502, 503, 529},
+                            status_code=status,
+                            failure_reason=HTTP_ERROR,
+                        )
                     print(
                         "LLM HTTP call succeeded:",
                         {
@@ -538,7 +618,18 @@ def _log_structured_attempt(diagnostics: dict[str, Any]) -> None:
 
 def _sanitize_json_text(content: str) -> str:
     value = str(content or "").strip()
-    value = value.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    value = re.sub(r"<think>[\s\S]*?</think>", "", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"<\|?(?:redacted_)?reasoning\|?>[\s\S]*?<\|?/(?:redacted_)?reasoning\|?>",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", value, flags=re.IGNORECASE)
+    if fence:
+        value = fence.group(1).strip()
+    else:
+        value = value.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     # Remove ASCII control characters except whitespace JSON permits.
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", value)
 
@@ -613,10 +704,63 @@ def _close_truncated_json(content: str) -> str | None:
     return repaired
 
 
+def _raise_if_openrouter_error_payload(data: dict[str, Any], *, provider: str, model: str) -> None:
+    """OpenRouter sometimes returns 200 OK with an embedded provider error and no choices."""
+    error = data.get("error")
+    if not error:
+        return
+    if isinstance(error, dict):
+        message = str(error.get("message") or error)
+        code = error.get("code")
+        try:
+            status = int(code) if code is not None else 502
+        except (TypeError, ValueError):
+            status = 502
+    else:
+        message = str(error)
+        status = 502
+    raise LLMProviderError(
+        f"{provider}:{model} upstream error: {message}",
+        retryable=is_retryable_status(status) or status in {502, 503, 529},
+        status_code=status,
+        failure_reason=HTTP_ERROR,
+    )
+
+
+def _tool_call_argument_texts(message: dict[str, Any]) -> list[str]:
+    """Extract function-call argument JSON (OpenRouter tool calling)."""
+    texts: list[str] = []
+    for call in message.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        arguments = function.get("arguments")
+        if isinstance(arguments, dict):
+            texts.append(json.dumps(arguments, ensure_ascii=False))
+        elif arguments:
+            texts.append(str(arguments))
+    return texts
+
+
+def _reasoning_detail_texts(message: dict[str, Any]) -> list[str]:
+    details = message.get("reasoning_details") or []
+    texts: list[str] = []
+    if isinstance(details, list):
+        for item in details:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or item.get("summary")
+                if text:
+                    texts.append(str(text))
+            elif item:
+                texts.append(str(item))
+    return texts
+
+
 def _assistant_message_text(message: dict[str, Any]) -> str:
     content = str(message.get("content") or "")
     reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "")
-    candidates = [part for part in (_sanitize_json_text(content), _sanitize_json_text(reasoning)) if part]
+    parts = [content, reasoning, *_reasoning_detail_texts(message), *_tool_call_argument_texts(message)]
+    candidates = [part for part in (_sanitize_json_text(value) for value in parts if value) if part]
     for candidate in candidates:
         try:
             json.loads(candidate)
@@ -633,6 +777,10 @@ def _assistant_message_text(message: dict[str, Any]) -> str:
         repaired = _close_truncated_json(candidate)
         if repaired:
             return repaired
+    # Prefer tool-call args over empty content when the model only emitted a tool call.
+    for raw in _tool_call_argument_texts(message):
+        if raw.strip():
+            return raw
     return content or reasoning
 
 

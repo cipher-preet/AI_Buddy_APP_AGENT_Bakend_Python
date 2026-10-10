@@ -118,8 +118,46 @@ class StructuredProviderPlan:
     attempts: list[StructuredAttemptPlan]
 
 
+def openrouter_prefers_plain_json(model: str) -> bool:
+    """OpenRouter free / Nemotron endpoints do not reliably enforce response_format.
+
+    Per OpenRouter model docs, nvidia/nemotron-3-ultra-550b-a55b:free accepts tools
+    but does not support response_format, so json_schema/json_object must not be sent.
+    """
+    name = str(model or "").strip().casefold()
+    return ":free" in name or "nemotron" in name
+
+
+def openrouter_json_reasoning_body() -> dict[str, Any]:
+    """Reasoning settings for OpenRouter free/Nemotron JSON generation.
+
+    Official model metadata for nvidia/nemotron-3-ultra-550b-a55b:free:
+      reasoning.supported_efforts = ["high", "medium"]  # NOT "none" / "low"
+      reasoning.default_effort = "high"
+      reasoning.supports_max_tokens = true
+      reasoning.mandatory = false
+
+    OpenRouter reasoning docs: do not use effort "none" when unsupported; do not set
+    exclude=true when content may only appear after reasoning (exclude hides reasoning
+    and can leave an empty message). Cap reasoning.max_tokens so visible JSON still fits
+    inside the request max_tokens budget.
+    """
+    # OpenRouter accepts only ONE of effort / max_tokens (not both). Prefer
+    # max_tokens so we can hard-cap thinking and leave room for visible JSON.
+    return {"reasoning": {"max_tokens": 2048}}
+
+
+# Backward-compatible alias — previous name implied disabling reasoning, which this
+# model does not support via effort="none".
+openrouter_disable_reasoning_body = openrouter_json_reasoning_body
+
+
 def structured_capabilities(provider: str, model: str) -> StructuredOutputCapability:
     provider_name = str(provider or "").strip().casefold()
+    # Free/Nemotron OpenRouter routes: claim no response_format support so adapters
+    # never attach json_schema / json_object (avoids MALFORMED_STRUCTURED_OUTPUT).
+    if provider_name == "openrouter" and openrouter_prefers_plain_json(model):
+        return StructuredOutputCapability(False, False, True, "medium")
     if provider_name in {"openai", "openrouter", "krutrim"}:
         return StructuredOutputCapability(True, True, True, "high")
     if provider_name in {"mistral", "groq", "gemini", "sarvam"}:
@@ -274,19 +312,35 @@ class KrutrimStructuredAdapter(StructuredSchemaAdapter):
 class DefaultStructuredAdapter(StructuredSchemaAdapter):
     def plan(self, provider: str, model: str, schema_name: str, canonical_schema: dict[str, Any]) -> StructuredProviderPlan:
         capability = structured_capabilities(provider, model)
+        plain_extra = (
+            openrouter_json_reasoning_body()
+            if str(provider or "").strip().casefold() == "openrouter" and openrouter_prefers_plain_json(model)
+            else {}
+        )
+        plain = StructuredAttemptPlan(
+            mode="plain_json_prompt",
+            response_format=None,
+            extra_body=plain_extra,
+            schema=canonical_schema,
+            instruction=_schema_instruction(schema_name, canonical_schema, recovery=True),
+            temperature=0.0,
+        )
+        # OpenRouter free Nemotron: never send response_format; disable reasoning tokens.
+        if str(provider or "").strip().casefold() == "openrouter" and openrouter_prefers_plain_json(model):
+            return StructuredProviderPlan(provider, model, schema_name, canonical_schema, [plain])
+
         attempts: list[StructuredAttemptPlan] = []
         if capability.supports_json_schema:
             attempts.append(self._json_schema_attempt(schema_name, canonical_schema, strict=False))
         if capability.supports_json_object:
             attempts.append(self._json_object_attempt(schema_name, canonical_schema))
-        return StructuredProviderPlan(provider, model, schema_name, canonical_schema, attempts[:2] or [
-            StructuredAttemptPlan(
-                mode="plain_json_prompt",
-                response_format=None,
-                schema=canonical_schema,
-                instruction=_schema_instruction(schema_name, canonical_schema),
-            )
-        ])
+        attempts.append(plain)
+        return StructuredProviderPlan(provider, model, schema_name, canonical_schema, attempts[:3] or [plain])
+
+
+class OpenRouterStructuredAdapter(DefaultStructuredAdapter):
+    def plan(self, provider: str, model: str, schema_name: str, canonical_schema: dict[str, Any]) -> StructuredProviderPlan:
+        return super().plan(provider, model, schema_name, canonical_schema)
 
 
 def _adapter_for(provider: str) -> StructuredSchemaAdapter:
@@ -301,6 +355,8 @@ def _adapter_for(provider: str) -> StructuredSchemaAdapter:
         return SarvamStructuredAdapter()
     if name == "krutrim":
         return KrutrimStructuredAdapter()
+    if name == "openrouter":
+        return OpenRouterStructuredAdapter()
     return DefaultStructuredAdapter()
 
 

@@ -65,7 +65,11 @@ async def enqueue_mindmap_generation(database, *, user_id: str, space_id: str) -
 
     try:
         client = get_mindmap_redis_client()
-        await RedisStreamProducer(client, force_direct=True).publish(settings.REDIS_MINDMAP_STREAM, event)
+        await RedisStreamProducer(client, force_direct=True).publish(
+            settings.REDIS_MINDMAP_STREAM,
+            event,
+            maxlen=settings.REDIS_MINDMAP_STREAM_MAXLEN,
+        )
     except MindmapRedisConfigError as error:
         await store.mark_failed(mindmap_id, str(error))
         raise PermissionError(str(error)) from error

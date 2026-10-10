@@ -24,6 +24,7 @@ from apps.api_gateway.workers.daily_briefing_worker import (
     run_daily_briefing_scheduler,
 )
 from apps.api_gateway.workers.mindmap_worker import build_mindmap_consumer, ensure_mindmap_redis
+from apps.api_gateway.workers.document_worker import build_document_consumer
 from services.db.mongo import close_mongo_client, ensure_mongo_indexes
 from services.llm.router import close_llm_runtime, log_llm_provider_status
 from services.meeting_extension.ffmpeg_audio import probe_ffmpeg
@@ -104,6 +105,7 @@ async def main():
     window_extraction_consumer = build_window_extraction_consumer()
     daily_briefing_consumer = build_daily_briefing_consumer()
     mindmap_consumer = build_mindmap_consumer()
+    document_consumer = build_document_consumer()
     meeting_video_consumer = build_meeting_video_consumer()
     meeting_merge_consumer = build_meeting_merge_consumer()
     schedule_extraction_consumer = build_schedule_extraction_consumer()
@@ -118,6 +120,7 @@ async def main():
             processing_consumer,
             daily_briefing_consumer,
             mindmap_consumer,
+            document_consumer,
             meeting_video_consumer,
             meeting_merge_consumer,
             schedule_extraction_consumer,

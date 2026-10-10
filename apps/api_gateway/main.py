@@ -6,6 +6,7 @@ from apps.api_gateway.middleware.logging import log_requests
 from apps.api_gateway.routes.conversation_routes import router as conversation_router
 from apps.api_gateway.routes.daily_briefing_routes import router as daily_briefing_router
 from apps.api_gateway.routes.mindmap_routes import router as mindmap_router
+from apps.api_gateway.routes.document_routes import router as document_router
 from apps.api_gateway.routes.reminder_voice_routes import router as reminder_voice_router
 from apps.api_gateway.routes.reminder_device_routes import router as reminder_device_router
 from apps.api_gateway.routes.speech_routes import router as speech_router
@@ -46,6 +47,11 @@ app.include_router(
     mindmap_router,
     prefix="/api/v1/mindmap",
     tags=["Mindmap"],
+)
+app.include_router(
+    document_router,
+    prefix="/api/v1/documents",
+    tags=["Documents"],
 )
 
 

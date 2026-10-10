@@ -133,6 +133,10 @@ class Settings(BaseSettings):
     REDIS_MEETING_VIDEO_STREAM: str = "buddy:stt:jobs"
     REDIS_MEETING_MERGE_STREAM: str = "buddy:meeting:video-merge"
     REDIS_MINDMAP_STREAM: str = "buddy:mindmap:jobs"
+    REDIS_DOCUMENT_STREAM: str = "buddy:document:jobs"
+    # Approximate MAXLEN so finished/acked entries cannot grow unbounded.
+    REDIS_MINDMAP_STREAM_MAXLEN: int = Field(default=2000, ge=100, le=100000)
+    REDIS_DOCUMENT_STREAM_MAXLEN: int = Field(default=2000, ge=100, le=100000)
 
     REDIS_AUDIO_GROUP: str = "audio-workers"
     REDIS_STT_GROUP: str = "stt-workers"
@@ -144,9 +148,15 @@ class Settings(BaseSettings):
     REDIS_MEETING_VIDEO_GROUP: str = "meeting-video-workers"
     REDIS_MEETING_MERGE_GROUP: str = "meeting-merge-workers"
     REDIS_MINDMAP_GROUP: str = "mindmap-workers"
+    REDIS_DOCUMENT_GROUP: str = "document-workers"
 
-    # Space mindmap generation (OpenRouter Nemotron by default).
-    MINDMAP_MODELS: str = "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"
+    # Mindmap: Krutrim first (reliable structured JSON). OpenRouter free Nemotron last —
+    # Nvidia free often returns HTTP 200 with upstream 502/503 (OpenRouter free-model docs).
+    MINDMAP_MODELS: str = (
+        "krutrim:gemma-4-31b-it,"
+        "krutrim:gpt-oss-20b,"
+        "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"
+    )
     MINDMAP_MAX_CONCURRENCY: int = Field(default=2, ge=1, le=16)
     MINDMAP_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
     MINDMAP_MAX_OUTPUT_TOKENS: int = Field(default=6000, ge=1000, le=32000)
@@ -156,6 +166,19 @@ class Settings(BaseSettings):
     MINDMAP_MAX_TRANSCRIPTS: int = Field(default=40, ge=5, le=500)
     MINDMAP_ITEM_BODY_CHARS: int = Field(default=280, ge=40, le=4000)
     MINDMAP_TRANSCRIPT_CHARS: int = Field(default=1200, ge=100, le=20000)
+
+    # Document-it: Krutrim first. OpenRouter :free Nvidia is capacity-limited and often
+    # returns embedded upstream errors (see OpenRouter free-model / rate-limit docs).
+    DOCUMENT_MODELS: str = (
+        "krutrim:gemma-4-31b-it,"
+        "krutrim:gpt-oss-20b,"
+        "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"
+    )
+    DOCUMENT_MAX_CONCURRENCY: int = Field(default=2, ge=1, le=16)
+    DOCUMENT_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
+    DOCUMENT_MAX_OUTPUT_TOKENS: int = Field(default=8000, ge=1000, le=32000)
+    DOCUMENT_CONTEXT_TOKEN_BUDGET: int = Field(default=14000, ge=1000, le=100000)
+    DOCUMENT_MAX_VERSIONS_PER_SPACE: int = Field(default=20, ge=3, le=100)
 
     DAILY_BRIEFING_ENABLED: bool = True
     DAILY_BRIEFING_TRIGGER_HOUR: int = Field(default=0, ge=0, le=23)
