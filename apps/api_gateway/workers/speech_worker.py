@@ -267,7 +267,6 @@ async def start_speech_consumer():
             job = await pop_speech_job()
 
             if not job:
-                await asyncio.sleep(1)
                 continue
 
             await process_speech_job(job)

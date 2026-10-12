@@ -1,0 +1,812 @@
+[
+  {
+    "id": "career-zsm-student",
+    "statement": "I want to become a Zonal Sales Manager in a bank.",
+    "expectedDomain": "CAREER",
+    "startingLevel": "STUDENT",
+    "context": {
+      "currentRole": "student"
+    },
+    "success": "I want to become a Zonal Sales Manager in a bank."
+  },
+  {
+    "id": "career-zsm-asm",
+    "statement": "I want to become a Zonal Sales Manager in a bank.",
+    "expectedDomain": "CAREER",
+    "startingLevel": "INTERMEDIATE",
+    "context": {
+      "currentRole": "Area Sales Manager"
+    },
+    "success": "I want to become a Zonal Sales Manager in a bank."
+  },
+  {
+    "id": "career-zsm-rsm",
+    "statement": "I want to become a Zonal Sales Manager in a bank.",
+    "expectedDomain": "CAREER",
+    "startingLevel": "SENIOR",
+    "context": {
+      "currentRole": "Regional Sales Manager"
+    },
+    "success": "I want to become a Zonal Sales Manager in a bank."
+  },
+  {
+    "id": "career-fullstack",
+    "statement": "I want to become a full-stack engineer",
+    "expectedDomain": "CAREER",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "I want to become a full-stack engineer"
+  },
+  {
+    "id": "career-nurse",
+    "statement": "I want to become a registered nurse",
+    "expectedDomain": "CAREER",
+    "startingLevel": "STUDENT",
+    "context": {},
+    "success": "I want to become a registered nurse"
+  },
+  {
+    "id": "career-pm",
+    "statement": "I want to get promoted to product manager",
+    "expectedDomain": "CAREER",
+    "startingLevel": "INTERMEDIATE",
+    "context": {
+      "currentRole": "business analyst"
+    },
+    "success": "I want to get promoted to product manager"
+  },
+  {
+    "id": "career-teacher",
+    "statement": "I want to become a high school teacher",
+    "expectedDomain": "CAREER",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "I want to become a high school teacher"
+  },
+  {
+    "id": "career-data",
+    "statement": "I want to become a data analyst",
+    "expectedDomain": "CAREER",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "I want to become a data analyst"
+  },
+  {
+    "id": "career-lawyer",
+    "statement": "I want to qualify as a lawyer",
+    "expectedDomain": "CAREER",
+    "startingLevel": "STUDENT",
+    "context": {},
+    "success": "I want to qualify as a lawyer"
+  },
+  {
+    "id": "career-hr",
+    "statement": "I want to become an HR business partner",
+    "expectedDomain": "CAREER",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "I want to become an HR business partner"
+  },
+  {
+    "id": "skill-python-zero",
+    "statement": "I want to learn Python from zero",
+    "expectedDomain": "EDUCATION",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "I want to learn Python from zero"
+  },
+  {
+    "id": "skill-excel",
+    "statement": "Learn advanced Excel for finance",
+    "expectedDomain": "EDUCATION",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Learn advanced Excel for finance"
+  },
+  {
+    "id": "exam-upsc",
+    "statement": "Prepare for a competitive civil service examination",
+    "expectedDomain": "EDUCATION",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Prepare for a competitive civil service examination"
+  },
+  {
+    "id": "exam-cfa",
+    "statement": "Pass CFA level 1",
+    "expectedDomain": "EDUCATION",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Pass CFA level 1"
+  },
+  {
+    "id": "edu-mba",
+    "statement": "Get into a part-time MBA",
+    "expectedDomain": "EDUCATION",
+    "startingLevel": "SENIOR",
+    "context": {},
+    "success": "Get into a part-time MBA"
+  },
+  {
+    "id": "edu-spanish",
+    "statement": "Become conversational in Spanish",
+    "expectedDomain": "EDUCATION",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Become conversational in Spanish"
+  },
+  {
+    "id": "edu-sql",
+    "statement": "Master SQL for analytics",
+    "expectedDomain": "EDUCATION",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Master SQL for analytics"
+  },
+  {
+    "id": "edu-piano",
+    "statement": "Learn piano as an adult beginner",
+    "expectedDomain": "EDUCATION",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Learn piano as an adult beginner"
+  },
+  {
+    "id": "edu-cloud",
+    "statement": "Get an AWS associate certification",
+    "expectedDomain": "EDUCATION",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Get an AWS associate certification"
+  },
+  {
+    "id": "edu-thesis",
+    "statement": "Finish my masters thesis",
+    "expectedDomain": "EDUCATION",
+    "startingLevel": "ADVANCED",
+    "context": {},
+    "success": "Finish my masters thesis"
+  },
+  {
+    "id": "biz-saas",
+    "statement": "Launch a SaaS invoicing app for dentists",
+    "expectedDomain": "BUSINESS",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Launch a SaaS invoicing app for dentists"
+  },
+  {
+    "id": "biz-bakery",
+    "statement": "Launch a local bakery",
+    "expectedDomain": "BUSINESS",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Launch a local bakery"
+  },
+  {
+    "id": "biz-agency",
+    "statement": "Grow my freelance design agency",
+    "expectedDomain": "BUSINESS",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Grow my freelance design agency"
+  },
+  {
+    "id": "biz-shop",
+    "statement": "Open a neighborhood grocery shop",
+    "expectedDomain": "BUSINESS",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Open a neighborhood grocery shop"
+  },
+  {
+    "id": "biz-course",
+    "statement": "Sell an online course",
+    "expectedDomain": "BUSINESS",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Sell an online course"
+  },
+  {
+    "id": "biz-restaurant",
+    "statement": "Open a small restaurant",
+    "expectedDomain": "BUSINESS",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Open a small restaurant"
+  },
+  {
+    "id": "biz-side",
+    "statement": "Turn a side project into a business",
+    "expectedDomain": "BUSINESS",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Turn a side project into a business"
+  },
+  {
+    "id": "biz-export",
+    "statement": "Start an export trading business",
+    "expectedDomain": "BUSINESS",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Start an export trading business"
+  },
+  {
+    "id": "biz-consult",
+    "statement": "Launch an independent consulting practice",
+    "expectedDomain": "BUSINESS",
+    "startingLevel": "SENIOR",
+    "context": {},
+    "success": "Launch an independent consulting practice"
+  },
+  {
+    "id": "biz-franchise",
+    "statement": "Buy a franchise",
+    "expectedDomain": "BUSINESS",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Buy a franchise"
+  },
+  {
+    "id": "tech-app",
+    "statement": "Build a mobile habit tracker app",
+    "expectedDomain": "TECHNOLOGY",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Build a mobile habit tracker app"
+  },
+  {
+    "id": "tech-oss",
+    "statement": "Ship an open-source CLI tool",
+    "expectedDomain": "TECHNOLOGY",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Ship an open-source CLI tool"
+  },
+  {
+    "id": "tech-migrate",
+    "statement": "Migrate our monolith to services",
+    "expectedDomain": "TECHNOLOGY",
+    "startingLevel": "ADVANCED",
+    "context": {},
+    "success": "Migrate our monolith to services"
+  },
+  {
+    "id": "tech-portfolio",
+    "statement": "Build a portfolio website",
+    "expectedDomain": "TECHNOLOGY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Build a portfolio website"
+  },
+  {
+    "id": "tech-game",
+    "statement": "Finish a small indie game",
+    "expectedDomain": "TECHNOLOGY",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Finish a small indie game"
+  },
+  {
+    "id": "tech-bot",
+    "statement": "Build a Telegram bot for reminders",
+    "expectedDomain": "TECHNOLOGY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Build a Telegram bot for reminders"
+  },
+  {
+    "id": "tech-chrome",
+    "statement": "Ship a chrome extension",
+    "expectedDomain": "TECHNOLOGY",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Ship a chrome extension"
+  },
+  {
+    "id": "tech-dataset",
+    "statement": "Clean and publish a research dataset",
+    "expectedDomain": "TECHNOLOGY",
+    "startingLevel": "ADVANCED",
+    "context": {},
+    "success": "Clean and publish a research dataset"
+  },
+  {
+    "id": "tech-ml",
+    "statement": "Train a small image classifier",
+    "expectedDomain": "TECHNOLOGY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Train a small image classifier"
+  },
+  {
+    "id": "tech-docs",
+    "statement": "Rewrite internal API docs",
+    "expectedDomain": "TECHNOLOGY",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Rewrite internal API docs"
+  },
+  {
+    "id": "fin-emergency",
+    "statement": "Build a 6-month emergency fund",
+    "expectedDomain": "FINANCIAL",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Build a 6-month emergency fund"
+  },
+  {
+    "id": "fin-debt",
+    "statement": "Pay off credit card debt",
+    "expectedDomain": "FINANCIAL",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Pay off credit card debt"
+  },
+  {
+    "id": "fin-house",
+    "statement": "Save a house down payment",
+    "expectedDomain": "FINANCIAL",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Save a house down payment"
+  },
+  {
+    "id": "fin-retire",
+    "statement": "Increase retirement contributions",
+    "expectedDomain": "FINANCIAL",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Increase retirement contributions"
+  },
+  {
+    "id": "fin-budget",
+    "statement": "Stick to a monthly budget",
+    "expectedDomain": "FINANCIAL",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Stick to a monthly budget"
+  },
+  {
+    "id": "fin-invest",
+    "statement": "Start index-fund investing",
+    "expectedDomain": "FINANCIAL",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Start index-fund investing"
+  },
+  {
+    "id": "fin-tax",
+    "statement": "Get this year tax filing organized",
+    "expectedDomain": "FINANCIAL",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Get this year tax filing organized"
+  },
+  {
+    "id": "fin-side-income",
+    "statement": "Add a second income stream",
+    "expectedDomain": "FINANCIAL",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Add a second income stream"
+  },
+  {
+    "id": "fin-kids",
+    "statement": "Start a child education fund",
+    "expectedDomain": "FINANCIAL",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Start a child education fund"
+  },
+  {
+    "id": "fin-fx",
+    "statement": "Learn personal FX risk for remittances",
+    "expectedDomain": "FINANCIAL",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Learn personal FX risk for remittances"
+  },
+  {
+    "id": "health-marathon",
+    "statement": "Train for a marathon",
+    "expectedDomain": "HEALTH",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Train for a marathon"
+  },
+  {
+    "id": "health-5k",
+    "statement": "Run a 5k without stopping",
+    "expectedDomain": "HEALTH",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Run a 5k without stopping"
+  },
+  {
+    "id": "health-sleep",
+    "statement": "Sleep 7 hours most nights",
+    "expectedDomain": "HEALTH",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Sleep 7 hours most nights"
+  },
+  {
+    "id": "health-strength",
+    "statement": "Build a 3-day strength habit",
+    "expectedDomain": "HEALTH",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Build a 3-day strength habit"
+  },
+  {
+    "id": "health-physio",
+    "statement": "Recover from a knee injury with physio",
+    "expectedDomain": "HEALTH",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Recover from a knee injury with physio"
+  },
+  {
+    "id": "health-weight",
+    "statement": "Lose 8kg with sustainable habits",
+    "expectedDomain": "HEALTH",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Lose 8kg with sustainable habits"
+  },
+  {
+    "id": "health-yoga",
+    "statement": "Practice yoga three times a week",
+    "expectedDomain": "HEALTH",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Practice yoga three times a week"
+  },
+  {
+    "id": "health-bp",
+    "statement": "Lower blood pressure with lifestyle changes",
+    "expectedDomain": "HEALTH",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Lower blood pressure with lifestyle changes"
+  },
+  {
+    "id": "health-swim",
+    "statement": "Learn to swim as an adult",
+    "expectedDomain": "HEALTH",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Learn to swim as an adult"
+  },
+  {
+    "id": "health-hike",
+    "statement": "Complete a 2-day trek",
+    "expectedDomain": "HEALTH",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Complete a 2-day trek"
+  },
+  {
+    "id": "habit-reading",
+    "statement": "Improve a daily reading habit",
+    "expectedDomain": "PRODUCTIVITY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Improve a daily reading habit"
+  },
+  {
+    "id": "habit-journal",
+    "statement": "Journal every morning",
+    "expectedDomain": "PRODUCTIVITY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Journal every morning"
+  },
+  {
+    "id": "habit-deepwork",
+    "statement": "Protect two deep-work hours on weekdays",
+    "expectedDomain": "PRODUCTIVITY",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Protect two deep-work hours on weekdays"
+  },
+  {
+    "id": "habit-inbox",
+    "statement": "Reach inbox zero weekly",
+    "expectedDomain": "PRODUCTIVITY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Reach inbox zero weekly"
+  },
+  {
+    "id": "habit-phone",
+    "statement": "Cut recreational phone time",
+    "expectedDomain": "PRODUCTIVITY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Cut recreational phone time"
+  },
+  {
+    "id": "habit-planning",
+    "statement": "Do a weekly review every Sunday",
+    "expectedDomain": "PRODUCTIVITY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Do a weekly review every Sunday"
+  },
+  {
+    "id": "habit-water",
+    "statement": "Drink 2 litres of water daily",
+    "expectedDomain": "PRODUCTIVITY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Drink 2 litres of water daily"
+  },
+  {
+    "id": "habit-language",
+    "statement": "Do 15 minutes of language practice daily",
+    "expectedDomain": "PRODUCTIVITY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Do 15 minutes of language practice daily"
+  },
+  {
+    "id": "habit-walk",
+    "statement": "Walk 8000 steps a day",
+    "expectedDomain": "PRODUCTIVITY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Walk 8000 steps a day"
+  },
+  {
+    "id": "habit-no-snooze",
+    "statement": "Stop snoozing the alarm",
+    "expectedDomain": "PRODUCTIVITY",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Stop snoozing the alarm"
+  },
+  {
+    "id": "cre-novel",
+    "statement": "Finish the first draft of a novel",
+    "expectedDomain": "CREATIVE",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Finish the first draft of a novel"
+  },
+  {
+    "id": "cre-youtube",
+    "statement": "Publish 12 YouTube videos",
+    "expectedDomain": "CREATIVE",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Publish 12 YouTube videos"
+  },
+  {
+    "id": "cre-photo",
+    "statement": "Build a street photography portfolio",
+    "expectedDomain": "CREATIVE",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Build a street photography portfolio"
+  },
+  {
+    "id": "cre-podcast",
+    "statement": "Launch a 6-episode podcast",
+    "expectedDomain": "CREATIVE",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Launch a 6-episode podcast"
+  },
+  {
+    "id": "cre-art",
+    "statement": "Draw every day for 30 days",
+    "expectedDomain": "CREATIVE",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Draw every day for 30 days"
+  },
+  {
+    "id": "cre-music",
+    "statement": "Release one original song",
+    "expectedDomain": "CREATIVE",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Release one original song"
+  },
+  {
+    "id": "cre-blog",
+    "statement": "Write 8 long-form essays",
+    "expectedDomain": "CREATIVE",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Write 8 long-form essays"
+  },
+  {
+    "id": "cre-comic",
+    "statement": "Complete a 20-page comic",
+    "expectedDomain": "CREATIVE",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Complete a 20-page comic"
+  },
+  {
+    "id": "cre-pottery",
+    "statement": "Learn wheel throwing",
+    "expectedDomain": "CREATIVE",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Learn wheel throwing"
+  },
+  {
+    "id": "cre-film",
+    "statement": "Shoot a 5-minute short film",
+    "expectedDomain": "CREATIVE",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Shoot a 5-minute short film"
+  },
+  {
+    "id": "travel-japan",
+    "statement": "Plan a 2-week trip to Japan",
+    "expectedDomain": "TRAVEL",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Plan a 2-week trip to Japan"
+  },
+  {
+    "id": "travel-visa",
+    "statement": "Get a work visa for Canada",
+    "expectedDomain": "TRAVEL",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Get a work visa for Canada"
+  },
+  {
+    "id": "rel-family",
+    "statement": "Have a weekly family dinner",
+    "expectedDomain": "RELATIONSHIPS",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Have a weekly family dinner"
+  },
+  {
+    "id": "rel-network",
+    "statement": "Rebuild a professional network after a move",
+    "expectedDomain": "RELATIONSHIPS",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Rebuild a professional network after a move"
+  },
+  {
+    "id": "life-move",
+    "statement": "Move cities with a 8-week plan",
+    "expectedDomain": "OTHER",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Move cities with a 8-week plan"
+  },
+  {
+    "id": "life-license",
+    "statement": "Get a driving license",
+    "expectedDomain": "OTHER",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Get a driving license"
+  },
+  {
+    "id": "life-volunteer",
+    "statement": "Volunteer 4 hours a week",
+    "expectedDomain": "RELATIONSHIPS",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Volunteer 4 hours a week"
+  },
+  {
+    "id": "travel-trek",
+    "statement": "Do the Inca trail",
+    "expectedDomain": "TRAVEL",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Do the Inca trail"
+  },
+  {
+    "id": "rel-mentor",
+    "statement": "Find and work with a mentor",
+    "expectedDomain": "CAREER",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Find and work with a mentor"
+  },
+  {
+    "id": "other-garden",
+    "statement": "Grow a balcony vegetable garden",
+    "expectedDomain": "OTHER",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Grow a balcony vegetable garden"
+  },
+  {
+    "id": "career-sales-exec",
+    "statement": "Move from individual contributor sales to team lead",
+    "expectedDomain": "CAREER",
+    "startingLevel": "INTERMEDIATE",
+    "context": {
+      "currentRole": "account executive"
+    },
+    "success": "Move from individual contributor sales to team lead"
+  },
+  {
+    "id": "career-ops",
+    "statement": "Become operations manager in logistics",
+    "expectedDomain": "CAREER",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Become operations manager in logistics"
+  },
+  {
+    "id": "edu-bootcamp",
+    "statement": "Complete a web development bootcamp",
+    "expectedDomain": "EDUCATION",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Complete a web development bootcamp"
+  },
+  {
+    "id": "biz-farmers",
+    "statement": "Start a weekend farmers market stall",
+    "expectedDomain": "BUSINESS",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Start a weekend farmers market stall"
+  },
+  {
+    "id": "health-cycle",
+    "statement": "Complete a 100km cycling event",
+    "expectedDomain": "HEALTH",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Complete a 100km cycling event"
+  },
+  {
+    "id": "fin-insurance",
+    "statement": "Review and fix family insurance cover",
+    "expectedDomain": "FINANCIAL",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Review and fix family insurance cover"
+  },
+  {
+    "id": "tech-tests",
+    "statement": "Add CI tests to a messy repo",
+    "expectedDomain": "TECHNOLOGY",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Add CI tests to a messy repo"
+  },
+  {
+    "id": "creative-newsletter",
+    "statement": "Grow a newsletter to 500 readers",
+    "expectedDomain": "CREATIVE",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Grow a newsletter to 500 readers"
+  },
+  {
+    "id": "prod-meeting",
+    "statement": "Cut recurring meetings by 30 percent",
+    "expectedDomain": "PRODUCTIVITY",
+    "startingLevel": "INTERMEDIATE",
+    "context": {},
+    "success": "Cut recurring meetings by 30 percent"
+  },
+  {
+    "id": "travel-budget",
+    "statement": "Take a 10-day trip under a fixed budget",
+    "expectedDomain": "TRAVEL",
+    "startingLevel": "BEGINNER",
+    "context": {},
+    "success": "Take a 10-day trip under a fixed budget"
+  }
+]

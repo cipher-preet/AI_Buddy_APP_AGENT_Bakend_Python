@@ -3,18 +3,31 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
-from redis.exceptions import ConnectionError, ResponseError, TimeoutError as RedisTimeoutError
+from redis.exceptions import (
+    ConnectionError,
+    MaxConnectionsError,
+    ResponseError,
+    TimeoutError as RedisTimeoutError,
+)
 
 from apps.api_gateway.config.setting import settings
 from services.queue.factory import use_queue_api
 from services.queue.http_queue import QueueApiPublisher
 from services.queue.redis_queue import redis_client
+from services.queue.shared_redis import (
+    capacity_backoff_seconds,
+    is_redis_capacity_error,
+    mark_redis_capacity_pressure,
+    recover_redis_capacity,
+    redis_under_capacity_pressure,
+)
 
 
 class NonRetryableQueueError(RuntimeError):
@@ -111,6 +124,8 @@ class RedisStreamConsumer:
         self._uses_default_redis = redis is None
         self._shutdown = asyncio.Event()
         self._semaphore = asyncio.Semaphore(self.concurrency)
+        self._last_claim_at = 0.0
+        self._capacity_failures = 0
 
     async def _ack_and_cleanup(self, message_id: str) -> None:
         await self._redis.xack(self.stream, self.group, message_id)
@@ -187,6 +202,91 @@ class RedisStreamConsumer:
     async def stop(self) -> None:
         self._shutdown.set()
 
+    def pool_identity(self) -> int:
+        pool = getattr(self._redis, "connection_pool", None)
+        return id(pool) if pool is not None else id(self._redis)
+
+    async def read_batch(self, *, block_ms: int) -> list:
+        return (
+            await self._redis.xreadgroup(
+                groupname=self.group,
+                consumername=self.consumer_name,
+                streams={self.stream: ">"},
+                count=settings.REDIS_BATCH_SIZE,
+                block=max(0, int(block_ms)),
+            )
+            or []
+        )
+
+    async def dispatch_messages(self, messages) -> None:
+        tasks: list[asyncio.Task[None]] = []
+        for _, entries in messages or []:
+            for message_id, fields in entries:
+                if self._shutdown.is_set():
+                    break
+                await self._semaphore.acquire()
+                tasks.append(asyncio.create_task(self._handle_message(message_id, fields)))
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def maybe_claim_stale(self) -> None:
+        interval = float(getattr(settings, "REDIS_CLAIM_INTERVAL_SECONDS", 30) or 30)
+        now = time.monotonic()
+        if now - self._last_claim_at < interval:
+            return
+        self._last_claim_at = now
+        if redis_under_capacity_pressure():
+            return
+        await self.claim_stale()
+
+    async def _backoff_capacity(self, error: BaseException) -> None:
+        self._capacity_failures += 1
+        mark_redis_capacity_pressure()
+        print(
+            "Redis stream consumer backing off:",
+            {
+                "stream": self.stream,
+                "group": self.group,
+                "error": str(error),
+                "failures": self._capacity_failures,
+            },
+            flush=True,
+        )
+        await recover_redis_capacity(self._redis)
+        await asyncio.sleep(capacity_backoff_seconds(self._capacity_failures))
+
+    async def _read_or_recover(self, *, block_ms: int):
+        try:
+            messages = await self.read_batch(block_ms=block_ms)
+            self._capacity_failures = 0
+            return messages
+        except ResponseError as error:
+            if "NOGROUP" in str(error):
+                await self.ensure_group()
+                return []
+            if is_redis_capacity_error(error):
+                await self._backoff_capacity(error)
+                return []
+            raise
+        except MaxConnectionsError as error:
+            await self._backoff_capacity(error)
+            return []
+        except (RedisTimeoutError, ConnectionError) as error:
+            if is_redis_capacity_error(error):
+                await self._backoff_capacity(error)
+                return []
+            print(
+                "Redis stream consumer read failed:",
+                {
+                    "stream": self.stream,
+                    "group": self.group,
+                    "error": str(error),
+                },
+                flush=True,
+            )
+            await asyncio.sleep(1)
+            return []
+
     async def run_forever(self) -> None:
         await self.ensure_group()
         print(
@@ -199,41 +299,9 @@ class RedisStreamConsumer:
             },
         )
         while not self._shutdown.is_set():
-            try:
-                await self.claim_stale()
-                messages = await self._redis.xreadgroup(
-                    groupname=self.group,
-                    consumername=self.consumer_name,
-                    streams={self.stream: ">"},
-                    count=settings.REDIS_BATCH_SIZE,
-                    block=settings.REDIS_BLOCK_MS,
-                )
-            except ResponseError as error:
-                if "NOGROUP" not in str(error):
-                    raise
-                await self.ensure_group()
-                continue
-            except (RedisTimeoutError, ConnectionError) as error:
-                print(
-                    "Redis stream consumer read failed:",
-                    {
-                        "stream": self.stream,
-                        "group": self.group,
-                        "error": str(error),
-                    },
-                    flush=True,
-                )
-                await asyncio.sleep(1)
-                continue
-            tasks: list[asyncio.Task[None]] = []
-            for _, entries in messages or []:
-                for message_id, fields in entries:
-                    if self._shutdown.is_set():
-                        break
-                    await self._semaphore.acquire()
-                    tasks.append(asyncio.create_task(self._handle_message(message_id, fields)))
-            if tasks:
-                await asyncio.gather(*tasks)
+            await self.maybe_claim_stale()
+            messages = await self._read_or_recover(block_ms=settings.REDIS_BLOCK_MS)
+            await self.dispatch_messages(messages)
 
     async def claim_stale(self) -> None:
         try:
@@ -245,7 +313,7 @@ class RedisStreamConsumer:
                 start_id="0-0",
                 count=settings.REDIS_BATCH_SIZE,
             )
-        except (ResponseError, RedisTimeoutError, ConnectionError):
+        except (ResponseError, RedisTimeoutError, ConnectionError, MaxConnectionsError):
             return
         entries = claimed[1] if len(claimed) > 1 else []
         for message_id, fields in entries:
@@ -354,6 +422,70 @@ class RedisStreamConsumer:
             # Dedicated Redis (e.g. cloud mindmap) has no shared retry relay — re-queue bounded.
             await self._xadd_bounded(self.stream, {"event": retry.model_dump_json()})
         await self._ack_and_cleanup(message_id)
+
+
+class MultiplexedStreamHub:
+    """One non-blocking poller for many streams that share a Redis pool."""
+
+    def __init__(self, consumers: Sequence[RedisStreamConsumer]):
+        if not consumers:
+            raise ValueError("MultiplexedStreamHub needs at least one consumer")
+        self.consumers = list(consumers)
+        self.stream = f"hub:{self.consumers[0].stream}"
+        self._shutdown = asyncio.Event()
+
+    async def ensure_group(self) -> None:
+        for consumer in self.consumers:
+            await consumer.ensure_group()
+            await asyncio.sleep(0.02)
+
+    async def stop(self) -> None:
+        self._shutdown.set()
+        for consumer in self.consumers:
+            await consumer.stop()
+
+    async def run_forever(self) -> None:
+        await self.ensure_group()
+        idle_ms = int(getattr(settings, "REDIS_POLL_IDLE_MS", 120) or 120)
+        print(
+            "Redis multiplexed stream hub started:",
+            {
+                "streams": [consumer.stream for consumer in self.consumers],
+                "idle_ms": idle_ms,
+            },
+            flush=True,
+        )
+        while not self._shutdown.is_set():
+            had_work = False
+            for consumer in self.consumers:
+                if self._shutdown.is_set():
+                    break
+                await consumer.maybe_claim_stale()
+                messages = await consumer._read_or_recover(block_ms=0)
+                if messages:
+                    had_work = True
+                    await consumer.dispatch_messages(messages)
+            if not had_work:
+                await asyncio.sleep(max(0.04, idle_ms / 1000))
+
+
+def group_stream_runners(items: Sequence[Any]) -> list[Any]:
+    """Collapse RedisStreamConsumers that share a pool into one hub each."""
+    buckets: dict[int, list[RedisStreamConsumer]] = {}
+    others: list[Any] = []
+    for item in items:
+        if isinstance(item, RedisStreamConsumer):
+            buckets.setdefault(item.pool_identity(), []).append(item)
+        else:
+            others.append(item)
+    runners: list[Any] = []
+    for group in buckets.values():
+        if len(group) == 1:
+            runners.append(group[0])
+        else:
+            runners.append(MultiplexedStreamHub(group))
+    runners.extend(others)
+    return runners
 
 
 def retry_delay(attempt: int) -> float:

@@ -217,7 +217,6 @@ async def start_vector_consumer():
             job_id = await pop_completed_speech_job()
 
             if not job_id:
-                await asyncio.sleep(1)
                 continue
 
             await process_completed_speech_job(job_id)

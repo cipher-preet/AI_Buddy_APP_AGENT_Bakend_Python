@@ -3,10 +3,10 @@ from __future__ import annotations
 import redis.asyncio as redis
 
 from apps.api_gateway.config.setting import settings
+from services.queue.shared_redis import get_shared_redis_client, normalize_redis_url, redis_pool_limit
 from services.reminders.redis_client import (
     describe_redis_url,
     format_redis_target,
-    get_reminder_redis_client,
     get_reminder_redis_url,
     redact_redis_secrets,
 )
@@ -30,59 +30,41 @@ def get_mindmap_redis_url() -> str:
     )
 
 
-def _urls_match(left: str, right: str) -> bool:
-    return left.strip().rstrip("/") == right.strip().rstrip("/")
-
-
-_mindmap_redis_client: redis.Redis | None = None
-_mindmap_redis_owns_client = False
-
-
 def get_mindmap_redis_client() -> redis.Redis:
-    """Small pooled client for Redis Cloud Essentials (shared with reminders when URLs match)."""
-    global _mindmap_redis_client, _mindmap_redis_owns_client
-    if _mindmap_redis_client is not None:
-        return _mindmap_redis_client
-
-    url = get_mindmap_redis_url()
-    # Same cloud DB as reminders → reuse one pool so we do not burn Essentials connection quota.
-    try:
-        reminder_url = get_reminder_redis_url()
-    except Exception:
-        reminder_url = ""
-    if reminder_url and _urls_match(url, reminder_url):
-        _mindmap_redis_client = get_reminder_redis_client()
-        _mindmap_redis_owns_client = False
-        return _mindmap_redis_client
-
-    max_connections = max(2, int(settings.MINDMAP_REDIS_MAX_CONNECTIONS))
-    _mindmap_redis_client = redis.from_url(
-        url,
-        decode_responses=True,
-        max_connections=max_connections,
-        socket_connect_timeout=10,
-        socket_timeout=30,
-        socket_keepalive=True,
-        health_check_interval=30,
-        retry_on_timeout=True,
+    """Shared pool with conversation/reminder when the URL matches."""
+    return get_shared_redis_client(
+        normalize_redis_url(get_mindmap_redis_url()),
+        max_connections=settings.MINDMAP_REDIS_MAX_CONNECTIONS,
+        label="mindmap",
     )
-    _mindmap_redis_owns_client = True
-    return _mindmap_redis_client
 
 
 async def test_mindmap_redis_connection() -> bool:
+    from services.queue.shared_redis import normalize_redis_url, prepare_shared_redis
+
     url = get_mindmap_redis_url()
     target = describe_redis_url(url)
     client = get_mindmap_redis_client()
+    # Same cloud DB as conversation → do not open a second pool or extra ping storm.
+    same_as_conversation = normalize_redis_url(url) == normalize_redis_url(settings.REDIS_URL)
     try:
-        pong = await client.ping()
+        if same_as_conversation:
+            print(
+                "Mindmap Redis connected:",
+                format_redis_target(target),
+                f"max_connections={redis_pool_limit(url, settings.MINDMAP_REDIS_MAX_CONNECTIONS)}",
+                "shared_with=conversation",
+                flush=True,
+            )
+            return True
+        await prepare_shared_redis(client)
         print(
             "Mindmap Redis connected:",
             format_redis_target(target),
-            f"max_connections={settings.MINDMAP_REDIS_MAX_CONNECTIONS}",
+            f"max_connections={redis_pool_limit(url, settings.MINDMAP_REDIS_MAX_CONNECTIONS)}",
             flush=True,
         )
-        return bool(pong)
+        return True
     except Exception as error:
         print(
             f"Mindmap Redis connection failed: {redact_redis_secrets(str(error))}",
@@ -92,8 +74,5 @@ async def test_mindmap_redis_connection() -> bool:
 
 
 async def close_mindmap_redis_client() -> None:
-    global _mindmap_redis_client, _mindmap_redis_owns_client
-    if _mindmap_redis_client is not None and _mindmap_redis_owns_client:
-        await _mindmap_redis_client.aclose()
-    _mindmap_redis_client = None
-    _mindmap_redis_owns_client = False
+    # Shared registry owns the client. Closing happens with process shutdown.
+    return

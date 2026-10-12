@@ -16,7 +16,11 @@ class Settings(BaseSettings):
     # Cloud Redis for mindmap/document jobs. Falls back to REMINDER_REDIS_URL when empty.
     MINDMAP_REDIS_URL: str = ""
     # Redis Cloud Essentials connection quota is small — share one tight pool.
-    MINDMAP_REDIS_MAX_CONNECTIONS: int = Field(default=6, ge=2, le=32)
+    # Stream consumers multiplex onto one non-blocking reader per Redis URL.
+    MINDMAP_REDIS_MAX_CONNECTIONS: int = Field(default=8, ge=4, le=24)
+    # Dedicated Redis Cloud DB for Achieve Goal only (never share conversation Redis).
+    GOAL_REDIS_URL: str = ""
+    GOAL_REDIS_MAX_CONNECTIONS: int = Field(default=4, ge=2, le=16)
     REDIS_MAX_RETRIES: int | None = None
     REDIS_EVENT_RETENTION: int = Field(default=86400, ge=60)
     MONGODB_URI: str = ""
@@ -161,6 +165,33 @@ class Settings(BaseSettings):
     REDIS_MEETING_MERGE_GROUP: str = "meeting-merge-workers"
     REDIS_MINDMAP_GROUP: str = "mindmap-workers"
     REDIS_DOCUMENT_GROUP: str = "document-workers"
+    REDIS_GOAL_INTERACTIVE_STREAM: str = "buddy:goals:interactive"
+    REDIS_GOAL_JOBS_STREAM: str = "buddy:goals:jobs"
+    REDIS_GOAL_INTERACTIVE_GROUP: str = "goal-interactive-workers"
+    REDIS_GOAL_JOBS_GROUP: str = "goal-workers"
+    REDIS_GOAL_STREAM_MAXLEN: int = Field(default=200, ge=20, le=100000)
+    GOAL_CLARIFY_MAX_CONCURRENCY: int = Field(default=3, ge=1, le=8)
+    GOAL_JOB_MAX_CONCURRENCY: int = Field(default=1, ge=1, le=4)
+    GOAL_MAX_CLARIFY_TURNS: int = Field(default=8, ge=1, le=12)
+    GOAL_CLARIFY_MAX_TOKENS: int = Field(default=1100, ge=200, le=4000)
+
+    PARALLEL_API_KEY: SecretStr | str = ""
+    PARALLEL_BASE_URL: str = "https://api.parallel.ai"
+    PARALLEL_SEARCH_MODE: str = "fast"
+    PARALLEL_SEARCH_TIMEOUT_SECONDS: float = Field(default=20, ge=3, le=120)
+    PARALLEL_EXTRACT_TIMEOUT_SECONDS: float = Field(default=30, ge=5, le=120)
+    PARALLEL_MAX_RETRIES: int = Field(default=2, ge=0, le=6)
+    PARALLEL_MAX_CONCURRENCY: int = Field(default=2, ge=1, le=8)
+    PARALLEL_MAX_RESULTS: int = Field(default=8, ge=1, le=20)
+    PARALLEL_MAX_CHARS_TOTAL: int = Field(default=12000, ge=1000, le=80000)
+    PARALLEL_EXTRACT_ENABLED: bool = False
+    GOAL_SEARCH_CACHE_TTL_SECONDS: int = Field(default=86400, ge=60, le=604800)
+    GOAL_SEARCH_BUDGET_PER_GOAL: int = Field(default=4, ge=0, le=20)
+    GOAL_SEARCH_BUDGET_PER_USER: int = Field(default=20, ge=0, le=200)
+    GOAL_RESEARCH_MAX_ROUNDS: int = Field(default=1, ge=0, le=3)
+    GOAL_KNOWLEDGE_COLLECTION: str = "goal_domain_knowledge"
+    GOAL_KNOWLEDGE_TTL_STABLE_DAYS: int = Field(default=30, ge=1, le=365)
+    GOAL_KNOWLEDGE_TTL_VOLATILE_DAYS: int = Field(default=7, ge=1, le=90)
 
     # Mindmap: official NVIDIA Nemotron 3 Super first, then Krutrim fallbacks.
     MINDMAP_MODELS: str = (
@@ -236,8 +267,10 @@ class Settings(BaseSettings):
     DAILY_BRIEFING_FORCE_DAILY_LIMIT: int = Field(default=3, ge=1, le=50)
 
     REDIS_CLAIM_IDLE_MS: int = 60000
-    REDIS_BLOCK_MS: int = 5000
+    REDIS_BLOCK_MS: int = 1000
     REDIS_BATCH_SIZE: int = 10
+    REDIS_POLL_IDLE_MS: int = Field(default=120, ge=40, le=2000)
+    REDIS_CLAIM_INTERVAL_SECONDS: int = Field(default=30, ge=5, le=300)
     ENABLE_REMINDER_WORKER: bool = True
     REMINDER_SCHEDULE_KEY: str = "buddy:reminder:schedule"
     REMINDER_PROCESSING_KEY: str = "buddy:reminder:processing"

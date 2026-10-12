@@ -291,6 +291,11 @@ async def mongo_health() -> dict[str, Any]:
 async def emit_redis_queue_health() -> None:
     from apps.api_gateway.config.setting import settings
     from services.queue.redis_queue import redis_client
+    from services.queue.shared_redis import redis_under_capacity_pressure
+
+    if redis_under_capacity_pressure():
+        diag_log("redis_queue_health", skipped="capacity_pressure")
+        return
 
     streams = (
         settings.REDIS_DAILY_BRIEFING_STREAM,
@@ -315,31 +320,76 @@ async def emit_redis_queue_health() -> None:
                 error_type=type(error).__name__,
             )
 
-    # Mindmap jobs use cloud Redis (MINDMAP_REDIS_URL → REMINDER_REDIS_URL).
     try:
-        from services.mindmap.redis_client import get_mindmap_redis_client
+        from services.mindmap.redis_client import get_mindmap_redis_client, get_mindmap_redis_url
+        from services.queue.shared_redis import normalize_redis_url
 
         mindmap_client = get_mindmap_redis_client()
-        stream = settings.REDIS_MINDMAP_STREAM
-        length = int(await mindmap_client.xlen(stream))
-        pending = None
-        try:
-            groups = await mindmap_client.xinfo_groups(stream)
-            pending = sum(int(group.get("pending") or 0) for group in groups or [])
-        except Exception:
-            pending = None
-        diag_log(
-            "redis_queue_health",
-            stream=stream,
-            redis="mindmap",
-            length=length,
-            pending=pending,
-        )
+        same = normalize_redis_url(get_mindmap_redis_url()) == normalize_redis_url(settings.REDIS_URL)
+        for stream in (settings.REDIS_MINDMAP_STREAM, settings.REDIS_DOCUMENT_STREAM):
+            try:
+                length = int(await mindmap_client.xlen(stream))
+                pending = None
+                try:
+                    groups = await mindmap_client.xinfo_groups(stream)
+                    pending = sum(int(group.get("pending") or 0) for group in groups or [])
+                except Exception:
+                    pending = None
+                diag_log(
+                    "redis_queue_health",
+                    stream=stream,
+                    redis="shared" if same else "mindmap",
+                    length=length,
+                    pending=pending,
+                )
+            except Exception as error:
+                diag_log(
+                    "redis_queue_health",
+                    stream=stream,
+                    redis="mindmap",
+                    error_type=type(error).__name__,
+                )
     except Exception as error:
         diag_log(
             "redis_queue_health",
             stream=settings.REDIS_MINDMAP_STREAM,
             redis="mindmap",
+            error_type=type(error).__name__,
+        )
+
+    # Achieve Goal uses a dedicated Redis Cloud URL.
+    try:
+        from services.goals.redis_client import get_goal_redis_client
+
+        goal_client = get_goal_redis_client()
+        for stream in (settings.REDIS_GOAL_INTERACTIVE_STREAM, settings.REDIS_GOAL_JOBS_STREAM):
+            try:
+                length = int(await goal_client.xlen(stream))
+                pending = None
+                try:
+                    groups = await goal_client.xinfo_groups(stream)
+                    pending = sum(int(group.get("pending") or 0) for group in groups or [])
+                except Exception:
+                    pending = None
+                diag_log(
+                    "redis_queue_health",
+                    stream=stream,
+                    redis="goals",
+                    length=length,
+                    pending=pending,
+                )
+            except Exception as error:
+                diag_log(
+                    "redis_queue_health",
+                    stream=stream,
+                    redis="goals",
+                    error_type=type(error).__name__,
+                )
+    except Exception as error:
+        diag_log(
+            "redis_queue_health",
+            stream=settings.REDIS_GOAL_INTERACTIVE_STREAM,
+            redis="goals",
             error_type=type(error).__name__,
         )
 
@@ -372,7 +422,7 @@ async def run_event_loop_lag_monitor(interval_seconds: float = 8.0, threshold_ms
             )
 
 
-async def run_redis_queue_health(interval_seconds: float = 60.0) -> None:
+async def run_redis_queue_health(interval_seconds: float = 120.0) -> None:
     while True:
         try:
             await emit_redis_queue_health()

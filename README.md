@@ -126,3 +126,31 @@ python -m pytest tests
 ```
 
 Tests use mocks for paid services. Do not use real Sarvam, OpenAI, S3, MongoDB, or Qdrant credentials in tests.
+
+## Goal consultant research
+
+Goal workers can call Parallel Search (`POST https://api.parallel.ai/v1/search`) while building a plan.
+
+```text
+PARALLEL_API_KEY=...
+PARALLEL_SEARCH_MODE=fast
+PARALLEL_MAX_RESULTS=8
+GOAL_SEARCH_BUDGET_PER_GOAL=4
+GOAL_SEARCH_CACHE_TTL_SECONDS=86400
+PARALLEL_EXTRACT_ENABLED=false
+```
+
+Do not put the API key in client apps, logs, or generated plans. Default unit tests mock Parallel and do not make paid calls.
+
+Live smoke (opt-in):
+
+```powershell
+$env:PARALLEL_API_KEY="..."
+python -m pytest tests/test_parallel_search_live.py -m integration
+```
+
+Full evaluation (fixture rubrics, not a production-ready stamp):
+
+```powershell
+python -m scripts.eval.goal_consultant_eval
+```

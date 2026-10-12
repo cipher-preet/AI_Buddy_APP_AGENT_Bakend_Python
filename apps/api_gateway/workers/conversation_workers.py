@@ -566,7 +566,17 @@ async def run_retry_relay() -> None:
         except (RedisTimeoutError, ConnectionError, RedisError) as error:
             window.maybe_emit()
             print(f"Retry relay Redis error: {error}", flush=True)
-            await asyncio.sleep(2)
+            from services.queue.shared_redis import (
+                capacity_backoff_seconds,
+                is_redis_capacity_error,
+                recover_redis_capacity,
+            )
+
+            if is_redis_capacity_error(error):
+                await recover_redis_capacity()
+                await asyncio.sleep(capacity_backoff_seconds(3))
+            else:
+                await asyncio.sleep(2)
             continue
         except Exception as error:
             window.maybe_emit()

@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 import redis.asyncio as redis
 
 from apps.api_gateway.config.setting import settings
+from services.queue.shared_redis import get_shared_redis_client, normalize_redis_url
 
 
 class ReminderRedisConfigError(RuntimeError):
@@ -40,38 +41,34 @@ def get_reminder_redis_url() -> str:
     return url
 
 
-_reminder_redis_client: redis.Redis | None = None
-
-
 def get_reminder_redis_client() -> redis.Redis:
-    global _reminder_redis_client
-    if _reminder_redis_client is None:
-        # Essentials plans have a low connection cap — keep the pool tiny.
-        max_connections = max(2, int(getattr(settings, "MINDMAP_REDIS_MAX_CONNECTIONS", 6) or 6))
-        _reminder_redis_client = redis.from_url(
-            get_reminder_redis_url(),
-            decode_responses=True,
-            max_connections=max_connections,
-            socket_connect_timeout=10,
-            socket_timeout=30,
-            socket_keepalive=True,
-            health_check_interval=30,
-            retry_on_timeout=True,
-        )
-    return _reminder_redis_client
+    return get_shared_redis_client(
+        normalize_redis_url(get_reminder_redis_url()),
+        max_connections=settings.MINDMAP_REDIS_MAX_CONNECTIONS,
+        label="reminder",
+    )
 
 
 async def test_reminder_redis_connection() -> bool:
+    from services.queue.shared_redis import normalize_redis_url, prepare_shared_redis
+
     url = get_reminder_redis_url()
     target = describe_redis_url(url)
     client = get_reminder_redis_client()
     try:
-        pong = await client.ping()
+        # Same shared pool as conversation — do not open another client or spam ping.
+        if normalize_redis_url(url) == normalize_redis_url(settings.REDIS_URL):
+            print(
+                f"Reminder Redis connected: host={target['host']} port={target['port']} shared_with=conversation",
+                flush=True,
+            )
+            return True
+        await prepare_shared_redis(client)
         print(
             f"Reminder Redis connected: host={target['host']} port={target['port']}",
             flush=True,
         )
-        return bool(pong)
+        return True
     except Exception as error:
         print(
             f"Reminder Redis connection failed: {redact_redis_secrets(str(error))}",
