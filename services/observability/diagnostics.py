@@ -306,13 +306,7 @@ async def emit_redis_queue_health() -> None:
     for stream in streams:
         try:
             length = int(await redis_client.xlen(stream))
-            pending = None
-            try:
-                groups = await redis_client.xinfo_groups(stream)
-                pending = sum(int(group.get("pending") or 0) for group in groups or [])
-            except Exception:
-                pending = None
-            diag_log("redis_queue_health", stream=stream, length=length, pending=pending)
+            diag_log("redis_queue_health", stream=stream, length=length)
         except Exception as error:
             diag_log(
                 "redis_queue_health",
@@ -329,18 +323,11 @@ async def emit_redis_queue_health() -> None:
         for stream in (settings.REDIS_MINDMAP_STREAM, settings.REDIS_DOCUMENT_STREAM):
             try:
                 length = int(await mindmap_client.xlen(stream))
-                pending = None
-                try:
-                    groups = await mindmap_client.xinfo_groups(stream)
-                    pending = sum(int(group.get("pending") or 0) for group in groups or [])
-                except Exception:
-                    pending = None
                 diag_log(
                     "redis_queue_health",
                     stream=stream,
                     redis="shared" if same else "mindmap",
                     length=length,
-                    pending=pending,
                 )
             except Exception as error:
                 diag_log(
@@ -365,18 +352,11 @@ async def emit_redis_queue_health() -> None:
         for stream in (settings.REDIS_GOAL_INTERACTIVE_STREAM, settings.REDIS_GOAL_JOBS_STREAM):
             try:
                 length = int(await goal_client.xlen(stream))
-                pending = None
-                try:
-                    groups = await goal_client.xinfo_groups(stream)
-                    pending = sum(int(group.get("pending") or 0) for group in groups or [])
-                except Exception:
-                    pending = None
                 diag_log(
                     "redis_queue_health",
                     stream=stream,
                     redis="goals",
                     length=length,
-                    pending=pending,
                 )
             except Exception as error:
                 diag_log(
@@ -422,7 +402,7 @@ async def run_event_loop_lag_monitor(interval_seconds: float = 8.0, threshold_ms
             )
 
 
-async def run_redis_queue_health(interval_seconds: float = 120.0) -> None:
+async def run_redis_queue_health(interval_seconds: float = 300.0) -> None:
     while True:
         try:
             await emit_redis_queue_health()

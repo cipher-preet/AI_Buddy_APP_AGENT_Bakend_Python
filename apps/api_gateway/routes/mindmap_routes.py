@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from services.db.mongo import get_database
 from services.mindmap.enqueue import enqueue_mindmap_generation
 from services.mindmap.store import MindmapStore, public_mindmap_doc, public_mindmap_summary
+from services.plans.plan_limits import PlanLimitExceeded
 
 router = APIRouter()
 
@@ -23,6 +24,17 @@ async def generate_mindmap(body: GenerateMindmapBody):
             user_id=body.userId.strip(),
             space_id=body.spaceId.strip(),
         )
+    except PlanLimitExceeded as error:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": str(error),
+                "resource": error.resource,
+                "limit": error.limit,
+                "used": error.used,
+                "planCode": error.plan_code,
+            },
+        ) from error
     except PermissionError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except ValueError as error:

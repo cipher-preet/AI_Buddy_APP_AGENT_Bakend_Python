@@ -9,6 +9,7 @@ from services.document_it.store import DocumentStore, public_document_doc
 from services.document_it.templates import load_template_spec
 from services.llm.router import get_llm_router
 from services.mindmap.redis_client import MindmapRedisConfigError, get_mindmap_redis_client
+from services.plans.plan_limits import assert_plan_count_allowed
 from services.queue.streams import EventEnvelope, RedisStreamProducer
 from services.schedule_extraction.llm import parse_model_route
 
@@ -64,6 +65,8 @@ async def enqueue_document_generation(
         raise PermissionError(
             "Document generation is unavailable: configure NVIDIA_API_KEY or KRUTRIM_API_KEY (or DOCUMENT_MODELS)."
         )
+
+    await assert_plan_count_allowed(database, user_id=user_id, resource="documents")
 
     job_id = str(uuid4())
     reserved = await store.reserve(

@@ -3,22 +3,27 @@ from __future__ import annotations
 import asyncio
 
 from redis.exceptions import ConnectionError, MaxConnectionsError, ResponseError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from services.queue.capacity import (
     estimate_goal_simultaneous_users,
     estimate_worker_redis_clients,
 )
+from services.queue.maintenance import should_reap_pending
 from services.queue.shared_redis import (
     capacity_backoff_seconds,
     is_redis_capacity_error,
+    is_windows_socket_abort,
     redis_pool_limit,
     supervisor_restart_delay,
 )
 from services.queue.streams import (
     EventEnvelope,
+    IdlePoll,
     MultiplexedStreamHub,
     RedisStreamConsumer,
     group_stream_runners,
+    xreadgroup_block,
 )
 
 
@@ -60,6 +65,16 @@ class _FakeRedis:
 
     async def xautoclaim(self, *args, **kwargs):
         return ["0-0", []]
+
+
+def test_windows_socket_abort_is_detected():
+    error = ConnectionAbortedError(10053, "An established connection was aborted by the software in your host machine")
+    error.winerror = 10053
+    assert is_windows_socket_abort(error) is True
+    reset = ConnectionResetError(10054, "An existing connection was forcibly closed by the remote host")
+    reset.winerror = 10054
+    assert is_windows_socket_abort(reset) is True
+    assert is_windows_socket_abort(RuntimeError("boom")) is False
 
 
 def test_capacity_error_classifier():
@@ -199,3 +214,96 @@ def test_read_or_recover_does_not_raise_max_clients():
 
     messages = asyncio.run(run())
     assert messages == []
+
+
+def test_timeout_read_reconnects_without_one_second_sleep(monkeypatch):
+    redis = _FakeRedis()
+    sleeps: list[float] = []
+    recycled = {"n": 0}
+
+    async def boom(**kwargs):
+        raise RedisTimeoutError("Timeout reading from redis.example:18535")
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    async def fake_recycle(_client=None):
+        recycled["n"] += 1
+
+    redis.xreadgroup = boom  # type: ignore[method-assign]
+    consumer = RedisStreamConsumer("s", "g", "c", lambda event: None, redis=redis)
+    monkeypatch.setattr("services.queue.streams.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("services.queue.streams.recycle_broken_redis_pool", fake_recycle)
+    monkeypatch.setattr("services.queue.streams.should_log_redis_timeout", lambda: False)
+
+    messages = asyncio.run(consumer._read_or_recover(block_ms=0))
+    assert messages == []
+    assert recycled["n"] == 0
+    assert sleeps == [0.5]
+
+
+def test_goal_worker_reads_jobs_after_interactive_timeout():
+    from apps.api_gateway.workers.goal_worker import GoalStreamsRunner
+
+    class Redis(_FakeRedis):
+        async def xreadgroup(self, groupname, consumername, streams, count=10, block=0):
+            stream = next(iter(streams))
+            if "interactive" in stream:
+                raise RedisTimeoutError("Timeout reading from goals")
+            return await super().xreadgroup(groupname, consumername, streams, count=count, block=block)
+
+    async def run():
+        runner = GoalStreamsRunner.__new__(GoalStreamsRunner)
+        runner.redis = Redis()
+        runner.redis.pending["buddy:goals:jobs"] = [("1-0", {"event": "{}"})]
+        runner.consumer_name = "goal-test"
+        runner.streams = {
+            "buddy:goals:interactive": "goal-interactive",
+            "buddy:goals:jobs": "goal-jobs",
+        }
+        runner._capacity_failures = 0
+        runner._timeout_failures = 0
+        interactive = await runner._read_stream("buddy:goals:interactive", "goal-interactive", 2)
+        jobs = await runner._read_stream("buddy:goals:jobs", "goal-jobs", 1)
+        return interactive, jobs
+
+    interactive, jobs = asyncio.run(run())
+    assert interactive == []
+    assert jobs and jobs[0][0] == "buddy:goals:jobs"
+
+
+def test_idle_poll_backs_off_when_queues_are_empty():
+    idle = IdlePoll(min_seconds=0.4, max_seconds=2.5)
+    first = idle.miss()
+    second = idle.miss()
+    idle.hit()
+    assert first > 0.4
+    assert second > first
+    assert idle.seconds == 0.4
+
+
+def test_redis_block_zero_is_non_blocking():
+    assert xreadgroup_block(0) is None
+    assert xreadgroup_block(-1) is None
+    assert xreadgroup_block(None) is None
+    assert xreadgroup_block(400) == 400
+
+
+def test_read_batch_omits_forever_block():
+    redis = _FakeRedis()
+    seen: list[int | None] = []
+
+    async def capture(**kwargs):
+        seen.append(kwargs.get("block"))
+        return []
+
+    redis.xreadgroup = capture  # type: ignore[method-assign]
+    consumer = RedisStreamConsumer("s", "g", "c", lambda event: None, redis=redis)
+    asyncio.run(consumer.read_batch(block_ms=0))
+    assert seen == [None]
+
+
+def test_stuck_pending_jobs_are_reaped():
+    assert should_reap_pending(idle_ms=15 * 60 * 1000, deliveries=1) is True
+    assert should_reap_pending(idle_ms=1000, deliveries=8) is True
+    assert should_reap_pending(idle_ms=1000, deliveries=1) is False

@@ -16,6 +16,7 @@ _clients: dict[str, redis.Redis] = {}
 _client_names: dict[str, str] = {}
 _cleanup_lock = asyncio.Lock()
 _capacity_until = 0.0
+_last_timeout_log = 0.0
 _CAPACITY_MARKERS = (
     "max number of clients reached",
     "maxclients",
@@ -98,10 +99,42 @@ def _process_client_name(label: str) -> str:
     return f"buddy-orch-{label}-{os.getpid()}"
 
 
+_WINDOWS_ABORT_CODES = {10053, 10054, 10038, 10057}
+
+
+def is_windows_socket_abort(error: BaseException | None) -> bool:
+    """Idle Redis sockets aborted by Windows (Proactor shutdown after the peer already closed)."""
+    if error is None:
+        return False
+    winerror = getattr(error, "winerror", None)
+    if winerror in _WINDOWS_ABORT_CODES:
+        return True
+    text = str(error).lower()
+    return "winerror 10053" in text or "winerror 10054" in text or "forcibly closed" in text or "aborted by the software" in text
+
+
+def install_windows_socket_exception_filter(loop: asyncio.AbstractEventLoop | None = None) -> None:
+    """Stop WinError 10053/10054 from dumping a traceback while the worker keeps running."""
+    running = loop or asyncio.get_running_loop()
+    previous = running.get_exception_handler()
+
+    def _handler(current, context):
+        error = context.get("exception")
+        message = str(context.get("message") or "")
+        if is_windows_socket_abort(error) or "call_connection_lost" in message:
+            return
+        if previous is not None:
+            previous(current, context)
+            return
+        current.default_exception_handler(context)
+
+    running.set_exception_handler(_handler)
+
+
 class WaitingConnectionPool(ConnectionPool):
     """Wait for a free pooled socket instead of crashing every stream worker."""
 
-    def __init__(self, *args, wait_timeout_seconds: float = 45.0, **kwargs):
+    def __init__(self, *args, wait_timeout_seconds: float = 20.0, **kwargs):
         super().__init__(*args, **kwargs)
         self._wait_timeout_seconds = wait_timeout_seconds
 
@@ -149,10 +182,10 @@ def get_shared_redis_client(
         decode_responses=True,
         max_connections=limit,
         socket_connect_timeout=8,
-        socket_timeout=35,
+        socket_timeout=25,
         socket_keepalive=True,
-        health_check_interval=120,
-        retry_on_timeout=True,
+        health_check_interval=30,
+        retry_on_timeout=False,
         client_name=client_name,
     )
     client = redis.Redis(connection_pool=pool)
@@ -228,6 +261,37 @@ async def disconnect_idle_pool_connections() -> None:
                 pass
         except Exception:
             pass
+
+
+async def recycle_broken_redis_pool(client: redis.Redis | None = None) -> None:
+    """Drop dead pooled sockets after a cloud timeout so the next command reconnects."""
+    target = client
+    if target is None:
+        values = list(_clients.values())
+        target = values[0] if values else None
+    if target is None:
+        return
+    pool = getattr(target, "connection_pool", None)
+    if pool is None:
+        return
+    try:
+        await pool.disconnect(inuse_connections=False)
+    except TypeError:
+        try:
+            await pool.disconnect()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def should_log_redis_timeout() -> bool:
+    global _last_timeout_log
+    now = time.monotonic()
+    if now - _last_timeout_log < 60:
+        return False
+    _last_timeout_log = now
+    return True
 
 
 async def recover_redis_capacity(client: redis.Redis | None = None) -> int:

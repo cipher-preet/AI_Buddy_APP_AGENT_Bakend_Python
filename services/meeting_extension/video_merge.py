@@ -8,8 +8,17 @@ from uuid import uuid4
 from bson import ObjectId
 
 from apps.api_gateway.config.setting import settings
-from services.meeting_extension.ffmpeg_audio import MeetingAudioExtractionError, concat_webm_chunks
-from services.meeting_extension.s3_keys import meeting_chunk_object_key, meeting_final_object_key, validate_meeting_object_key
+from services.meeting_extension.ffmpeg_audio import (
+    MeetingAudioExtractionError,
+    concat_webm_chunks,
+    extract_video_thumbnail,
+)
+from services.meeting_extension.s3_keys import (
+    meeting_chunk_object_key,
+    meeting_final_object_key,
+    meeting_thumbnail_object_key,
+    validate_meeting_object_key,
+)
 from services.observability.diagnostics import diag_log
 from services.queue.streams import EventEnvelope, NonRetryableQueueError, RedisStreamProducer
 from services.storage.s3_audio_storage import get_s3_audio_storage, temp_audio_root
@@ -176,20 +185,28 @@ async def _merge_once(db, meeting_session_id: str, user_id: str, expected: int, 
                 "Merged recording is not a recognized MP4/WebM container",
                 corrupt=True,
             )
+        thumbnail_key = await _upload_meeting_thumbnail(
+            storage=storage,
+            user_id=user_id,
+            meeting_session_id=meeting_session_id,
+            merged_path=output,
+            chunk_paths=chunk_paths,
+        )
         now = datetime.now(timezone.utc)
+        update_fields: dict = {
+            "videoMergeStatus": "COMPLETED",
+            "finalRecordingS3Key": final_key,
+            "updatedAt": now,
+            "mergeMissingSequences": missing_sequences,
+            "mergePresentChunkCount": len(chunk_paths),
+            "mergeExpectedSequence": expected,
+            "videoMergeAttempts": 0,
+        }
+        if thumbnail_key:
+            update_fields["thumbnailS3Key"] = thumbnail_key
         await db.meeting_sessions.update_one(
             {"_id": _oid(meeting_session_id)},
-            {
-                "$set": {
-                    "videoMergeStatus": "COMPLETED",
-                    "finalRecordingS3Key": final_key,
-                    "updatedAt": now,
-                    "mergeMissingSequences": missing_sequences,
-                    "mergePresentChunkCount": len(chunk_paths),
-                    "mergeExpectedSequence": expected,
-                    "videoMergeAttempts": 0,
-                }
-            },
+            {"$set": update_fields},
         )
         diag_log("meeting_video_merge_completed", meetingSessionId=meeting_session_id, userId=user_id)
     except Exception as error:
@@ -314,6 +331,64 @@ async def _download_merge_chunk(storage, user_id: str, meeting_session_id: str, 
         return
     except Exception:
         await storage.download_file(bucket=storage.bucket, object_key=muxed_key, destination=destination)
+
+
+async def _upload_meeting_thumbnail(
+    *,
+    storage,
+    user_id: str,
+    meeting_session_id: str,
+    merged_path: Path,
+    chunk_paths: list[Path],
+) -> str | None:
+    """Pick one frame for the meeting card; never raise into the merge path."""
+    try:
+        thumb_path = merged_path.with_name("thumbnail.jpg")
+        # Prefer the merged recording; fall back to a mid/first present chunk.
+        sources: list[tuple[Path, float]] = [(merged_path, 1.0)]
+        if chunk_paths:
+            mid = chunk_paths[len(chunk_paths) // 2]
+            if mid != merged_path:
+                sources.append((mid, 0.5))
+            if chunk_paths[0] not in {merged_path, mid}:
+                sources.append((chunk_paths[0], 0.5))
+
+        created: Path | None = None
+        for source, seek in sources:
+            created = await extract_video_thumbnail(source, thumb_path, seek_seconds=seek)
+            if created is not None:
+                break
+        if created is None:
+            diag_log(
+                "meeting_thumbnail_skipped",
+                meetingSessionId=meeting_session_id,
+                userId=user_id,
+                reason="extract_failed",
+            )
+            return None
+
+        thumbnail_key = meeting_thumbnail_object_key(user_id, meeting_session_id)
+        validate_meeting_object_key(
+            object_key=thumbnail_key,
+            user_id=user_id,
+            meeting_session_id=meeting_session_id,
+        )
+        await storage.upload_file(created, thumbnail_key, content_type="image/jpeg")
+        diag_log(
+            "meeting_thumbnail_uploaded",
+            meetingSessionId=meeting_session_id,
+            userId=user_id,
+            thumbnailS3Key=thumbnail_key,
+        )
+        return thumbnail_key
+    except Exception as error:
+        diag_log(
+            "meeting_thumbnail_failed",
+            meetingSessionId=meeting_session_id,
+            userId=user_id,
+            errorCode=type(error).__name__,
+        )
+        return None
 
 
 def _oid(value: str):

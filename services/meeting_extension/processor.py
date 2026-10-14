@@ -15,11 +15,16 @@ from services.db.mongo import get_database
 from services.meeting_extension.ffmpeg_audio import (
     MeetingAudioExtractionError,
     extract_audio_for_stt,
+    extract_video_thumbnail,
     extract_webm_init,
     has_webm_header,
     write_standalone_webm,
 )
-from services.meeting_extension.s3_keys import meeting_chunk_object_key, validate_meeting_object_key
+from services.meeting_extension.s3_keys import (
+    meeting_chunk_object_key,
+    meeting_thumbnail_object_key,
+    validate_meeting_object_key,
+)
 from services.meeting_extension.segments import extract_stt_segments
 from services.observability.diagnostics import diag_log
 from services.queue.streams import EventEnvelope, NonRetryableQueueError, RedisStreamProducer
@@ -111,6 +116,14 @@ async def process_meeting_video_chunk(event: EventEnvelope) -> None:
                 chunkSequence=sequence,
                 userId=user_id,
             )
+            # Early card preview from the first video chunk; merge may replace later.
+            if sequence == 1:
+                await _maybe_store_early_thumbnail(
+                    user_id=user_id,
+                    meeting_session_id=meeting_session_id,
+                    video_path=video_path,
+                    job_dir=job_dir,
+                )
             content_type = "audio/wav" if audio_path.suffix == ".wav" else "audio/webm"
         result = await transcribe_from_path_with_fallback(
             file_path=str(audio_path),
@@ -300,3 +313,59 @@ async def _ensure_standalone_webm(
         initBytes=len(init_bytes),
     )
     return repaired
+
+
+async def _maybe_store_early_thumbnail(
+    *,
+    user_id: str,
+    meeting_session_id: str,
+    video_path: Path,
+    job_dir: Path,
+) -> None:
+    """Create a card thumbnail from the first video chunk if one is not stored yet."""
+    try:
+        db = get_database()
+        existing = await db.meeting_sessions.find_one(
+            {"_id": _object_id(meeting_session_id)},
+            {"thumbnailS3Key": 1},
+        )
+        if existing and existing.get("thumbnailS3Key"):
+            return
+
+        thumb_path = await extract_video_thumbnail(
+            video_path,
+            job_dir / "thumbnail.jpg",
+            seek_seconds=0.5,
+        )
+        if thumb_path is None:
+            return
+
+        thumbnail_key = meeting_thumbnail_object_key(user_id, meeting_session_id)
+        validate_meeting_object_key(
+            object_key=thumbnail_key,
+            user_id=user_id,
+            meeting_session_id=meeting_session_id,
+        )
+        await get_s3_audio_storage().upload_file(thumb_path, thumbnail_key, content_type="image/jpeg")
+        # Only fill empty slots so the later merge thumbnail can replace freely.
+        result = await db.meeting_sessions.update_one(
+            {
+                "_id": _object_id(meeting_session_id),
+                "$or": [{"thumbnailS3Key": None}, {"thumbnailS3Key": {"$exists": False}}],
+            },
+            {"$set": {"thumbnailS3Key": thumbnail_key, "updatedAt": datetime.now(timezone.utc)}},
+        )
+        if result.modified_count:
+            diag_log(
+                "meeting_thumbnail_early_uploaded",
+                meetingSessionId=meeting_session_id,
+                userId=user_id,
+                thumbnailS3Key=thumbnail_key,
+            )
+    except Exception as error:
+        diag_log(
+            "meeting_thumbnail_early_failed",
+            meetingSessionId=meeting_session_id,
+            userId=user_id,
+            errorCode=type(error).__name__,
+        )

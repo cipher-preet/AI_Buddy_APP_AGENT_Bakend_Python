@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from services.db.mongo import get_database
 from services.document_it.enqueue import enqueue_document_generation
 from services.document_it.store import DocumentStore, public_document_doc, public_document_summary
+from services.plans.plan_limits import PlanLimitExceeded
 
 router = APIRouter()
 
@@ -28,6 +29,17 @@ async def generate_document(body: GenerateDocumentBody):
             space_id=body.spaceId.strip(),
             template_code=body.templateCode.strip(),
         )
+    except PlanLimitExceeded as error:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": str(error),
+                "resource": error.resource,
+                "limit": error.limit,
+                "used": error.used,
+                "planCode": error.plan_code,
+            },
+        ) from error
     except PermissionError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except ValueError as error:

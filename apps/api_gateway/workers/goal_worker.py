@@ -20,8 +20,10 @@ from services.queue.shared_redis import (
     capacity_backoff_seconds,
     is_redis_capacity_error,
     recover_redis_capacity,
+    recycle_broken_redis_pool,
+    should_log_redis_timeout,
 )
-from services.queue.streams import EventEnvelope, NonRetryableQueueError
+from services.queue.streams import EventEnvelope, IdlePoll, NonRetryableQueueError, xreadgroup_block
 
 
 async def handle_goal_event(event: EventEnvelope) -> None:
@@ -30,7 +32,6 @@ async def handle_goal_event(event: EventEnvelope) -> None:
 
 async def run_goal_scheduler() -> None:
     from services.goals.reviews import enqueue_due_reviews
-    from services.queue.shared_redis import disconnect_idle_pool_connections
 
     while True:
         try:
@@ -38,10 +39,6 @@ async def run_goal_scheduler() -> None:
             await enqueue_due_reviews(database)
         except Exception as error:
             print("goal scheduler failed", {"error": type(error).__name__}, flush=True)
-        try:
-            await disconnect_idle_pool_connections()
-        except Exception:
-            pass
         await asyncio.sleep(60)
 
 
@@ -62,8 +59,14 @@ class GoalStreamsRunner:
             settings.REDIS_GOAL_JOBS_STREAM: settings.REDIS_GOAL_JOBS_GROUP,
         }
         self.maxlen = settings.REDIS_GOAL_STREAM_MAXLEN
-        self._semaphore = asyncio.Semaphore(max(1, min(settings.GOAL_CLARIFY_MAX_CONCURRENCY, 3)))
+        self._max_active = max(1, min(settings.GOAL_CLARIFY_MAX_CONCURRENCY, 3))
+        self._semaphore = asyncio.Semaphore(self._max_active)
         self._capacity_failures = 0
+        self._active = 0
+        self._inflight: set[asyncio.Task] = set()
+        self._last_claim_at = 0.0
+        self._timeout_failures = 0
+        self._idle = IdlePoll(min_seconds=0.4, max_seconds=2.5)
 
     async def ensure_group(self) -> None:
         await self.ensure_groups()
@@ -112,6 +115,81 @@ class GoalStreamsRunner:
             except Exception as error:
                 print("goal event failed", {"error": type(error).__name__}, flush=True)
 
+    def _spawn(self, stream: str, group: str, message_id: str, fields: dict) -> None:
+        self._active += 1
+
+        async def run() -> None:
+            try:
+                await self._handle_message(stream, group, message_id, fields)
+            finally:
+                self._active = max(0, self._active - 1)
+
+        task = asyncio.create_task(run())
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+
+    async def _read_stream(self, stream: str, group: str, count: int):
+        try:
+            options: dict = {
+                "groupname": group,
+                "consumername": self.consumer_name,
+                "streams": {stream: ">"},
+                "count": count,
+            }
+            block = xreadgroup_block(0)
+            if block is not None:
+                options["block"] = block
+            messages = await self.redis.xreadgroup(**options)
+            self._capacity_failures = 0
+            self._timeout_failures = 0
+            return messages or []
+        except ResponseError as error:
+            if "NOGROUP" in str(error):
+                await self.ensure_groups()
+                return []
+            if is_redis_capacity_error(error):
+                self._capacity_failures += 1
+                await recover_redis_capacity(self.redis)
+                await asyncio.sleep(capacity_backoff_seconds(self._capacity_failures))
+                return []
+            raise
+        except (MaxConnectionsError, RedisTimeoutError, ConnectionError) as error:
+            if is_redis_capacity_error(error) or isinstance(error, MaxConnectionsError):
+                self._capacity_failures += 1
+                await recover_redis_capacity(self.redis)
+                await asyncio.sleep(capacity_backoff_seconds(self._capacity_failures))
+                return []
+            self._timeout_failures += 1
+            if self._timeout_failures >= 3:
+                await recycle_broken_redis_pool(self.redis)
+                self._timeout_failures = 0
+            if should_log_redis_timeout():
+                print("goal redis read failed", {"error": type(error).__name__, "stream": stream}, flush=True)
+            await asyncio.sleep(min(4.0, 0.8 * max(1, self._timeout_failures or 1)))
+            return []
+
+    async def _claim_stale(self) -> None:
+        now = asyncio.get_running_loop().time()
+        if now - self._last_claim_at < 45:
+            return
+        self._last_claim_at = now
+        idle_ms = min(int(settings.REDIS_CLAIM_IDLE_MS), 10000)
+        for stream, group in self.streams.items():
+            try:
+                claimed = await self.redis.xautoclaim(
+                    stream,
+                    group,
+                    self.consumer_name,
+                    min_idle_time=idle_ms,
+                    start_id="0-0",
+                    count=2,
+                )
+            except Exception:
+                continue
+            entries = claimed[1] if len(claimed) > 1 else []
+            for message_id, fields in entries:
+                self._spawn(stream, group, message_id, fields)
+
     async def run_forever(self) -> None:
         await self.ensure_groups()
         print(
@@ -123,60 +201,34 @@ class GoalStreamsRunner:
             flush=True,
         )
         while True:
-            try:
-                # Non-blocking reads so this loop never parks a cloud socket.
-                messages = await self.redis.xreadgroup(
-                    groupname=settings.REDIS_GOAL_INTERACTIVE_GROUP,
-                    consumername=self.consumer_name,
-                    streams={settings.REDIS_GOAL_INTERACTIVE_STREAM: ">"},
-                    count=2,
-                    block=0,
-                )
-                job_messages = None
-                if not messages:
-                    job_messages = await self.redis.xreadgroup(
-                        groupname=settings.REDIS_GOAL_JOBS_GROUP,
-                        consumername=self.consumer_name,
-                        streams={settings.REDIS_GOAL_JOBS_STREAM: ">"},
-                        count=1,
-                        block=0,
-                    )
-                self._capacity_failures = 0
-            except ResponseError as error:
-                if "NOGROUP" in str(error):
-                    await self.ensure_groups()
-                    continue
-                if is_redis_capacity_error(error):
-                    self._capacity_failures += 1
-                    await recover_redis_capacity(self.redis)
-                    await asyncio.sleep(capacity_backoff_seconds(self._capacity_failures))
-                    continue
-                raise
-            except (MaxConnectionsError, RedisTimeoutError, ConnectionError) as error:
-                if is_redis_capacity_error(error) or isinstance(error, MaxConnectionsError):
-                    self._capacity_failures += 1
-                    print("goal redis capacity", {"error": type(error).__name__}, flush=True)
-                    await recover_redis_capacity(self.redis)
-                    await asyncio.sleep(capacity_backoff_seconds(self._capacity_failures))
-                    continue
-                print("goal redis read failed", {"error": type(error).__name__}, flush=True)
-                await asyncio.sleep(1)
+            slots = self._max_active - self._active
+            if slots <= 0:
+                await asyncio.sleep(0.08)
                 continue
-
-            batches = []
-            if messages:
-                batches.extend(messages)
-            if job_messages:
-                batches.extend(job_messages)
-            tasks = []
-            for stream, entries in batches:
+            await self._claim_stale()
+            interactive = await self._read_stream(
+                settings.REDIS_GOAL_INTERACTIVE_STREAM,
+                settings.REDIS_GOAL_INTERACTIVE_GROUP,
+                min(2, max(1, slots)),
+            )
+            claimed = sum(len(entries) for _, entries in interactive)
+            jobs = []
+            if claimed < slots:
+                jobs = await self._read_stream(
+                    settings.REDIS_GOAL_JOBS_STREAM,
+                    settings.REDIS_GOAL_JOBS_GROUP,
+                    1,
+                )
+            spawned = False
+            for stream, entries in list(interactive) + list(jobs):
                 group = self.streams[stream]
                 for message_id, fields in entries:
-                    tasks.append(asyncio.create_task(self._handle_message(stream, group, message_id, fields)))
-            if tasks:
-                await asyncio.gather(*tasks)
+                    self._spawn(stream, group, message_id, fields)
+                    spawned = True
+            if spawned:
+                self._idle.hit()
             else:
-                await asyncio.sleep(0.12)
+                await asyncio.sleep(self._idle.miss())
 
 
 def build_goal_consumers():

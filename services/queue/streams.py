@@ -26,8 +26,37 @@ from services.queue.shared_redis import (
     is_redis_capacity_error,
     mark_redis_capacity_pressure,
     recover_redis_capacity,
+    recycle_broken_redis_pool,
     redis_under_capacity_pressure,
+    should_log_redis_timeout,
 )
+
+
+def xreadgroup_block(block_ms: int | None) -> int | None:
+    """
+    Redis BLOCK 0 waits forever. That plus socket_timeout looks like a TimeoutError
+    on every empty stream. Omit BLOCK (None) for a true non-blocking read.
+    """
+    if block_ms is None:
+        return None
+    value = int(block_ms)
+    return value if value > 0 else None
+
+
+class IdlePoll:
+    """Slow down Redis reads when queues are empty so Cloud is not hammered."""
+
+    def __init__(self, min_seconds: float = 0.4, max_seconds: float = 2.5):
+        self.min_seconds = min_seconds
+        self.max_seconds = max_seconds
+        self.seconds = min_seconds
+
+    def hit(self) -> None:
+        self.seconds = self.min_seconds
+
+    def miss(self) -> float:
+        self.seconds = min(self.max_seconds, max(self.min_seconds, self.seconds * 1.5))
+        return self.seconds
 
 
 class NonRetryableQueueError(RuntimeError):
@@ -126,6 +155,7 @@ class RedisStreamConsumer:
         self._semaphore = asyncio.Semaphore(self.concurrency)
         self._last_claim_at = 0.0
         self._capacity_failures = 0
+        self._timeout_failures = 0
 
     async def _ack_and_cleanup(self, message_id: str) -> None:
         await self._redis.xack(self.stream, self.group, message_id)
@@ -207,16 +237,16 @@ class RedisStreamConsumer:
         return id(pool) if pool is not None else id(self._redis)
 
     async def read_batch(self, *, block_ms: int) -> list:
-        return (
-            await self._redis.xreadgroup(
-                groupname=self.group,
-                consumername=self.consumer_name,
-                streams={self.stream: ">"},
-                count=settings.REDIS_BATCH_SIZE,
-                block=max(0, int(block_ms)),
-            )
-            or []
-        )
+        options: dict[str, Any] = {
+            "groupname": self.group,
+            "consumername": self.consumer_name,
+            "streams": {self.stream: ">"},
+            "count": settings.REDIS_BATCH_SIZE,
+        }
+        block = xreadgroup_block(block_ms)
+        if block is not None:
+            options["block"] = block
+        return (await self._redis.xreadgroup(**options)) or []
 
     async def dispatch_messages(self, messages) -> None:
         tasks: list[asyncio.Task[None]] = []
@@ -259,6 +289,7 @@ class RedisStreamConsumer:
         try:
             messages = await self.read_batch(block_ms=block_ms)
             self._capacity_failures = 0
+            self._timeout_failures = 0
             return messages
         except ResponseError as error:
             if "NOGROUP" in str(error):
@@ -275,16 +306,21 @@ class RedisStreamConsumer:
             if is_redis_capacity_error(error):
                 await self._backoff_capacity(error)
                 return []
-            print(
-                "Redis stream consumer read failed:",
-                {
-                    "stream": self.stream,
-                    "group": self.group,
-                    "error": str(error),
-                },
-                flush=True,
-            )
-            await asyncio.sleep(1)
+            self._timeout_failures += 1
+            if self._timeout_failures >= 3:
+                await recycle_broken_redis_pool(self._redis)
+                self._timeout_failures = 0
+            if should_log_redis_timeout():
+                print(
+                    "Redis stream consumer read failed:",
+                    {
+                        "stream": self.stream,
+                        "group": self.group,
+                        "error": str(error),
+                    },
+                    flush=True,
+                )
+            await asyncio.sleep(min(4.0, 0.5 * max(1, self._timeout_failures or 1)))
             return []
 
     async def run_forever(self) -> None:
@@ -433,6 +469,9 @@ class MultiplexedStreamHub:
         self.consumers = list(consumers)
         self.stream = f"hub:{self.consumers[0].stream}"
         self._shutdown = asyncio.Event()
+        self._claim_index = 0
+        self._inflight: set[asyncio.Task[None]] = set()
+        self._idle = IdlePoll()
 
     async def ensure_group(self) -> None:
         for consumer in self.consumers:
@@ -446,7 +485,8 @@ class MultiplexedStreamHub:
 
     async def run_forever(self) -> None:
         await self.ensure_group()
-        idle_ms = int(getattr(settings, "REDIS_POLL_IDLE_MS", 120) or 120)
+        idle_ms = int(getattr(settings, "REDIS_POLL_IDLE_MS", 400) or 400)
+        self._idle = IdlePoll(min_seconds=max(0.25, idle_ms / 1000), max_seconds=2.5)
         print(
             "Redis multiplexed stream hub started:",
             {
@@ -457,16 +497,25 @@ class MultiplexedStreamHub:
         )
         while not self._shutdown.is_set():
             had_work = False
+            claim_consumer = self.consumers[self._claim_index % len(self.consumers)]
+            self._claim_index += 1
+            await claim_consumer.maybe_claim_stale()
             for consumer in self.consumers:
                 if self._shutdown.is_set():
                     break
-                await consumer.maybe_claim_stale()
+                if consumer._semaphore.locked():
+                    continue
                 messages = await consumer._read_or_recover(block_ms=0)
-                if messages:
-                    had_work = True
-                    await consumer.dispatch_messages(messages)
-            if not had_work:
-                await asyncio.sleep(max(0.04, idle_ms / 1000))
+                if not messages:
+                    continue
+                had_work = True
+                task = asyncio.create_task(consumer.dispatch_messages(messages))
+                self._inflight.add(task)
+                task.add_done_callback(self._inflight.discard)
+            if had_work:
+                self._idle.hit()
+            else:
+                await asyncio.sleep(self._idle.miss())
 
 
 def group_stream_runners(items: Sequence[Any]) -> list[Any]:

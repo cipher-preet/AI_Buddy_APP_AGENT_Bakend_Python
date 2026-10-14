@@ -128,6 +128,63 @@ def probe_ffmpeg() -> str | None:
         return None
 
 
+async def extract_video_thumbnail(
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    seek_seconds: float = 1.0,
+) -> Path | None:
+    """Grab one JPEG frame for meeting cards.
+
+    Best-effort only: returns None on any failure so callers never fail the meeting.
+    Prefers a short seek so the first black/loading frame is skipped when possible.
+    """
+    source = Path(input_path)
+    destination = Path(output_path)
+    if not source.exists() or source.stat().st_size <= 0:
+        return None
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    timeout = min(15.0, float(settings.MEETING_FFMPEG_TIMEOUT_SECONDS))
+    seek = max(0.0, float(seek_seconds))
+
+    # Seek first (fast), then decode one frame scaled for card use.
+    attempts = (
+        [seek, 0.0] if seek > 0 else [0.0]
+    )
+    for offset in attempts:
+        command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *_FFMPEG_INPUT_FLAGS,
+        ]
+        if offset > 0:
+            command.extend(["-ss", f"{offset:.2f}"])
+        command.extend(
+            [
+                "-i",
+                str(source),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale='min(640,iw)':-2",
+                "-q:v",
+                "5",
+                str(destination),
+            ]
+        )
+        error = await _run_ffmpeg(command, timeout=timeout, allow_failure=True)
+        if error is None and destination.exists() and destination.stat().st_size > 256:
+            return destination
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return None
+
+
 async def extract_audio_for_stt(input_path: str | Path, output_path: str | Path) -> Path:
     source = Path(input_path)
     destination = Path(output_path)

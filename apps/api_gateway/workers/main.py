@@ -29,7 +29,12 @@ from apps.api_gateway.workers.goal_worker import build_goal_consumers, run_goal_
 from services.db.mongo import close_mongo_client, ensure_mongo_indexes
 from services.goals.redis_client import GoalRedisConfigError, ensure_goal_redis
 from services.llm.router import close_llm_runtime, log_llm_provider_status
-from services.queue.shared_redis import close_shared_redis_clients, supervisor_restart_delay
+from services.queue.maintenance import run_redis_maintenance
+from services.queue.shared_redis import (
+    close_shared_redis_clients,
+    install_windows_socket_exception_filter,
+    supervisor_restart_delay,
+)
 from services.queue.streams import group_stream_runners
 from services.meeting_extension.ffmpeg_audio import probe_ffmpeg
 from services.meeting_extension.video_merge import resume_stuck_video_merges
@@ -94,6 +99,7 @@ async def _run_supervised(name: str, factory) -> None:
 
 
 async def main():
+    install_windows_socket_exception_filter()
     await test_redis_connection()
     await ensure_mindmap_redis()
     await ensure_goal_redis()
@@ -163,6 +169,7 @@ async def main():
             _staggered("worker-health", run_worker_heartbeat, 2.5),
             _staggered("event-loop-lag", run_event_loop_lag_monitor, 2.5),
             _staggered("redis-queue-health", run_redis_queue_health, 3.0),
+            _staggered("redis-maintenance", run_redis_maintenance, 4.0),
         )
     finally:
         await close_llm_runtime()

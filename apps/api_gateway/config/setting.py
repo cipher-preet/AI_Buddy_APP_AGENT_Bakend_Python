@@ -228,7 +228,7 @@ class Settings(BaseSettings):
     DAILY_BRIEFING_BATCH_SIZE: int = Field(default=100, ge=1, le=2000)
     DAILY_BRIEFING_MAX_CONCURRENCY: int = Field(default=5, ge=1, le=32)
     DAILY_BRIEFING_MAX_RETRIES: int = Field(default=2, ge=0, le=10)
-    DAILY_BRIEFING_SCAN_INTERVAL_SECONDS: int = Field(default=20, ge=5, le=3600)
+    DAILY_BRIEFING_SCAN_INTERVAL_SECONDS: int = Field(default=180, ge=5, le=3600)
     DAILY_BRIEFING_WINDOW_TARGET_TOKENS: int = Field(default=5000, ge=200, le=100000)
     DAILY_BRIEFING_WINDOW_MAX_TOKENS: int = Field(default=7000, ge=200, le=120000)
     # "v2" = work-planning briefing (chat + backlog + next-day agenda, grounded output).
@@ -266,10 +266,10 @@ class Settings(BaseSettings):
     # Each forced run is a paid LLM call; READY briefings are never regenerated.
     DAILY_BRIEFING_FORCE_DAILY_LIMIT: int = Field(default=3, ge=1, le=50)
 
-    REDIS_CLAIM_IDLE_MS: int = 60000
+    REDIS_CLAIM_IDLE_MS: int = 15000
     REDIS_BLOCK_MS: int = 1000
     REDIS_BATCH_SIZE: int = 10
-    REDIS_POLL_IDLE_MS: int = Field(default=120, ge=40, le=2000)
+    REDIS_POLL_IDLE_MS: int = Field(default=400, ge=40, le=5000)
     REDIS_CLAIM_INTERVAL_SECONDS: int = Field(default=30, ge=5, le=300)
     ENABLE_REMINDER_WORKER: bool = True
     REMINDER_SCHEDULE_KEY: str = "buddy:reminder:schedule"

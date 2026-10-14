@@ -8,6 +8,7 @@ from services.mindmap.log import mindmap_log
 from services.mindmap.redis_client import MindmapRedisConfigError, get_mindmap_redis_client
 from services.mindmap.schemas import MindmapStatus
 from services.mindmap.store import MindmapStore, public_mindmap_doc
+from services.plans.plan_limits import assert_plan_count_allowed
 from services.queue.streams import EventEnvelope, RedisStreamProducer
 from services.schedule_extraction.llm import parse_model_route
 
@@ -48,6 +49,8 @@ async def enqueue_mindmap_generation(database, *, user_id: str, space_id: str) -
         raise PermissionError(
             "Mind map generation is unavailable: configure NVIDIA_API_KEY or KRUTRIM_API_KEY (or MINDMAP_MODELS)."
         )
+
+    await assert_plan_count_allowed(database, user_id=user_id, resource="mindmaps")
 
     job_id = str(uuid4())
     reserved = await store.reserve(user_id=user_id, space_id=space_id, job_id=job_id)
