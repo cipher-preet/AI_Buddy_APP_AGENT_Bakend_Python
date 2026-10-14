@@ -716,12 +716,13 @@ class ConversationRepository:
     async def save_meeting_memory(self, memory: MeetingMemoryDocument) -> MeetingMemoryDocument:
         memory.updatedAt = utc_now()
         doc = memory.model_dump(by_alias=True)
+        memory_id = doc.pop("_id", memory.id)
         doc["conversationId"] = to_mongo_id(memory.conversationId)
         doc["userId"] = to_mongo_id(memory.userId)
         doc["spaceId"] = to_mongo_id(memory.spaceId)
         result = await self.db.meeting_memory.find_one_and_update(
             {"conversationId": doc["conversationId"]},
-            {"$set": doc},
+            {"$set": doc, "$setOnInsert": {"_id": to_mongo_id(memory_id)}},
             upsert=True,
             return_document=ReturnDocument.AFTER,
         )
@@ -736,6 +737,7 @@ class ConversationRepository:
             if not event_id:
                 continue
             payload = dict(event)
+            payload.pop("_id", None)
             payload["conversationId"] = conversation_key
             payload["updatedAt"] = utc_now()
             await self.db.conversation_events.find_one_and_update(
@@ -837,10 +839,12 @@ class ConversationRepository:
         staged_decisions = [item.model_dump() for item in run.stagedDecisions]
         staged_issues = [item.model_dump() for item in run.stagedIssues]
         doc = extraction_run_doc(run)
+        run_id = doc.pop("_id", run.id)
         await self.db.extraction_runs.update_one(
             {"_id": run.id},
             {
                 "$set": doc,
+                "$setOnInsert": {"_id": to_mongo_id(run_id)},
                 "$unset": {
                     "stagedTasks": "",
                     "stagedNotes": "",
@@ -932,25 +936,27 @@ class ConversationRepository:
         note_ids = await self._publish_notes(run)
         summary.taskIds = task_ids
         summary_doc = summary.model_dump(by_alias=True)
+        summary_id = summary_doc.pop("_id", summary.id)
         summary_doc["conversationId"] = to_mongo_id(summary.conversationId)
         summary_doc["userId"] = to_mongo_id(summary.userId)
         summary_doc["spaceId"] = optional_mongo_id(summary.spaceId)
         await self.db.conversation_summaries.update_one(
             {"conversationId": to_mongo_id(summary.conversationId)},
-            {"$set": summary_doc},
+            {"$set": summary_doc, "$setOnInsert": {"_id": to_mongo_id(summary_id)}},
             upsert=True,
         )
 
         # Extension meetings have no space context — do not write space_memory.
         if has_space_id(memory.spaceId):
             memory_doc = memory.model_dump(by_alias=True)
+            memory_id = memory_doc.pop("_id", memory.id)
             memory_doc["userId"] = to_mongo_id(memory.userId)
             memory_doc["spaceId"] = to_mongo_id(memory.spaceId)
             if memory.lastUpdatedConversationId is not None:
                 memory_doc["lastUpdatedConversationId"] = to_mongo_id(memory.lastUpdatedConversationId)
             await self.db.space_memory.update_one(
                 {"userId": to_mongo_id(memory.userId), "spaceId": to_mongo_id(memory.spaceId)},
-                {"$set": memory_doc},
+                {"$set": memory_doc, "$setOnInsert": {"_id": to_mongo_id(memory_id)}},
                 upsert=True,
             )
         return {"taskIds": task_ids, "noteIds": note_ids}
