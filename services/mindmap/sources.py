@@ -7,6 +7,7 @@ from apps.api_gateway.config.setting import settings
 from services.conversation.repository import mongo_id_candidates
 from services.mindmap.log import mindmap_log
 from services.mindmap.schemas import SourceStats, SpaceContextBundle
+from services.mindmap.source_scope import SourceScope, combine_query
 from services.observability.diagnostics import diag_log
 
 TASK_PROJECTION = {
@@ -75,11 +76,19 @@ class MindmapSource:
             self._collections = set(await self.db.list_collection_names())
         return self._collections
 
-    async def load(self, user_id: str, space_id: str) -> SpaceContextBundle:
+    async def load(
+        self,
+        user_id: str,
+        space_id: str,
+        *,
+        scope: SourceScope | None = None,
+    ) -> SpaceContextBundle:
         names = await self._collection_names()
         user_filter = _id_filter(user_id)
         space_filter = _space_filter(space_id)
         soft = _not_deleted()
+        scope = scope or SourceScope()
+        owned = {**user_filter, **space_filter, **soft}
         task_limit = settings.MINDMAP_MAX_TASKS
         note_limit = settings.MINDMAP_MAX_NOTES
         transcript_limit = settings.MINDMAP_MAX_TRANSCRIPTS
@@ -89,14 +98,14 @@ class MindmapSource:
         space_name = await self._space_name(space_id, names)
         tasks = await self._merge_collections(
             ["tasks", "stagedTasks"],
-            {**user_filter, **space_filter, **soft},
+            combine_query(owned, scope.task_filter()),
             TASK_PROJECTION,
             limit=task_limit,
             sort=[("updatedAt", -1)],
         )
         notes = await self._merge_collections(
             ["notes", "stagedNotes"],
-            {**user_filter, **space_filter, **soft},
+            combine_query(owned, scope.note_filter()),
             NOTE_PROJECTION,
             limit=note_limit,
             sort=[("updatedAt", -1)],
@@ -106,6 +115,7 @@ class MindmapSource:
             space_filter,
             limit=transcript_limit,
             names=names,
+            scope=scope,
         )
         diag_log(
             "mongo_query_timing",
@@ -178,6 +188,8 @@ class MindmapSource:
             notes=mapped_notes,
             transcripts=mapped_transcripts,
             sourceStats=stats,
+            scopeMode=scope.mode,
+            scopeDate=scope.coverage_label,
         )
 
     async def _space_name(self, space_id: str, names: set[str]) -> str:
@@ -229,14 +241,18 @@ class MindmapSource:
         *,
         limit: int,
         names: set[str],
+        scope: SourceScope | None = None,
     ) -> list[dict[str, Any]]:
         if "transcript_chunks" not in names:
             return []
-        query = {
-            **user_filter,
-            **space_filter,
-            "sttStatus": "completed",
-        }
+        query = combine_query(
+            {
+                **user_filter,
+                **space_filter,
+                "sttStatus": "completed",
+            },
+            (scope or SourceScope()).transcript_filter(),
+        )
         return await (
             self.db.transcript_chunks.find(query, TRANSCRIPT_PROJECTION)
             .sort([("createdAt", -1)])

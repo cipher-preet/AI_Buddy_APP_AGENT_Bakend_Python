@@ -13,6 +13,7 @@ from services.db.mongo import get_database
 from services.queue.factory import use_queue_api
 from services.queue.http_queue import QueueApiPublisher
 from services.queue.redis_queue import (
+    expire_speech_job,
     get_job_result,
     push_speech_job,
     redis_client,
@@ -165,6 +166,7 @@ async def transcribe_audio_service(file: UploadFile, user_id: str, space_id: str
                 )
             else:
                 await redis_client.hset(f"speech_job:{job_id}", mapping=job)
+                await expire_speech_job(job_id)
                 await push_speech_job(job)
         except Exception:
             if not use_queue_api():
@@ -172,6 +174,7 @@ async def transcribe_audio_service(file: UploadFile, user_id: str, space_id: str
                     f"speech_job:{job_id}",
                     mapping={"status": "failed", "error": "Failed to publish speech job"},
                 )
+                await expire_speech_job(job_id)
             if s3_ref:
                 try:
                     await get_s3_audio_storage().delete_file(s3_ref.bucket, s3_ref.object_key)
@@ -235,8 +238,15 @@ async def get_transcribe_job_result_service(job_id: str):
     return await get_job_result(job_id)
 
 
+LISTENING_SESSION_TTL_SECONDS = 86400
+
+
 def _listening_session_key(user_id: str, space_id: str) -> str:
     return f"speech_listening_session:{user_id}:{space_id}"
+
+
+async def _touch_listening_session(key: str) -> None:
+    await redis_client.expire(key, LISTENING_SESSION_TTL_SECONDS)
 
 
 async def start_listening_session_service(user_id: str, space_id: str):
@@ -263,8 +273,10 @@ async def start_listening_session_service(user_id: str, space_id: str):
             },
         }
 
-    existing = await redis_client.hgetall(_listening_session_key(user_id, space_id))
+    session_key = _listening_session_key(user_id, space_id)
+    existing = await redis_client.hgetall(session_key)
     if existing.get("status") == "listening" and existing.get("conversation_id"):
+        await _touch_listening_session(session_key)
         return {
             "success": True,
             "message": "Listening session already started.",
@@ -280,7 +292,8 @@ async def start_listening_session_service(user_id: str, space_id: str):
         "started_at": utc_now().isoformat(),
         "last_sequence_number": "-1",
     }
-    await redis_client.hset(_listening_session_key(user_id, space_id), mapping=session)
+    await redis_client.hset(session_key, mapping=session)
+    await _touch_listening_session(session_key)
 
     return {
         "success": True,
@@ -374,7 +387,7 @@ async def end_listening_session_service(
             "stopped_at": stopped_at,
         },
     )
-    await redis_client.expire(key, 86400)
+    await _touch_listening_session(key)
 
     return {
         "success": True,
@@ -403,6 +416,7 @@ async def _get_or_create_listening_session(user_id: str, space_id: str) -> dict:
     key = _listening_session_key(user_id, space_id)
     existing = await redis_client.hgetall(key)
     if existing.get("status") == "listening" and existing.get("conversation_id"):
+        await _touch_listening_session(key)
         return existing
 
     result = await start_listening_session_service(user_id, space_id)
@@ -417,7 +431,9 @@ async def _next_listening_sequence(user_id: str, space_id: str, conversation_id:
         return int(existing.get("receivedAudioChunkCount") or 0)
 
     key = _listening_session_key(user_id, space_id)
-    return int(await redis_client.hincrby(key, "last_sequence_number", 1))
+    sequence = int(await redis_client.hincrby(key, "last_sequence_number", 1))
+    await _touch_listening_session(key)
+    return sequence
 
 
 async def _find_active_conversation(user_id: str, space_id: str, conversation_id: str | None = None) -> dict | None:

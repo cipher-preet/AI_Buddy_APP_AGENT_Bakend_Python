@@ -16,6 +16,7 @@ from services.queue.shared_redis import (
 
 SPEECH_QUEUE = "speech_transcribe_queue"
 COMPLETED_SPEECH_QUEUE = "completed_speech_queue"
+SPEECH_JOB_TTL_SECONDS = 86400
 
 
 def _redact_redis_secrets(message: str) -> str:
@@ -100,11 +101,16 @@ async def pop_speech_job():
         return None
 
 
+async def expire_speech_job(job_id: str) -> None:
+    await redis_client.expire(f"speech_job:{job_id}", SPEECH_JOB_TTL_SECONDS)
+
+
 async def mark_job_processing(job_id: str):
     await redis_client.hset(
         f"speech_job:{job_id}",
         mapping={"status": "processing"},
     )
+    await expire_speech_job(job_id)
 
 
 async def mark_job_failed(job_id: str, error: str):
@@ -115,6 +121,7 @@ async def mark_job_failed(job_id: str, error: str):
             "error": error,
         },
     )
+    await expire_speech_job(job_id)
 
 
 async def save_job_result(job_id: str, result: dict):
@@ -125,6 +132,7 @@ async def save_job_result(job_id: str, result: dict):
             "result": json.dumps(result),
         },
     )
+    await expire_speech_job(job_id)
 
 
 async def get_job_result(job_id: str):

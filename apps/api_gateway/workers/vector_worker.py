@@ -9,6 +9,7 @@ from services.conversation.repository import ConversationRepository
 from services.db.mongo import get_database
 from services.queue.redis_queue import (
     delete_speech_job,
+    expire_speech_job,
     get_job_result,
     pop_completed_speech_job,
     push_completed_speech_job,
@@ -159,6 +160,7 @@ async def _schedule_vector_retry(job_id: str, job: dict, error: Exception) -> bo
         return False
     try:
         await redis_client.hset(f"speech_job:{job_id}", mapping={"vector_attempts": attempts})
+        await expire_speech_job(job_id)
     except Exception:
         return False
     delay = VECTOR_RETRY_DELAYS_SECONDS[min(attempts - 1, len(VECTOR_RETRY_DELAYS_SECONDS) - 1)]

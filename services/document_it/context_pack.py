@@ -31,6 +31,7 @@ def build_document_context_pack(
         "tasks": [],
         "notes": [],
         "meetingHighlights": [],
+        "coverage": bundle.scopeDate if bundle.scopeMode == "date" and bundle.scopeDate else "whole space",
         "sourceStats": bundle.sourceStats.model_dump(),
     }
     used = _estimate_tokens(bundle.spaceName) + _estimate_tokens(template.guidance) + 120

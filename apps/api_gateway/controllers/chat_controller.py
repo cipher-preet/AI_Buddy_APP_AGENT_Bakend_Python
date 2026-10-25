@@ -35,8 +35,8 @@ async def ask_chat_controller(
     }
 
 
-async def load_chat_controller(user_id: str, chat_id: str):
-    return {"success": True, "data": await ChatService().load_chat(user_id, chat_id)}
+async def load_chat_controller(user_id: str, chat_id: str, *, card: bool = False):
+    return {"success": True, "data": await ChatService().load_chat(user_id, chat_id, card=card)}
 
 
 async def list_chats_controller(
@@ -45,8 +45,17 @@ async def list_chats_controller(
     limit: int = 20,
     cursor: str | None = None,
     meeting_id: str | None = None,
+    *,
+    card: bool = False,
 ):
     return {
         "success": True,
-        "data": await ChatService().list_chats(user_id, space_id, limit, cursor, meeting_id=meeting_id),
+        "data": await ChatService().list_chats(
+            user_id,
+            space_id,
+            limit,
+            cursor,
+            meeting_id=meeting_id,
+            card=card,
+        ),
     }

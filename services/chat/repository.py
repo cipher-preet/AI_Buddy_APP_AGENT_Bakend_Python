@@ -204,7 +204,19 @@ class ChatRepository:
                 {"updatedAt": cursor_updated_at, "_id": {"$lt": cursor_id}},
             ]
         mongo_cursor = (
-            self.db.chat_sessions.find(query)
+            self.db.chat_sessions.find(
+                query,
+                {
+                    "userId": 1,
+                    "spaceId": 1,
+                    "meetingId": 1,
+                    "title": 1,
+                    "status": 1,
+                    "messageCount": 1,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                },
+            )
             .sort([("updatedAt", -1), ("_id", -1)])
             .limit(limit)
         )

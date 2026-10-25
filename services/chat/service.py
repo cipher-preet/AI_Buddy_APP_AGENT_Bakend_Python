@@ -276,7 +276,7 @@ class ChatService:
 
         return None, question
 
-    async def load_chat(self, user_id: str, chat_id: str) -> dict[str, Any]:
+    async def load_chat(self, user_id: str, chat_id: str, *, card: bool = False) -> dict[str, Any]:
         session = await self.repository.get_session(chat_id)
         if not session:
             raise ValueError("Chat session not found")
@@ -284,7 +284,7 @@ class ChatService:
             raise PermissionError("Chat session does not belong to this user")
         messages = await self.repository.list_recent_messages(chat_id, MAX_CHAT_MESSAGES)
         return {
-            "chat": _session_response(session),
+            "chat": _session_response(session, card=card),
             "messages": [_message_response(message) for message in messages],
         }
 
@@ -295,6 +295,8 @@ class ChatService:
         limit: int = 20,
         cursor: str | None = None,
         meeting_id: str | None = None,
+        *,
+        card: bool = False,
     ) -> dict[str, Any]:
         page_size = max(1, min(limit, 100))
         sessions = await self.repository.list_sessions(
@@ -306,9 +308,14 @@ class ChatService:
         )
         visible_sessions = sessions[:page_size]
         has_more = len(sessions) > page_size
-        return {
-            "chats": [_session_response(session) for session in visible_sessions],
+        page = {
+            "chats": [_session_response(session, card=card) for session in visible_sessions],
             "nextCursor": encode_sessions_cursor(visible_sessions[-1]) if has_more and visible_sessions else None,
+        }
+        if card:
+            return page
+        return {
+            **page,
             "hasMore": has_more,
             "limit": page_size,
         }
@@ -767,11 +774,20 @@ def _looks_like_raw_context_line(line: str) -> bool:
     return False
 
 
-def _session_response(session) -> dict[str, Any]:
+def _session_response(session, *, card: bool = False) -> dict[str, Any]:
+    space_id = None if session.spaceId is None else str(session.spaceId)
+    if card:
+        return {
+            "id": str(session.id),
+            "title": session.title,
+            "spaceId": space_id,
+            "messageCount": session.messageCount,
+            "updatedAt": session.updatedAt,
+        }
     return {
         "id": str(session.id),
         "userId": str(session.userId),
-        "spaceId": None if session.spaceId is None else str(session.spaceId),
+        "spaceId": space_id,
         "meetingId": None if session.meetingId is None else str(session.meetingId),
         "title": session.title,
         "status": session.status,

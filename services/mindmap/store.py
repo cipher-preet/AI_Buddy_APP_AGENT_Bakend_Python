@@ -15,6 +15,7 @@ from services.mindmap.schemas import (
     MindmapStatus,
     SourceStats,
 )
+from services.mindmap.source_scope import SourceScope, active_scope_filter
 
 CLAIM_STALE = timedelta(minutes=20)
 MAX_VERSIONS_PER_SPACE = 5
@@ -47,15 +48,22 @@ class MindmapStore:
         self.db = database
         self.collection = database.spaceMindmaps
 
-    async def find_active(self, user_id: str, space_id: str) -> dict[str, Any] | None:
+    async def find_active(
+        self,
+        user_id: str,
+        space_id: str,
+        *,
+        scope: SourceScope | None = None,
+    ) -> dict[str, Any] | None:
+        query: dict[str, Any] = {
+            "userId": {"$in": mongo_id_candidates(user_id)},
+            "spaceId": {"$in": mongo_id_candidates(space_id)},
+            "status": {"$in": list(ACTIVE_STATUSES)},
+        }
+        if scope is not None:
+            query.update(active_scope_filter(scope))
         docs = await (
-            self.collection.find(
-                {
-                    "userId": {"$in": mongo_id_candidates(user_id)},
-                    "spaceId": {"$in": mongo_id_candidates(space_id)},
-                    "status": {"$in": list(ACTIVE_STATUSES)},
-                }
-            )
+            self.collection.find(query)
             .sort([("updatedAt", -1)])
             .limit(5)
             .to_list(length=5)
@@ -102,6 +110,7 @@ class MindmapStore:
         user_id: str,
         space_id: str,
         job_id: str,
+        source_scope: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = utc_now()
         mindmap_id = str(uuid4())
@@ -111,6 +120,7 @@ class MindmapStore:
             "userId": str(user_id),
             "spaceId": str(space_id),
             "jobId": str(job_id),
+            "sourceScope": source_scope or {"mode": "space"},
             "status": MindmapStatus.QUEUED.value,
             "stage": "queued",
             "progress": 5,
@@ -241,8 +251,23 @@ class MindmapStore:
         space_id: str,
         *,
         limit: int = 24,
+        card: bool = False,
     ) -> list[dict[str, Any]]:
         capped = max(1, min(int(limit), 50))
+        projection = (
+            {
+                "preview": 1,
+                "version": 1,
+                "updatedAt": 1,
+                "createdAt": 1,
+            }
+            if card
+            else {
+                "claimedBy": 0,
+                "claimedAt": 0,
+                "graph": 0,
+            }
+        )
         docs = await (
             self.collection.find(
                 {
@@ -250,11 +275,7 @@ class MindmapStore:
                     "spaceId": {"$in": mongo_id_candidates(space_id)},
                     "status": MindmapStatus.READY.value,
                 },
-                {
-                    "claimedBy": 0,
-                    "claimedAt": 0,
-                    "graph": 0,
-                },
+                projection,
             )
             .sort([("version", -1), ("updatedAt", -1)])
             .limit(capped)
@@ -472,6 +493,7 @@ def public_mindmap_doc(doc: dict[str, Any] | None) -> dict[str, Any] | None:
     payload["mindmapId"] = str(payload.get("_id") or "")
     payload["_id"] = str(payload.get("_id") or "")
     payload.pop("claimedBy", None)
+    payload.pop("sourceScope", None)
     return payload
 
 
@@ -483,3 +505,20 @@ def public_mindmap_summary(doc: dict[str, Any] | None) -> dict[str, Any] | None:
     if not payload.get("preview"):
         payload["preview"] = build_mindmap_preview(None)
     return payload
+
+
+def public_mindmap_card(doc: dict[str, Any] | None) -> dict[str, Any] | None:
+    summary = public_mindmap_summary(doc)
+    if not summary:
+        return None
+    preview = summary.get("preview") if isinstance(summary.get("preview"), dict) else {}
+    return {
+        "mindmapId": summary.get("mindmapId"),
+        "preview": {
+            "title": preview.get("title"),
+            "nodes": preview.get("nodes") if isinstance(preview.get("nodes"), list) else [],
+        },
+        "version": summary.get("version"),
+        "updatedAt": summary.get("updatedAt"),
+        "createdAt": summary.get("createdAt"),
+    }

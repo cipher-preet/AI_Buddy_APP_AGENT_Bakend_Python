@@ -7,6 +7,7 @@ from services.document_it.log import document_log
 from services.document_it.schemas import DocumentStatus
 from services.document_it.store import DocumentStore, public_document_doc
 from services.document_it.templates import load_template_spec
+from services.mindmap.source_scope import SourceScope
 from services.llm.router import get_llm_router
 from services.mindmap.redis_client import MindmapRedisConfigError, get_mindmap_redis_client
 from services.plans.plan_limits import assert_plan_count_allowed
@@ -30,14 +31,16 @@ async def enqueue_document_generation(
     user_id: str,
     space_id: str,
     template_code: str,
+    scope: SourceScope | None = None,
 ) -> dict:
     code = str(template_code or "").strip().lower()
     if not code:
         raise ValueError("templateCode is required.")
 
     store = DocumentStore(database)
+    scope = scope or SourceScope()
     template = await load_template_spec(database, code)
-    active = await store.find_active(user_id, space_id, template_code=code)
+    active = await store.find_active(user_id, space_id, template_code=code, scope=scope)
     if active is not None:
         document_log(
             "enqueue_reuse_active",
@@ -69,12 +72,14 @@ async def enqueue_document_generation(
     await assert_plan_count_allowed(database, user_id=user_id, resource="documents")
 
     job_id = str(uuid4())
+    stored_scope = scope.as_document()
     reserved = await store.reserve(
         user_id=user_id,
         space_id=space_id,
         job_id=job_id,
         template_code=code,
         template_title=template.title,
+        source_scope=stored_scope,
     )
     document_id = str(reserved["_id"])
 
@@ -89,6 +94,7 @@ async def enqueue_document_generation(
             "documentId": document_id,
             "templateCode": code,
             "templateTitle": template.title,
+            "sourceScope": stored_scope,
         },
     )
 

@@ -9,6 +9,7 @@ from services.document_it.log import document_log
 from services.document_it.schemas import DocumentStatus, SourceStats
 from services.document_it.store import DocumentStore
 from services.document_it.templates import load_template_spec
+from services.mindmap.source_scope import empty_context_message, scope_from_stored
 from services.mindmap.sources import MindmapSource
 from services.queue.streams import EventEnvelope, NonRetryableQueueError
 
@@ -57,14 +58,20 @@ class DocumentJobHandler:
 
         try:
             template = await load_template_spec(self.database, template_code)
+            scope = scope_from_stored(payload.get("sourceScope") or (doc or {}).get("sourceScope"))
+            gathering = (
+                f"Gathering notes, tasks, and transcripts for {scope.day_label}"
+                if scope.mode == "date" and scope.dates
+                else "Gathering notes, tasks, and transcripts"
+            )
             await self.store.update_progress(
                 document_id,
                 status=DocumentStatus.GATHERING.value,
                 stage="gathering_context",
                 progress=20,
-                message="Gathering notes, tasks, and transcripts",
+                message=gathering,
             )
-            bundle = await self.sources.load(user_id, space_id)
+            bundle = await self.sources.load(user_id, space_id, scope=scope)
             pack = build_document_context_pack(bundle, template=template)
             await self.store.update_progress(
                 document_id,
@@ -75,9 +82,7 @@ class DocumentJobHandler:
             )
 
             if not has_usable_context(pack):
-                raise NonRetryableQueueError(
-                    "No notes, tasks, or meeting transcripts found for this space yet."
-                )
+                raise NonRetryableQueueError(empty_context_message(scope))
 
             await self.store.update_progress(
                 document_id,
@@ -133,6 +138,10 @@ class DocumentJobHandler:
                 docxBytes=len(docx_bytes),
                 model=model,
             )
+        except ValueError as error:
+            await self.store.mark_failed(document_id, str(error))
+            document_log("job_failed_nonretryable", documentId=document_id, error=str(error)[:200])
+            raise NonRetryableQueueError(str(error)) from error
         except NonRetryableQueueError as error:
             await self.store.mark_failed(document_id, str(error))
             document_log("job_failed_nonretryable", documentId=document_id, error=str(error)[:200])

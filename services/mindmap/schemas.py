@@ -129,3 +129,5 @@ class SpaceContextBundle(BaseModel):
     notes: list[dict[str, Any]] = Field(default_factory=list)
     transcripts: list[dict[str, Any]] = Field(default_factory=list)
     sourceStats: SourceStats = Field(default_factory=SourceStats)
+    scopeMode: str = "space"
+    scopeDate: str | None = None

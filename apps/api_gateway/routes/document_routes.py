@@ -6,9 +6,16 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from services.mindmap.source_scope import parse_source_scope
+
 from services.db.mongo import get_database
 from services.document_it.enqueue import enqueue_document_generation
-from services.document_it.store import DocumentStore, public_document_doc, public_document_summary
+from services.document_it.store import (
+    DocumentStore,
+    public_document_card,
+    public_document_doc,
+    public_document_summary,
+)
 from services.plans.plan_limits import PlanLimitExceeded
 
 router = APIRouter()
@@ -18,6 +25,10 @@ class GenerateDocumentBody(BaseModel):
     userId: str = Field(min_length=1)
     spaceId: str = Field(min_length=1)
     templateCode: str = Field(min_length=1)
+    scope: str = "space"
+    date: str | None = None
+    dates: list[str] | None = None
+    timeZone: str | None = None
 
 
 @router.post("/generate")
@@ -28,6 +39,7 @@ async def generate_document(body: GenerateDocumentBody):
             user_id=body.userId.strip(),
             space_id=body.spaceId.strip(),
             template_code=body.templateCode.strip(),
+            scope=parse_source_scope(body.scope, body.date, body.timeZone, dates=body.dates),
         )
     except PlanLimitExceeded as error:
         raise HTTPException(
@@ -57,16 +69,20 @@ async def list_documents(
     user_id: str = Query(..., alias="userId", min_length=1),
     space_id: str = Query(..., alias="spaceId", min_length=1),
     limit: int = Query(24, ge=1, le=50),
+    view: str | None = Query(default=None),
 ):
+    card = view == "card"
     store = DocumentStore(get_database())
     documents = await store.list_for_space(
         user_id.strip(),
         space_id.strip(),
         limit=limit,
+        card=card,
     )
+    present = public_document_card if card else public_document_summary
     return {
         "success": True,
-        "documents": [public_document_summary(doc) for doc in documents],
+        "documents": [present(doc) for doc in documents],
     }
 
 

@@ -104,17 +104,16 @@ def artifacts_from_windows(windows: Iterable[ConversationWindowDocument]) -> lis
     return captured
 
 
-def compact_artifact(artifact: MeetingArtifactDocument, content_limit: int = 240) -> dict[str, Any]:
-    body_preview = (artifact.content or "")[:content_limit]
+def compact_artifact(artifact: MeetingArtifactDocument, content_limit: int | None = None) -> dict[str, Any]:
+    # Keep the full note unless a caller explicitly asks for a shorter slice.
+    # Reconcile still trims only when the model input would exceed its token budget.
+    content = artifact.content or ""
+    visible = content if content_limit is None else content[:content_limit]
     return {
         "artifactId": str(artifact.id),
         "artifactType": artifact.artifactType.value,
         "title": artifact.title,
-        "content": body_preview,
-        # Kept as a derived presentation field so the persistence schema stays
-        # unchanged.  It can never accidentally repeat the title unless the
-        # validated body itself did so.
-        "bodyPreview": body_preview,
+        "content": visible,
         "status": artifact.status.value,
         "resolution": artifact.resolution.value,
         "ownerText": artifact.ownerText,

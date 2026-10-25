@@ -19,6 +19,7 @@ def build_context_pack(bundle: SpaceContextBundle) -> dict[str, Any]:
         "tasks": [],
         "notes": [],
         "meetingHighlights": [],
+        "coverage": bundle.scopeDate if bundle.scopeMode == "date" and bundle.scopeDate else "whole space",
         "sourceStats": bundle.sourceStats.model_dump(),
     }
     used = _estimate_tokens(bundle.spaceName) + 80

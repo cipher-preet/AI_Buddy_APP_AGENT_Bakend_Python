@@ -55,6 +55,10 @@ async def ask_chat(
     )
 
 
+def _card_view(view: str | None) -> bool:
+    return view == "card"
+
+
 @router.get("/sessions")
 async def list_chat_sessions(
     user_id: str = Query(..., alias="userId"),
@@ -62,16 +66,20 @@ async def list_chat_sessions(
     meeting_id: str | None = Query(default=None, alias="meetingId"),
     limit: int = Query(default=20, ge=1, le=100),
     cursor: str | None = Query(default=None),
+    view: str | None = Query(default=None),
 ):
-    return await _call(list_chats_controller(user_id, space_id, limit, cursor, meeting_id))
+    return await _call(
+        list_chats_controller(user_id, space_id, limit, cursor, meeting_id, card=_card_view(view))
+    )
 
 
 @router.get("/sessions/{session_id}")
 async def load_chat_by_session_id(
     session_id: str,
     user_id: str = Query(..., alias="userId"),
+    view: str | None = Query(default=None),
 ):
-    return await _call(load_chat_controller(user_id, session_id))
+    return await _call(load_chat_controller(user_id, session_id, card=_card_view(view)))
 
 
 @router.get("")
@@ -80,13 +88,18 @@ async def list_chats(
     space_id: str | None = Query(default=None, alias="spaceId"),
     limit: int = Query(default=20, ge=1, le=100),
     cursor: str | None = Query(default=None),
+    view: str | None = Query(default=None),
 ):
-    return await _call(list_chats_controller(user_id, space_id, limit, cursor))
+    return await _call(list_chats_controller(user_id, space_id, limit, cursor, card=_card_view(view)))
 
 
 @router.get("/{chat_id}")
-async def load_chat(chat_id: str, user_id: str = Query(..., alias="userId")):
-    return await _call(load_chat_controller(user_id, chat_id))
+async def load_chat(
+    chat_id: str,
+    user_id: str = Query(..., alias="userId"),
+    view: str | None = Query(default=None),
+):
+    return await _call(load_chat_controller(user_id, chat_id, card=_card_view(view)))
 
 
 async def _call(awaitable):

@@ -88,13 +88,20 @@ def _normalize_days(raw_days: list[Any]) -> list[dict[str, Any]]:
             continue
         days.append(
             {
+                "id": _text(data.get("id"))[:80] or f"day-{index}",
                 "dayIndex": int(data.get("dayIndex") or index),
                 "dateLabel": _text(data.get("dateLabel"))[:80] or f"Day {index}",
+                "scheduledDate": _text(data.get("scheduledDate"))[:20],
                 "title": title[:160],
                 "focus": _text(data.get("focus"))[:320],
+                "category": _text(data.get("category"))[:40],
+                "minutes": data.get("minutes"),
                 "hours": data.get("hours"),
                 "tasks": tasks[:8],
                 "definitionOfDone": _text(data.get("definitionOfDone"))[:320],
+                "status": _text(data.get("status"))[:20],
+                "notes": _text(data.get("notes"))[:4000],
+                "example": bool(data.get("example")),
             }
         )
         if len(days) >= 16:
@@ -1272,19 +1279,35 @@ def _preserve_progress(previous: dict[str, Any] | None, plan: dict[str, Any]) ->
         return plan
     done_ids: set[str] = set()
     notes: dict[str, str] = {}
-    for day in previous.get("days") or []:
+    previous_days = list(previous.get("days") or [])
+    by_id = {str(day.get("id")): day for day in previous_days if day.get("id")}
+    by_index = {int(day.get("dayIndex") or 0): day for day in previous_days if day.get("dayIndex")}
+    for day in previous_days:
         for task in day.get("tasks") or []:
             if task.get("done") and task.get("id"):
                 done_ids.add(str(task["id"]))
             if task.get("id") and task.get("note"):
                 notes[str(task["id"])] = str(task["note"])
     for day in plan.get("days") or []:
+        previous_day = by_id.get(str(day.get("id") or "")) or by_index.get(int(day.get("dayIndex") or 0))
+        if isinstance(previous_day, dict):
+            for key in ("status", "scheduledDate", "notes", "completedOn", "category", "minutes"):
+                if previous_day.get(key) not in (None, "", []) and not day.get(key):
+                    day[key] = previous_day.get(key)
+            if previous_day.get("status") in {"done", "skipped", "reopened"}:
+                day["status"] = previous_day.get("status")
         for task in day.get("tasks") or []:
             task_id = str(task.get("id") or "")
             if task_id in done_ids:
                 task["done"] = True
             if task_id in notes:
                 task["note"] = notes[task_id]
+    if previous.get("appliedRecommendationIds") and not plan.get("appliedRecommendationIds"):
+        plan["appliedRecommendationIds"] = list(previous.get("appliedRecommendationIds") or [])
+    if previous.get("weeklyReflection") and not plan.get("weeklyReflection"):
+        plan["weeklyReflection"] = previous.get("weeklyReflection")
+    if previous.get("startedOn") and not plan.get("startedOn"):
+        plan["startedOn"] = previous.get("startedOn")
     return plan
 
 
@@ -1312,7 +1335,9 @@ def _attach_consultant_fields(plan: dict[str, Any], goal: dict[str, Any], valida
     ]
     plan["validationReport"] = validation or {}
     plan["provisional"] = bool((goal.get("gaps") or {}).get("provisional") or (validation or {}).get("provisional"))
-    return plan
+    from services.goals.workspace import annotate_execution
+
+    return annotate_execution(plan, goal)
 
 
 async def build_plan(goal: dict[str, Any], store: Any | None = None, *, force_refresh: bool = False, previous_plan: dict[str, Any] | None = None) -> dict[str, Any]:

@@ -7,6 +7,7 @@ from services.llm.router import get_llm_router
 from services.mindmap.log import mindmap_log
 from services.mindmap.redis_client import MindmapRedisConfigError, get_mindmap_redis_client
 from services.mindmap.schemas import MindmapStatus
+from services.mindmap.source_scope import SourceScope
 from services.mindmap.store import MindmapStore, public_mindmap_doc
 from services.plans.plan_limits import assert_plan_count_allowed
 from services.queue.streams import EventEnvelope, RedisStreamProducer
@@ -22,9 +23,16 @@ def openrouter_configured() -> bool:
     return False
 
 
-async def enqueue_mindmap_generation(database, *, user_id: str, space_id: str) -> dict:
+async def enqueue_mindmap_generation(
+    database,
+    *,
+    user_id: str,
+    space_id: str,
+    scope: SourceScope | None = None,
+) -> dict:
     store = MindmapStore(database)
-    active = await store.find_active(user_id, space_id)
+    scope = scope or SourceScope()
+    active = await store.find_active(user_id, space_id, scope=scope)
     if active is not None:
         mindmap_log(
             "enqueue_reuse_active",
@@ -53,7 +61,13 @@ async def enqueue_mindmap_generation(database, *, user_id: str, space_id: str) -
     await assert_plan_count_allowed(database, user_id=user_id, resource="mindmaps")
 
     job_id = str(uuid4())
-    reserved = await store.reserve(user_id=user_id, space_id=space_id, job_id=job_id)
+    stored_scope = scope.as_document()
+    reserved = await store.reserve(
+        user_id=user_id,
+        space_id=space_id,
+        job_id=job_id,
+        source_scope=stored_scope,
+    )
     mindmap_id = str(reserved["_id"])
 
     event = EventEnvelope(
@@ -63,7 +77,7 @@ async def enqueue_mindmap_generation(database, *, user_id: str, space_id: str) -
         userId=user_id,
         spaceId=space_id,
         conversationId=mindmap_id,
-        payload={"mindmapId": mindmap_id},
+        payload={"mindmapId": mindmap_id, "sourceScope": stored_scope},
     )
 
     try:

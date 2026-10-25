@@ -4,6 +4,7 @@ from services.mindmap.context_pack import build_context_pack, has_usable_context
 from services.mindmap.generator import MindmapGenerateError, generate_mindmap_graph
 from services.mindmap.log import mindmap_log
 from services.mindmap.schemas import MindmapStatus, SourceStats
+from services.mindmap.source_scope import empty_context_message, scope_from_stored
 from services.mindmap.sources import MindmapSource
 from services.mindmap.store import MindmapStore
 from services.queue.streams import EventEnvelope, NonRetryableQueueError
@@ -42,14 +43,20 @@ class MindmapJobHandler:
             return
 
         try:
+            scope = scope_from_stored(payload.get("sourceScope") or (doc or {}).get("sourceScope"))
+            gathering = (
+                f"Gathering notes, tasks, and transcripts for {scope.day_label}"
+                if scope.mode == "date" and scope.dates
+                else "Gathering notes, tasks, and transcripts"
+            )
             await self.store.update_progress(
                 mindmap_id,
                 status=MindmapStatus.GATHERING.value,
                 stage="gathering_context",
                 progress=20,
-                message="Gathering notes, tasks, and transcripts",
+                message=gathering,
             )
-            bundle = await self.sources.load(user_id, space_id)
+            bundle = await self.sources.load(user_id, space_id, scope=scope)
             pack = build_context_pack(bundle)
             await self.store.update_progress(
                 mindmap_id,
@@ -60,9 +67,7 @@ class MindmapJobHandler:
             )
 
             if not has_usable_context(pack):
-                raise NonRetryableQueueError(
-                    "No notes, tasks, or meeting transcripts found for this space yet."
-                )
+                raise NonRetryableQueueError(empty_context_message(scope))
 
             await self.store.update_progress(
                 mindmap_id,
@@ -95,6 +100,10 @@ class MindmapJobHandler:
                 nodeCount=len(graph.nodes),
                 model=model,
             )
+        except ValueError as error:
+            await self.store.mark_failed(mindmap_id, str(error))
+            mindmap_log("job_failed_nonretryable", mindmapId=mindmap_id, error=str(error)[:200])
+            raise NonRetryableQueueError(str(error)) from error
         except NonRetryableQueueError as error:
             await self.store.mark_failed(mindmap_id, str(error))
             mindmap_log("job_failed_nonretryable", mindmapId=mindmap_id, error=str(error)[:200])

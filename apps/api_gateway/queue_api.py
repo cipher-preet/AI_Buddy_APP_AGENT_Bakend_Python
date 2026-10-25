@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from apps.api_gateway.config.setting import settings
-from services.queue.redis_queue import SPEECH_QUEUE, redis_client
+from services.queue.redis_queue import SPEECH_JOB_TTL_SECONDS, SPEECH_QUEUE, redis_client
 from services.queue.streams import EventEnvelope
 
 
@@ -206,6 +206,7 @@ async def _accept_speech_job(event: EventEnvelope) -> JSONResponse:
         )
 
     await redis_client.hset(f"speech_job:{job_id}", mapping={key: str(value) for key, value in job.items() if value is not None})
+    await redis_client.expire(f"speech_job:{job_id}", SPEECH_JOB_TTL_SECONDS)
     await redis_client.lpush(SPEECH_QUEUE, json.dumps(job))
     await redis_client.hset(
         accepted_key,

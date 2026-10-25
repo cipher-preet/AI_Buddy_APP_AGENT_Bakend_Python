@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from contextvars import ContextVar
@@ -1115,7 +1116,9 @@ async def reconcile_artifacts(router: LLMRouter, candidates, incoming, window_te
 
 async def _classify_window_semantics(provider, model: str, window_text: str) -> list[dict[str, Any]]:
     """One bounded structured call; Python validates evidence IDs but infers no language meaning."""
-    cache_key = re.sub(r"\s+", " ", window_text or "").strip()
+    cache_key = hashlib.sha256(
+        re.sub(r"\s+", " ", window_text or "").strip().encode("utf-8")
+    ).hexdigest()
     if cache_key in _SEMANTIC_CLASSIFICATION_CACHE:
         return _SEMANTIC_CLASSIFICATION_CACHE[cache_key]
     try:

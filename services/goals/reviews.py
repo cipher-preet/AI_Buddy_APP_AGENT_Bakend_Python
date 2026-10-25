@@ -294,6 +294,9 @@ def apply_coach_updates(plan: dict[str, Any], drafted: dict[str, Any]) -> dict[s
     recommendation = str(drafted.get("recommendation") or "").strip()
     if recommendation:
         next_plan["recommendation"] = recommendation[:1200]
+    focus = str(drafted.get("focus") or "").strip()
+    if focus:
+        next_plan["coachNote"] = focus[:320]
     return next_plan
 
 

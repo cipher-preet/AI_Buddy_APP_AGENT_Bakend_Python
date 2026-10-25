@@ -99,13 +99,20 @@ class DayTask(BaseModel):
 
 
 class PlanDay(BaseModel):
+    id: str = ""
     dayIndex: int = 1
     dateLabel: str = ""
+    scheduledDate: str = ""
     title: str
     focus: str = ""
+    category: str = ""
+    minutes: int | None = None
     hours: float | None = None
     tasks: list[DayTask] = Field(default_factory=list)
     definitionOfDone: str = ""
+    status: str = ""
+    notes: str = ""
+    example: bool = False
 
 
 class PlanStrategy(BaseModel):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import OrderedDict
 from typing import Any
 
 import httpx
@@ -11,7 +12,8 @@ import httpx
 from apps.api_gateway.config.setting import settings
 from services.reminders.language import is_hindi_text
 
-_CACHE: dict[str, dict[str, str]] = {}
+_CACHE: OrderedDict[str, dict[str, str]] = OrderedDict()
+_CACHE_LIMIT = 32
 _LOCK = asyncio.Lock()
 _DEEPGRAM_SPEAK_URL = "https://api.deepgram.com/v1/speak"
 
@@ -23,15 +25,20 @@ async def synthesize_speech(text: str) -> dict[str, str] | None:
 
     cached = _CACHE.get(cleaned)
     if cached:
+        _CACHE.move_to_end(cleaned)
         return cached
 
     async with _LOCK:
         cached = _CACHE.get(cleaned)
         if cached:
+            _CACHE.move_to_end(cleaned)
             return cached
         audio = await _speak(cleaned)
         if audio:
             _CACHE[cleaned] = audio
+            _CACHE.move_to_end(cleaned)
+            while len(_CACHE) > _CACHE_LIMIT:
+                _CACHE.popitem(last=False)
         return audio
 
 

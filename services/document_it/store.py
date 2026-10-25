@@ -10,6 +10,7 @@ from pymongo import ReturnDocument
 from apps.api_gateway.config.setting import settings
 from services.conversation.models import utc_now
 from services.conversation.repository import mongo_id_candidates
+from services.mindmap.source_scope import SourceScope, active_scope_filter
 from services.document_it.schemas import (
     ACTIVE_STATUSES,
     PIPELINE_VERSION,
@@ -81,16 +82,18 @@ class DocumentStore:
         space_id: str,
         *,
         template_code: str,
+        scope: SourceScope | None = None,
     ) -> dict[str, Any] | None:
+        query: dict[str, Any] = {
+            "userId": {"$in": mongo_id_candidates(user_id)},
+            "spaceId": {"$in": mongo_id_candidates(space_id)},
+            "templateCode": str(template_code),
+            "status": {"$in": list(ACTIVE_STATUSES)},
+        }
+        if scope is not None:
+            query.update(active_scope_filter(scope))
         docs = await (
-            self.collection.find(
-                {
-                    "userId": {"$in": mongo_id_candidates(user_id)},
-                    "spaceId": {"$in": mongo_id_candidates(space_id)},
-                    "templateCode": str(template_code),
-                    "status": {"$in": list(ACTIVE_STATUSES)},
-                }
-            )
+            self.collection.find(query)
             .sort([("updatedAt", -1)])
             .limit(5)
             .to_list(length=5)
@@ -130,6 +133,7 @@ class DocumentStore:
         job_id: str,
         template_code: str,
         template_title: str,
+        source_scope: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = utc_now()
         document_id = str(uuid4())
@@ -141,6 +145,7 @@ class DocumentStore:
             "jobId": str(job_id),
             "templateCode": str(template_code),
             "templateTitle": str(template_title),
+            "sourceScope": source_scope or {"mode": "space"},
             "status": DocumentStatus.QUEUED.value,
             "stage": "queued",
             "progress": 5,
@@ -288,8 +293,22 @@ class DocumentStore:
         space_id: str,
         *,
         limit: int = 24,
+        card: bool = False,
     ) -> list[dict[str, Any]]:
         capped = max(1, min(int(limit), 50))
+        projection = (
+            {
+                "status": 1,
+                "templateCode": 1,
+                "templateTitle": 1,
+                "preview": 1,
+                "fileName": 1,
+                "updatedAt": 1,
+                "createdAt": 1,
+            }
+            if card
+            else LIST_OMIT
+        )
         return await (
             self.collection.find(
                 {
@@ -297,7 +316,7 @@ class DocumentStore:
                     "spaceId": {"$in": mongo_id_candidates(space_id)},
                     "status": DocumentStatus.READY.value,
                 },
-                LIST_OMIT,
+                projection,
             )
             .sort([("updatedAt", -1), ("version", -1)])
             .limit(capped)
@@ -350,6 +369,7 @@ def public_document_doc(doc: dict[str, Any] | None, *, include_docx: bool = Fals
     payload["documentId"] = str(payload.get("_id") or "")
     payload["_id"] = str(payload.get("_id") or "")
     payload.pop("claimedBy", None)
+    payload.pop("sourceScope", None)
     if not include_docx:
         payload.pop("docxBase64", None)
     payload["hasDocx"] = bool(doc.get("docxBase64") or doc.get("docxBytes"))
@@ -365,3 +385,23 @@ def public_document_summary(doc: dict[str, Any] | None) -> dict[str, Any] | None
     if not payload.get("preview"):
         payload["preview"] = build_document_preview(None)
     return payload
+
+
+def public_document_card(doc: dict[str, Any] | None) -> dict[str, Any] | None:
+    summary = public_document_summary(doc)
+    if not summary:
+        return None
+    preview = summary.get("preview") if isinstance(summary.get("preview"), dict) else {}
+    return {
+        "documentId": summary.get("documentId"),
+        "status": summary.get("status"),
+        "templateCode": summary.get("templateCode"),
+        "templateTitle": summary.get("templateTitle"),
+        "preview": {
+            "title": preview.get("title"),
+            "excerpt": preview.get("excerpt"),
+        },
+        "fileName": summary.get("fileName"),
+        "updatedAt": summary.get("updatedAt"),
+        "createdAt": summary.get("createdAt"),
+    }

@@ -66,10 +66,12 @@ class Settings(BaseSettings):
     OPENROUTER_MAX_RPD: int = 200
 
     # NVIDIA NIM cloud (OpenAI-compatible). Docs: https://docs.api.nvidia.com/
-    # Model page: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b
+    # Nemotron 3 Super (nvidia/nemotron-3-super-120b-a12b) was retired on 2026-10-20
+    # and chat completions return HTTP 404. Replacement:
+    # https://build.nvidia.com/nvidia/nemotron-3.5-super-vl-120b-a12b
     NVIDIA_API_KEY: SecretStr | str = ""
     NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
-    NVIDIA_DEFAULT_MODEL: str = "nvidia/nemotron-3-super-120b-a12b"
+    NVIDIA_DEFAULT_MODEL: str = "nvidia/nemotron-3.5-super-vl-120b-a12b"
     NVIDIA_MAX_RPM: int = 20
     NVIDIA_MAX_RPD: int = 200
 
@@ -193,9 +195,9 @@ class Settings(BaseSettings):
     GOAL_KNOWLEDGE_TTL_STABLE_DAYS: int = Field(default=30, ge=1, le=365)
     GOAL_KNOWLEDGE_TTL_VOLATILE_DAYS: int = Field(default=7, ge=1, le=90)
 
-    # Mindmap: official NVIDIA Nemotron 3 Super first, then Krutrim fallbacks.
+    # Mindmap: official NVIDIA Nemotron 3.5 Super VL first, then Krutrim fallbacks.
     MINDMAP_MODELS: str = (
-        "nvidia:nvidia/nemotron-3-super-120b-a12b,"
+        "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b,"
         "krutrim:gemma-4-31b-it,"
         "krutrim:gpt-oss-20b"
     )
@@ -209,9 +211,9 @@ class Settings(BaseSettings):
     MINDMAP_ITEM_BODY_CHARS: int = Field(default=280, ge=40, le=4000)
     MINDMAP_TRANSCRIPT_CHARS: int = Field(default=1200, ge=100, le=20000)
 
-    # Document-it: official NVIDIA Nemotron 3 Super first, then Krutrim fallbacks.
+    # Document-it: official NVIDIA Nemotron 3.5 Super VL first, then Krutrim fallbacks.
     DOCUMENT_MODELS: str = (
-        "nvidia:nvidia/nemotron-3-super-120b-a12b,"
+        "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b,"
         "krutrim:gemma-4-31b-it,"
         "krutrim:gpt-oss-20b"
     )

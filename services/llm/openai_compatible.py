@@ -35,6 +35,14 @@ from services.llm.schema_adapter import (
 )
 
 
+# NVIDIA retired this hosted function on 2026-10-20. Chat completions return
+# HTTP 404 ("Function not found") even if GET /v1/models still lists the old id.
+# https://build.nvidia.com/nvidia/nemotron-3.5-super-vl-120b-a12b
+_NVIDIA_RETIRED_MODELS = {
+    "nvidia/nemotron-3-super-120b-a12b": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+}
+
+
 class OpenAICompatibleProvider:
     def __init__(
         self,
@@ -77,6 +85,11 @@ class OpenAICompatibleProvider:
     def transport_debug(self) -> dict[str, Any]:
         return {"provider": self.name, **self._transport.debug()}
 
+    def _resolve_model(self, model: str) -> str:
+        if self.name != "nvidia":
+            return model
+        return _NVIDIA_RETIRED_MODELS.get(model, model)
+
     async def _http_client(self) -> httpx.AsyncClient:
         return await self._transport.get()
 
@@ -84,13 +97,19 @@ class OpenAICompatibleProvider:
         await self._transport.aclose()
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
-        model = request.model or self.default_model
+        model = self._resolve_model(request.model or self.default_model)
         payload: dict[str, Any] = {
             "model": model,
             "messages": [message.model_dump() for message in request.messages],
             "temperature": request.temperature,
         }
         payload.update(request.metadata.get("extra_body") or {})
+        if self.name == "nvidia":
+            # Nemotron 3.5 thinks by default and can leave message.content empty.
+            # Documents and mindmaps need the answer in content.
+            template = dict(payload.get("chat_template_kwargs") or {})
+            template.setdefault("enable_thinking", False)
+            payload["chat_template_kwargs"] = template
         # OpenRouter free/Nemotron: never send response_format; cap reasoning.max_tokens
         # (OpenRouter forbids sending effort and max_tokens together).
         if self.name == "openrouter" and openrouter_prefers_plain_json(model):
@@ -149,7 +168,7 @@ class OpenAICompatibleProvider:
         response_schema: type[BaseModel],
     ) -> BaseModel:
         schema_name = request.schema_name or response_schema.__name__
-        model = request.model or self.default_model
+        model = self._resolve_model(request.model or self.default_model)
         plan = build_structured_plan(self.name, model, response_schema, schema_name)
         last_error: Exception | None = None
         for index, attempt in enumerate(plan.attempts):
@@ -198,7 +217,7 @@ class OpenAICompatibleProvider:
         extra_body = dict(structured_request.metadata.get("extra_body") or {})
         extra_body.pop("response_format", None)
         extra_body.update(attempt.extra_body or {})
-        model = structured_request.model or self.default_model
+        model = self._resolve_model(structured_request.model or self.default_model)
         if self.name == "openrouter" and openrouter_prefers_plain_json(model):
             # Force prompt-only JSON — never attach response_format for free/Nemotron.
             attempt_response_format = None
@@ -227,7 +246,7 @@ class OpenAICompatibleProvider:
         schema_name: str,
         mode: str,
     ) -> StructuredLLMRequest:
-        plan = build_structured_plan(self.name, request.model or self.default_model, None, schema_name)
+        plan = build_structured_plan(self.name, self._resolve_model(request.model or self.default_model), None, schema_name)
         for attempt in plan.attempts:
             if attempt.mode == mode:
                 return self._request_from_attempt(request, attempt)
@@ -247,7 +266,7 @@ class OpenAICompatibleProvider:
         structured_request.metadata.setdefault("extra_body", {})
         extra_body = dict(structured_request.metadata.get("extra_body") or {})
         extra_body.pop("response_format", None)
-        model = structured_request.model or self.default_model
+        model = self._resolve_model(structured_request.model or self.default_model)
         effective_format = response_format
         if self.name == "openrouter" and openrouter_prefers_plain_json(model):
             effective_format = None
