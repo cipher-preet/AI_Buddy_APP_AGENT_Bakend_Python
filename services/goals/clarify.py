@@ -10,8 +10,6 @@ from services.goals.schemas import GoalClarifyResult, GoalNextStep, GoalOption
 from services.goals.understanding import (
     apply_message_answers,
     draft_from_understanding,
-    next_interview_question,
-    ready_for_spaces,
     understand_goal,
 )
 from services.llm.models import LLMMessage, StructuredLLMRequest
@@ -36,18 +34,6 @@ def _step(step_id: str, prompt: str, control: str, options: list[dict[str, str]]
         "findings": [],
         "milestones": [],
     }
-
-
-def _space_step(title: str) -> dict[str, Any]:
-    return _step(
-        "choose-spaces",
-        (
-            f"Choose a Space for “{title}”. "
-            "I’ll use that Space later to shape your recommended steps, recommendations, and strategies "
-            "from what is already there."
-        ),
-        "space_picker",
-    )
 
 
 def detect_goal_type(statement: str, explicit: str = "", domain: str = "") -> str:
@@ -101,9 +87,13 @@ def fallback_clarify(goal: dict[str, Any], assistant_turns: int) -> dict[str, An
     if assistant_turns >= settings.GOAL_MAX_CLARIFY_TURNS or _understood(goal):
         return {
             "draft": draft,
-            "status": "AWAITING_SPACE",
+            "status": "READY_FOR_PLAN",
             "completeness": 75,
-            "step": _space_step(title),
+            "step": _step(
+                "build-plan",
+                "I'll build the plan from your answers and the deadline. No Space is used.",
+                "brief",
+            ),
             "model": "fallback",
         }
 
@@ -311,9 +301,13 @@ def fallback_clarify(goal: dict[str, Any], assistant_turns: int) -> dict[str, An
 
     return {
         "draft": draft,
-        "status": "AWAITING_SPACE",
+        "status": "READY_FOR_PLAN",
         "completeness": 78,
-        "step": _space_step(title),
+        "step": _step(
+            "build-plan",
+            "I'll build the plan from your answers and the deadline. No Space is used.",
+            "brief",
+        ),
         "model": "fallback",
     }
 
@@ -328,14 +322,9 @@ def _draft_updates(goal: dict[str, Any], result: GoalClarifyResult) -> dict[str,
             # Prefer a richer rewrite once the model is confident.
             if len(incoming) >= len(_text(goal.get(field))):
                 updates[field] = incoming[:2000 if field == "description" else 1000]
-    understanding = goal.get("understanding") if isinstance(goal.get("understanding"), dict) else {}
-    goal_type = detect_goal_type(
-        _text(goal.get("statement")),
-        _text(result.goalType) or _text(goal.get("goalType")),
-        str((understanding or {}).get("domain") or ""),
-    )
+    goal_type = _text(result.goalType) or _text(goal.get("goalType"))
     if goal_type:
-        updates["goalType"] = goal_type
+        updates["goalType"] = goal_type[:40]
     profile_updates: dict[str, Any] = {}
     if _text(result.currentRole) and not is_skip_answer(result.currentRole):
         profile_updates["currentRole"] = result.currentRole[:240]
@@ -368,41 +357,24 @@ def _draft_updates(goal: dict[str, Any], result: GoalClarifyResult) -> dict[str,
     return updates
 
 
+def _ready_step(updates: dict[str, Any]) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    step = _step("build-plan", "I'll build the plan from what you told me.", "brief")
+    step["allowFreeText"] = False
+    updates["completeness"] = max(int(updates.get("completeness") or 0), 75)
+    updates["pipelineState"] = "READY_FOR_RESEARCH"
+    return updates, "READY_FOR_PLAN", step
+
+
 def _public_step(result: GoalClarifyResult, goal: dict[str, Any], assistant_turns: int) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    """Use the model's question. The model chooses the fact. A fixed field list does not."""
     updates = _draft_updates(goal, result)
-    merged = {**goal, **updates}
     at_cap = assistant_turns + 1 >= settings.GOAL_MAX_CLARIFY_TURNS
-    model_wants_spaces = bool(result.needsSpaces or result.nextStep.control == "space_picker" or result.readyForBaseline)
+    control = result.nextStep.control if result.nextStep.control in CONTROLS - {"space_picker"} else "text"
+    step_id = result.nextStep.stepId.strip()[:40]
+    ready = at_cap or result.readyForBaseline or control == "brief" or step_id in {"approach", "build-plan"}
+    if ready:
+        return _ready_step(updates)
 
-    # Stay in consultant mode until the goal is actually understood.
-    if not _understood(merged) and not at_cap:
-        if model_wants_spaces or result.nextStep.control == "space_picker":
-            fallback = fallback_clarify(merged, assistant_turns)
-            return updates, "CLARIFYING", fallback["step"]
-        control = result.nextStep.control if result.nextStep.control in CONTROLS - {"space_picker"} else "text"
-        options = [
-            {"id": option.id.strip()[:40] or f"option-{index}", "label": option.label.strip()[:160]}
-            for index, option in enumerate(result.nextStep.options)
-            if option.label.strip()
-        ][:6]
-        if control in {"single_select", "multi_select"} and not options:
-            control = "text"
-        prompt = result.nextStep.prompt.strip()[:500]
-        if not prompt:
-            fallback = fallback_clarify(merged, assistant_turns)
-            return updates, "CLARIFYING", fallback["step"]
-        step = _step(result.nextStep.stepId.strip()[:40] or "question", prompt, control, options)
-        return updates, "CLARIFYING", step
-
-    if at_cap or model_wants_spaces or _understood(merged):
-        title = _named_thing(merged)
-        prompt = result.nextStep.prompt if result.nextStep.control == "space_picker" and result.nextStep.prompt else ""
-        step = _space_step(title)
-        if prompt and "space" in prompt.lower():
-            step["prompt"] = prompt[:500]
-        return updates | {"completeness": max(int(updates.get("completeness") or 0), 75)}, "AWAITING_SPACE", step
-
-    control = result.nextStep.control if result.nextStep.control in CONTROLS else "text"
     options = [
         {"id": option.id.strip()[:40] or f"option-{index}", "label": option.label.strip()[:160]}
         for index, option in enumerate(result.nextStep.options)
@@ -410,7 +382,12 @@ def _public_step(result: GoalClarifyResult, goal: dict[str, Any], assistant_turn
     ][:6]
     if control in {"single_select", "multi_select"} and not options:
         control = "text"
-    step = _step(result.nextStep.stepId.strip()[:40] or "question", result.nextStep.prompt.strip()[:500], control, options)
+    prompt = result.nextStep.prompt.strip()[:500]
+    if not prompt:
+        prompt = "What else should the plan know so it matches what you want to achieve? Skip anything that would not change the plan."
+        control = "text"
+        options = []
+    step = _step(step_id or "detail", prompt, control, options)
     return updates, "CLARIFYING", step
 
 
@@ -450,8 +427,8 @@ async def _call_model(goal: dict[str, Any], messages: list[dict[str, Any]]) -> t
             if _text(row.get("text"))
         ],
         "instruction": (
-            "Ask one high-leverage missing question only, or send them to Space if the outcome is clear "
-            "and extra questions would not change the first plan. Allow skip. Do not restart from zero."
+            "This can be any kind of goal. Decide the one missing fact that would change the plan, or stop. "
+            "Do not use a fixed questionnaire. Do not ask for a Space. Allow skip."
         ),
     }
     llm_messages = [
@@ -496,45 +473,28 @@ async def build_clarify_step(goal: dict[str, Any], messages: list[dict[str, Any]
     seeded = draft_from_understanding(goal, understanding, profile)
     working = {**goal, **seeded, "contextProfile": profile, "understanding": understanding}
 
-    if ready_for_spaces(working, understanding, profile, messages) or assistant_turns >= settings.GOAL_MAX_CLARIFY_TURNS:
-        title = _named_thing(working)
-        seeded["completeness"] = max(int(seeded.get("completeness") or 0), 75)
-        seeded["pipelineState"] = "READY_FOR_RESEARCH"
-        return {
-            "draft": seeded,
-            "status": "AWAITING_SPACE",
-            "step": _space_step(title),
-            "model": "understand",
-        }
+    if assistant_turns >= settings.GOAL_MAX_CLARIFY_TURNS:
+        updates, status, step = _ready_step(seeded)
+        return {"draft": updates, "status": status, "step": step, "model": "understand"}
 
-    question = next_interview_question(working, understanding, profile, messages)
     called = await _call_model(working, messages)
     if called is not None:
-        result, model = called
+        result, model_name = called
         updates, status, step = _public_step(result, working, assistant_turns)
-        updates = {**seeded, **updates, "understanding": understanding, "contextProfile": profile}
-        if status == "AWAITING_SPACE":
-            updates["pipelineState"] = "READY_FOR_RESEARCH"
-            updates["completeness"] = max(int(updates.get("completeness") or 0), 75)
-            return {"draft": updates, "status": status, "step": step, "model": model}
-        if _text(step.get("prompt")) and step.get("control") != "space_picker":
-            updates["pipelineState"] = "NEEDS_CONTEXT"
-            return {"draft": updates, "status": "CLARIFYING", "step": step, "model": model}
+        return {"draft": {**seeded, **updates}, "status": status, "step": step, "model": model_name}
 
-    if question is not None:
-        options = [{"id": option.id, "label": option.label} for option in question.options]
-        seeded["completeness"] = max(int(working.get("completeness") or 0), 25)
-        seeded["pipelineState"] = "NEEDS_CONTEXT"
-        return {
-            "draft": seeded,
-            "status": "CLARIFYING",
-            "step": _step(question.stepId, question.prompt, question.control, options or None),
-            "model": "interview",
-        }
-
-    fallback = fallback_clarify(working, assistant_turns)
-    fallback["draft"] = {**seeded, **(fallback.get("draft") or {})}
-    return fallback
+    seeded["completeness"] = min(70, 20 + assistant_turns * 12)
+    seeded["pipelineState"] = "NEEDS_CONTEXT"
+    return {
+        "draft": seeded,
+        "status": "CLARIFYING",
+        "step": _step(
+            "detail",
+            "What else should the plan know so it matches what you want to achieve? Skip anything that would not change the plan.",
+            "text",
+        ),
+        "model": "fallback",
+    }
 
 
 def normalize_step(step: GoalNextStep | dict[str, Any]) -> dict[str, Any]:

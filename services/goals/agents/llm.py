@@ -14,19 +14,18 @@ T = TypeVar("T", bound=BaseModel)
 
 
 def goal_context_payload(goal: dict[str, Any]) -> dict[str, Any]:
-    from services.goals.clarify import detect_goal_type
+    from services.goals.brief import stated_deadline
     from services.goals.domains import context_profile, understanding_as_dict
 
     statement = str(goal.get("statement") or "").strip()
     understanding = understanding_as_dict(goal.get("understanding"))
-    return {
+    profile = context_profile(goal)
+    stated = stated_deadline(goal)
+    level = str(profile.get("startingLevel") or profile.get("currentRole") or understanding.get("startingLevel") or "").strip()
+    payload = {
         "title": goal.get("title"),
         "statement": statement,
-        "goalType": detect_goal_type(
-            statement,
-            str(goal.get("goalType") or "").strip(),
-            str(understanding.get("domain") or ""),
-        ),
+        "goalType": str(goal.get("goalType") or understanding.get("goalType") or "").strip(),
         "description": goal.get("description") or goal.get("category") or "",
         "audience": goal.get("audience") or "",
         "targetMetric": goal.get("targetMetric") or "",
@@ -43,7 +42,12 @@ def goal_context_payload(goal: dict[str, Any]) -> dict[str, Any]:
         "gaps": goal.get("gaps") or {},
         "researchSummary": goal.get("researchSummary") or {},
         "planIsProvisional": bool((goal.get("gaps") or {}).get("provisional")),
+        "startingPoint": level,
     }
+    if stated is not None:
+        payload["deadlineDays"] = stated[0]
+        payload["deadlineLabel"] = stated[1]
+    return payload
 
 
 def provider_pairs() -> list[tuple[str, str]]:
@@ -55,6 +59,13 @@ def provider_pairs() -> list[tuple[str, str]]:
     ]
 
 
+def goal_step_pairs() -> list[tuple[str, str]]:
+    """Step evaluation and rewriting use Krutrim gpt-oss-120b, then Gemma if it fails."""
+    primary = (settings.GOAL_STEP_PROVIDER.strip(), settings.GOAL_STEP_MODEL.strip())
+    fallback = (settings.GOAL_STEP_FALLBACK_PROVIDER.strip(), settings.GOAL_STEP_FALLBACK_MODEL.strip())
+    return [primary, fallback]
+
+
 async def call_goal_agent(
     *,
     prompt_name: str,
@@ -63,6 +74,7 @@ async def call_goal_agent(
     stage: str,
     temperature: float = 0.3,
     max_tokens: int = 4500,
+    pairs: list[tuple[str, str]] | None = None,
 ) -> tuple[T, str] | None:
     router = get_llm_router()
     llm_messages = [
@@ -70,7 +82,7 @@ async def call_goal_agent(
         LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False, default=str)),
     ]
     seen: set[tuple[str, str]] = set()
-    for provider_name, model in provider_pairs():
+    for provider_name, model in pairs if pairs is not None else provider_pairs():
         key = (provider_name, model)
         if not provider_name or not model or key in seen:
             continue
@@ -96,6 +108,7 @@ async def call_goal_agent(
                     "provider": provider_name,
                     "model": model,
                     "error": type(error).__name__,
+                    "detail": str(error)[:240],
                 },
                 flush=True,
             )

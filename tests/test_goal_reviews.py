@@ -69,12 +69,13 @@ def test_space_findings_tag_done_tasks_as_output():
     assert ("transcript", "OUTPUT") in kinds
 
 
-def test_fallback_coach_prefers_open_space_task():
+def test_fallback_coach_uses_the_plan_not_space_tasks():
     goal = {
         "title": "Become a ZSM",
         "approvedPlan": {
             "strategies": [{"id": "s1", "title": "Banking path", "body": "Build branch credibility"}],
             "priorityRecommendations": [{"title": "Old rec", "reason": "stale"}],
+            "days": [{"title": "Write one proof story", "status": "open"}],
         },
     }
     context = {
@@ -84,9 +85,10 @@ def test_fallback_coach_prefers_open_space_task():
         "transcripts": [],
     }
     drafted = fallback_coach(goal, context, [])
-    titles = " ".join(item["title"] for item in drafted["priorityRecommendations"])
-    assert "JAIIB" in titles
-    assert "Career" in drafted["focus"] or "JAIIB" in drafted["focus"]
+    blob = str(drafted).lower()
+    assert "jaiib" not in blob
+    assert "credit risk" not in blob
+    assert "write one proof story" in drafted["focus"].lower()
 
 
 def test_apply_coach_updates_keeps_days():
@@ -189,7 +191,7 @@ class _FakeStore:
 
 
 @pytest.mark.asyncio
-async def test_build_review_ingests_space_and_writes_snapshot(monkeypatch):
+async def test_build_review_uses_the_plan_and_writes_snapshot(monkeypatch):
     from services.goals import reviews as reviews_mod
 
     goal = {
@@ -207,27 +209,20 @@ async def test_build_review_ingests_space_and_writes_snapshot(monkeypatch):
     }
     store = _FakeStore(goal)
 
-    async def fake_space(*_args, **_kwargs):
-        return {
-            "spaces": [{"id": "space-1", "name": "Career"}],
-            "tasks": [{"sourceId": "t1", "title": "JAIIB chapter", "status": "completed", "detail": ""}],
-            "notes": [{"sourceId": "n1", "title": "Credit risk", "detail": "Need practice cases"}],
-            "transcripts": [{"sourceId": "c1", "title": "Discussed mock interviews", "detail": "Discussed mock interviews"}],
-        }
-
     async def no_model(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(reviews_mod, "load_space_context", fake_space)
     monkeypatch.setattr(reviews_mod, "_model_review", no_model)
 
     await reviews_mod.build_review(store, goal, "daily", "2026-10-12")
 
-    assert store.db.goal_evidence.rows
     assert store.db.goal_reviews.rows[0]["summary"]
     snapshot = store.db.goal_snapshots.rows[0]
     assert snapshot["periodKey"] == "2026-10-12"
     assert snapshot["target"] == 100
     assert isinstance(snapshot["actual"], int)
-    recs = " ".join(item["title"] for item in store.goal["approvedPlan"]["priorityRecommendations"])
-    assert "Credit risk" in recs or "JAIIB" in recs
+    recs = " ".join(item["title"] for item in store.goal["approvedPlan"]["priorityRecommendations"]).lower()
+    summary = store.db.goal_reviews.rows[0]["summary"].lower()
+    assert "jaiib" not in recs
+    assert "credit risk" not in recs
+    assert "space" not in summary

@@ -9,6 +9,7 @@ from services.goals.agents.pipeline import (
     wants_expert_pipeline,
 )
 from services.goals.domains import detect_goal_type
+from services.goals.quality import tighten_plan
 from services.goals.schemas import (
     GoalExecutionResult,
     GoalStrategistResult,
@@ -54,7 +55,7 @@ def _normalize_milestones(raw_milestones: list[Any], timeframe: str) -> list[dic
             due = _text(item.dueLabel) or timeframe or "Later"
             deps = [_text(text) for text in (item.dependencies or []) if _text(text)]
         if not criteria:
-            criteria = ["This phase’s outcome is completed and can be shown"]
+            criteria = [title[:240]]
         milestones.append(_milestone(title, criteria, due, deps))
         if len(milestones) >= 8:
             break
@@ -78,20 +79,29 @@ def _normalize_days(raw_days: list[Any]) -> list[dict[str, Any]]:
                 {
                     "id": _text(task_data.get("id")) or _slug(f"d{index}-t", task_index),
                     "text": text[:240],
-                    "done": bool(task_data.get("done")),
+                    "done": False,
                     "why": _text(task_data.get("why"))[:480],
                     "definitionOfDone": _text(task_data.get("definitionOfDone"))[:320],
-                    "note": _text(task_data.get("note"))[:2000],
+                    "note": "",
                 }
             )
         if not tasks:
-            continue
+            tasks.append(
+                {
+                    "id": _slug(f"d{index}-t", 1),
+                    "text": title[:240],
+                    "done": False,
+                    "why": "This is the work for this step.",
+                    "definitionOfDone": title[:240],
+                    "note": "",
+                }
+            )
         days.append(
             {
                 "id": _text(data.get("id"))[:80] or f"day-{index}",
                 "dayIndex": int(data.get("dayIndex") or index),
                 "dateLabel": _text(data.get("dateLabel"))[:80] or f"Day {index}",
-                "scheduledDate": _text(data.get("scheduledDate"))[:20],
+                "scheduledDate": "",
                 "title": title[:160],
                 "focus": _text(data.get("focus"))[:320],
                 "category": _text(data.get("category"))[:40],
@@ -99,9 +109,9 @@ def _normalize_days(raw_days: list[Any]) -> list[dict[str, Any]]:
                 "hours": data.get("hours"),
                 "tasks": tasks[:8],
                 "definitionOfDone": _text(data.get("definitionOfDone"))[:320],
-                "status": _text(data.get("status"))[:20],
-                "notes": _text(data.get("notes"))[:4000],
-                "example": bool(data.get("example")),
+                "status": "open",
+                "notes": "",
+                "example": False,
             }
         )
         if len(days) >= 16:
@@ -366,7 +376,7 @@ def _degraded_plan(goal: dict[str, Any]) -> dict[str, Any]:
                         "id": f"m{index}-t{task_i}",
                         "text": text,
                         "done": False,
-                        "why": "This is the next honest step given current evidence.",
+                        "why": f"Do this as part of {milestone['title']}.",
                         "definitionOfDone": text,
                     }
                     for task_i, text in enumerate(milestone["successCriteria"], start=1)
@@ -1136,7 +1146,9 @@ def _fallback_plan(goal: dict[str, Any]) -> dict[str, Any]:
     plan["priorityRecommendations"] = _normalize_priority_recommendations(
         list(plan.get("priorityRecommendations") or [])
     )
-    return plan
+    from services.goals.brief import apply_plan_brief
+
+    return apply_plan_brief(plan, goal)
 
 
 def assemble_expert_plan(
@@ -1270,7 +1282,74 @@ def assemble_expert_plan(
     }
     if _is_generic_plan(milestones) or _is_thin_expert(plan):
         print("goal expert plan rejected as thin/generic; using domain fallback", flush=True)
-        return _fallback_plan(goal)
+        return tighten_plan(_fallback_plan(goal), goal)
+    return tighten_plan(plan, goal)
+
+
+def _days_from_milestones(milestones: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    days: list[dict[str, Any]] = []
+    for index, milestone in enumerate(milestones, start=1):
+        title = _text(milestone.get("title")) or f"Step {index}"
+        criteria = [_text(item) for item in (milestone.get("successCriteria") or []) if _text(item)]
+        tasks = [
+            {
+                "id": f"step-{index}-t{task_index}",
+                "text": text[:240],
+                "done": False,
+                "why": f"This is the work inside “{title}”.",
+                "definitionOfDone": text[:240],
+                "note": "",
+            }
+            for task_index, text in enumerate(criteria[:4] or [title], start=1)
+        ]
+        days.append(
+            {
+                "id": f"day-{index}",
+                "dayIndex": index,
+                "dateLabel": _text(milestone.get("dueLabel"))[:80] or f"Step {index}",
+                "scheduledDate": "",
+                "title": title[:160],
+                "focus": criteria[0][:320] if criteria else title[:320],
+                "category": "Step",
+                "minutes": 45,
+                "hours": None,
+                "tasks": tasks,
+                "definitionOfDone": (criteria[0] if criteria else title)[:320],
+                "status": "open",
+                "notes": "",
+                "example": False,
+            }
+        )
+    return days
+
+
+def _ensure_open_steps(plan: dict[str, Any]) -> dict[str, Any]:
+    """A new plan must contain steps the user can start. Model 'done' flags are ignored."""
+    days = [day for day in (plan.get("days") or []) if isinstance(day, dict) and _text(day.get("title"))]
+    if not days:
+        days = _days_from_milestones([item for item in (plan.get("milestones") or []) if isinstance(item, dict)])
+    for day in days:
+        if day.get("completedOn"):
+            continue
+        day["status"] = "open"
+        day["done"] = False
+        tasks = [task for task in (day.get("tasks") or []) if isinstance(task, dict) and _text(task.get("text"))]
+        if not tasks:
+            title = _text(day.get("title"))
+            tasks = [
+                {
+                    "id": f"{day.get('id') or 'day'}-t1",
+                    "text": title[:240],
+                    "done": False,
+                    "why": "This is the work for this step.",
+                    "definitionOfDone": title[:240],
+                    "note": "",
+                }
+            ]
+        for task in tasks:
+            task["done"] = False
+        day["tasks"] = tasks
+    plan["days"] = days
     return plan
 
 
@@ -1315,9 +1394,34 @@ async def prepare_plan_context(store: Any | None, goal: dict[str, Any], *, force
     from services.goals.gaps import analyze_gaps
     from services.goals.research import compact_evidence_pack, run_research
 
-    research = await run_research(store, goal, force_refresh=force_refresh)
+    try:
+        research = await run_research(store, goal, force_refresh=force_refresh)
+    except Exception as error:
+        print(
+            "goal research failed; planning from user context only",
+            {"error": type(error).__name__, "detail": str(error)[:240]},
+            flush=True,
+        )
+        research = {"evidence": [], "summary": {"status": "unavailable"}, "sources": []}
     evidence = list(research.get("evidence") or [])
-    gaps = await analyze_gaps(goal, evidence)
+    try:
+        gaps = await analyze_gaps(goal, evidence)
+    except Exception as error:
+        print(
+            "goal gap analysis failed; plan stays provisional",
+            {"error": type(error).__name__, "detail": str(error)[:240]},
+            flush=True,
+        )
+        gaps = {
+            "satisfied": [],
+            "partial": [],
+            "missing": [],
+            "unknown": [],
+            "risks": ["Gap analysis was unavailable."],
+            "highestImpact": [],
+            "pathwaySummary": "",
+            "provisional": True,
+        }
     goal["researchEvidencePack"] = compact_evidence_pack(evidence)
     goal["gaps"] = gaps
     goal["researchSummary"] = research.get("summary") or {}
@@ -1359,10 +1463,17 @@ async def build_plan(goal: dict[str, Any], store: Any | None = None, *, force_re
         )
         if _is_thin_expert(assembled) or _is_generic_plan(assembled.get("milestones") or []):
             assembled = None
-    plan = assembled or _fallback_plan(goal)
-    report = validate_plan(goal, plan, evidence=prepared["research"].get("evidence") or [], gaps=goal.get("gaps") or {})
+    plan = tighten_plan(assembled or _fallback_plan(goal), goal)
+    evidence = prepared["research"].get("evidence") or []
+    gaps = goal.get("gaps") or {}
+    report = validate_plan(goal, plan, evidence=evidence, gaps=gaps)
     if not report.accepted:
-        plan = strip_mismatched_items(plan, goal)
+        plan = tighten_plan(strip_mismatched_items(plan, goal), goal)
+        report = validate_plan(goal, plan, evidence=evidence, gaps=gaps)
+    # A second full model pass only when the plan is still off-domain or generic.
+    # Repeating the pipeline on every warning makes plans longer and less reliable.
+    hard_codes = {"domain_mismatch", "generic_filler", "false_outcome", "unsupported_citation"}
+    if not report.accepted and any(item.code in hard_codes for item in report.issues):
         retry = await run_expert_plan_pipeline(goal)
         if retry and retry.get("execution") is not None:
             repaired = assemble_expert_plan(
@@ -1372,15 +1483,20 @@ async def build_plan(goal: dict[str, Any], store: Any | None = None, *, force_re
                 execution=retry.get("execution"),
                 models=list(retry.get("models") or []) + ["repair"],
             )
-            second = validate_plan(goal, repaired, evidence=prepared["research"].get("evidence") or [], gaps=goal.get("gaps") or {})
+            second = validate_plan(goal, repaired, evidence=evidence, gaps=gaps)
             if second.accepted or len(second.issues) < len(report.issues):
                 plan = repaired
                 report = second
         if not report.accepted:
-            degraded = _fallback_plan(goal)
-            degraded = strip_mismatched_items(degraded, goal)
+            degraded = tighten_plan(strip_mismatched_items(_fallback_plan(goal), goal), goal)
             plan = degraded
-            report = validate_plan(goal, plan, evidence=prepared["research"].get("evidence") or [], gaps=goal.get("gaps") or {})
+            report = validate_plan(goal, plan, evidence=evidence, gaps=gaps)
             report.provisional = True
+    plan = _ensure_open_steps(plan)
     plan = _preserve_progress(previous_plan or goal.get("approvedPlan") or goal.get("proposedPlan"), plan)
+    from services.goals.agents.steps import evaluate_and_write_steps
+    from services.goals.brief import apply_plan_brief
+
+    plan = await evaluate_and_write_steps(goal, plan)
+    plan = apply_plan_brief(plan, goal)
     return _attach_consultant_fields(plan, goal, report.model_dump())

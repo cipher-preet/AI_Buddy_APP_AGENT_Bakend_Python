@@ -226,15 +226,11 @@ def merge_context_profile(existing: dict[str, Any], updates: dict[str, Any]) -> 
 
 
 def inferred_success(goal: dict[str, Any], understanding: dict[str, Any]) -> str:
+    """Only a success line the user actually gave. Do not copy the goal title into it."""
     existing = _text(goal.get("successCriteria"))
-    if existing:
+    statement = _text(goal.get("statement")).lower()
+    if existing and existing.lower() != statement:
         return existing
-    outcome = _text(understanding.get("targetOutcome"))
-    primary = _text(understanding.get("primaryGoal")) or _text(goal.get("statement"))
-    if outcome:
-        return outcome[:1000]
-    if primary:
-        return f"The stated outcome is achieved with evidence: {primary}"[:1000]
     return ""
 
 

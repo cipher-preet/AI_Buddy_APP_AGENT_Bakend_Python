@@ -101,12 +101,23 @@ class GoalJobHandler:
             force_refresh=bool(payload.get("forceRefresh") or job_type == "research"),
             previous_plan=(goal.get("approvedPlan") or goal.get("proposedPlan")) if payload.get("preserveProgress") else None,
         )
+        milestones = list(built.get("milestones") or [])
+        days = list(built.get("days") or [])
+        if not days and milestones:
+            from services.goals.plan import _days_from_milestones
+
+            days = _days_from_milestones(milestones)
+            built["days"] = days
+        if not milestones or not days:
+            await self.store.fail(job_id, "The plan did not include any steps. Try again.")
+            raise NonRetryableQueueError("goal plan missing milestones or steps")
+        summary = str(built.get("summary") or "").strip() or "Here is a practical plan for this goal."
         plan = {
             "version": int(built.get("version") or 1),
-            "measurementType": built["measurementType"],
-            "summary": built["summary"],
+            "measurementType": built.get("measurementType") or "MILESTONE",
+            "summary": summary,
             "mission": built.get("mission") or "",
-            "recommendation": built.get("recommendation") or built["summary"],
+            "recommendation": built.get("recommendation") or summary,
             "positioningHeadline": built.get("positioningHeadline") or "",
             "positioningBody": built.get("positioningBody") or "",
             "immediateNextStep": built.get("immediateNextStep") or "",
@@ -122,6 +133,7 @@ class GoalJobHandler:
             "assumptions": built.get("assumptions") or [],
             "openQuestions": built.get("openQuestions") or [],
             "agentTrace": built.get("agentTrace") or [],
+            "stepEvaluation": built.get("stepEvaluation") or {},
             "understanding": built.get("understanding") or goal.get("understanding") or {},
             "gaps": built.get("gaps") or {},
             "researchSummary": built.get("researchSummary") or {},
@@ -135,7 +147,9 @@ class GoalJobHandler:
             plan["targetValue"] = built["targetValue"]
         if built.get("measurementDirection"):
             plan["measurementDirection"] = built["measurementDirection"]
-        prompt = built.get("recommendation") or built["summary"]
+        prompt = plan["recommendation"]
+        from services.goals.brief import review_extras
+
         step = {
             "stepId": "plan-review",
             "prompt": prompt,
@@ -143,16 +157,17 @@ class GoalJobHandler:
             "options": [],
             "allowFreeText": False,
             "findings": [],
-            "milestones": built["milestones"],
+            "milestones": milestones,
             "mission": plan["mission"],
             "recommendation": plan["recommendation"],
             "successDefinition": plan["successDefinition"],
             "phases": plan["phases"],
-            "days": plan["days"][:7],
+            "days": plan["days"][:12],
             "strategies": plan["strategies"],
             "priorityRecommendations": plan["priorityRecommendations"],
             "checklists": plan["checklists"],
             "scorecard": plan["scorecard"],
+            **review_extras(plan),
         }
         await self.store.save_step(
             str(goal.get("_id")),
@@ -164,7 +179,7 @@ class GoalJobHandler:
                 "gaps": built.get("gaps") or {},
                 "researchSummary": built.get("researchSummary") or {},
                 "validationReport": built.get("validationReport") or {},
-                "measurementType": built["measurementType"],
+                "measurementType": plan["measurementType"],
                 **(
                     {"baselineValue": built["baselineValue"]}
                     if built.get("baselineValue") is not None and goal.get("baselineValue") is None
@@ -182,7 +197,7 @@ class GoalJobHandler:
                 ),
             },
             status="PLAN_REVIEW",
-            assistant_text=built["summary"],
+            assistant_text=summary,
             model=str(built.get("model") or ""),
             plan=plan,
         )

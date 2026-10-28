@@ -6,7 +6,6 @@ from services.goals.domains import (
     context_profile,
     detect_goal_type,
     domain_to_goal_type,
-    inferred_success,
     inferred_title,
     is_skip_answer,
     merge_context_profile,
@@ -15,7 +14,6 @@ from services.goals.domains import (
     _text,
 )
 from services.goals.schemas import (
-    GoalOption,
     GoalUnderstandingResult,
     InterviewQuestion,
     LabeledAssumption,
@@ -25,6 +23,7 @@ INTERVIEW_STEP_FIELDS = {
     "current-level": "startingLevel",
     "current-role": "currentRole",
     "starting-level": "startingLevel",
+    "stage": "startingLevel",
     "location": "geography",
     "geography": "geography",
     "hours": "availableHoursPerWeek",
@@ -37,6 +36,11 @@ INTERVIEW_STEP_FIELDS = {
     "what-it-is": "description",
     "what-product": "description",
     "which-skill": "description",
+    "subject": "description",
+    "audience": "audience",
+    "budget": "budget",
+    "product-type": "productType",
+    "product-kind": "productType",
 }
 
 
@@ -122,14 +126,21 @@ async def understand_goal(goal: dict[str, Any], messages: list[dict[str, Any]] |
         max_tokens=1200,
     )
     if called is None:
-        return existing or empty_understanding(statement)
-    result, _model = called
-    normalized = _normalize_understanding(result, statement)
-    if existing:
-        for key in ("geography", "startingLevel", "subdomain"):
-            if _text(existing.get(key)) and _text(existing.get(key)) not in {"UNKNOWN", "OTHER"}:
-                if not _text(normalized.get(key)) or normalized.get(key) in {"UNKNOWN", "OTHER"}:
-                    normalized[key] = existing[key]
+        normalized = existing or empty_understanding(statement)
+    else:
+        result, _model = called
+        normalized = _normalize_understanding(result, statement)
+        if existing:
+            for key in ("geography", "startingLevel", "subdomain"):
+                if _text(existing.get(key)) and _text(existing.get(key)) not in {"UNKNOWN", "OTHER"}:
+                    if not _text(normalized.get(key)) or normalized.get(key) in {"UNKNOWN", "OTHER"}:
+                        normalized[key] = existing[key]
+    profile = context_profile(goal)
+    user_level = _text(profile.get("startingLevel") or profile.get("currentRole"))
+    if user_level and user_level.upper() != "UNKNOWN" and not is_skip_answer(user_level):
+        normalized["startingLevel"] = user_level[:80]
+    else:
+        normalized["startingLevel"] = "UNKNOWN"
     return normalized
 
 
@@ -197,121 +208,10 @@ def next_interview_question(
     profile: dict[str, Any],
     messages: list[dict[str, Any]],
 ) -> InterviewQuestion | None:
-    if interview_questions_asked(messages) >= 3:
-        return None
-    domain = normalize_domain(str(understanding.get("domain") or "OTHER"))
-    title = inferred_title(goal, understanding) or "this goal"
-    candidates: list[InterviewQuestion] = []
+    """Pick the next goal-specific question, or the approach step, or nothing."""
+    from services.goals.intake import next_intake_question
 
-    if not _has_value(goal, profile, "startingLevel") and not _has_value(goal, profile, "currentRole"):
-        if domain == "CAREER":
-            candidates.append(
-                InterviewQuestion(
-                    stepId="current-level",
-                    field="startingLevel",
-                    prompt=(
-                        f"What is your current role or stage for “{title}”? "
-                        "If you are a student, say so. Skip if you want me to plan with labeled assumptions."
-                    ),
-                    control="text",
-                    leverage="Changes which earlier stages belong on the roadmap.",
-                )
-            )
-        elif domain in {"EDUCATION", "TECHNOLOGY", "HEALTH", "CREATIVE"}:
-            candidates.append(
-                InterviewQuestion(
-                    stepId="current-level",
-                    field="startingLevel",
-                    prompt=(
-                        f"What is your current level for “{title}”? "
-                        "Beginner, some experience, or already practicing? You can skip."
-                    ),
-                    control="single_select",
-                    options=[
-                        GoalOption(id="beginner", label="Beginner / from zero"),
-                        GoalOption(id="intermediate", label="Some experience"),
-                        GoalOption(id="advanced", label="Already practicing at a high level"),
-                        GoalOption(id="skip", label="Not sure / skip"),
-                    ],
-                    leverage="Changes whether fundamentals belong on the plan.",
-                )
-            )
-        elif domain == "BUSINESS":
-            candidates.append(
-                InterviewQuestion(
-                    stepId="current-level",
-                    field="startingLevel",
-                    prompt=(
-                        f"Where are you with “{title}” today — idea, building, already operating, or growing? "
-                        "Skip if you want a provisional outline."
-                    ),
-                    control="single_select",
-                    options=[
-                        GoalOption(id="idea", label="Idea / not started"),
-                        GoalOption(id="building", label="Building the first version"),
-                        GoalOption(id="operating", label="Already operating"),
-                        GoalOption(id="skip", label="Not sure / skip"),
-                    ],
-                    leverage="Changes whether the plan starts at discovery or scale.",
-                )
-            )
-
-    if not _has_value(goal, profile, "successCriteria") and not inferred_success(goal, understanding):
-        candidates.append(
-            InterviewQuestion(
-                stepId="success",
-                field="successCriteria",
-                prompt=f"What will ‘done’ look like for “{title}”? One concrete result is enough.",
-                control="text",
-                leverage="Defines the real-world success condition.",
-            )
-        )
-
-    if not _has_value(goal, profile, "timeframe"):
-        candidates.append(
-            InterviewQuestion(
-                stepId="timeframe",
-                field="timeframe",
-                prompt=f"When do you want a meaningful result for “{title}”? Skip if the timeline is open.",
-                control="single_select",
-                options=[
-                    GoalOption(id="30-days", label="Within 30 days"),
-                    GoalOption(id="90-days", label="Within 90 days"),
-                    GoalOption(id="6-months", label="Within 6 months"),
-                    GoalOption(id="1-year", label="Within a year"),
-                    GoalOption(id="multi-year", label="This will take years"),
-                    GoalOption(id="skip", label="Not sure / skip"),
-                ],
-                leverage="Changes estimate vs target dates.",
-            )
-        )
-
-    if domain in {"CAREER", "EDUCATION", "FINANCIAL"} and not _has_value(goal, profile, "geography"):
-        candidates.append(
-            InterviewQuestion(
-                stepId="location",
-                field="geography",
-                prompt=(
-                    "Which country or region should the plan assume? "
-                    "Requirements often differ by place. Skip to keep it general."
-                ),
-                control="text",
-                leverage="Changes researched requirements and regulations.",
-            )
-        )
-
-    if goal.get("availableHoursPerWeek") is None and not _has_value(goal, profile, "availableHoursPerWeek"):
-        candidates.append(
-            InterviewQuestion(
-                stepId="hours",
-                field="availableHoursPerWeek",
-                prompt="About how many hours each week can you spend on this? Skip if it varies.",
-                control="number",
-                leverage="Changes capacity and timeline realism.",
-            )
-        )
-
-    return candidates[0] if candidates else None
+    return next_intake_question(goal, understanding, profile, messages)
 
 
 def draft_from_understanding(
@@ -328,14 +228,26 @@ def draft_from_understanding(
     title = inferred_title(goal, understanding)
     if title:
         updates["title"] = title[:160]
-    description = _text(goal.get("description")) or _text(understanding.get("primaryGoal"))
+    description = _text(goal.get("description"))
     if description:
         updates["description"] = description[:2000]
     if _text(understanding.get("subdomain")):
         updates["category"] = _text(understanding.get("subdomain"))[:120]
-    success = inferred_success(goal, understanding)
-    if success:
+    success = _text(profile.get("successCriteria")) or _text(goal.get("successCriteria"))
+    if success and not is_skip_answer(success) and success.lower() != _text(goal.get("statement")).lower():
         updates["successCriteria"] = success[:1000]
+    description = _text(profile.get("description"))
+    if description and not is_skip_answer(description) and not _text(goal.get("description")):
+        updates["description"] = description[:2000]
+    audience = _text(profile.get("audience"))
+    if audience and not is_skip_answer(audience) and audience.upper() != "UNKNOWN" and not _text(goal.get("audience")):
+        updates["audience"] = audience[:240]
+    budget = _text(profile.get("budget"))
+    if budget and not is_skip_answer(budget) and budget.upper() != "UNKNOWN":
+        existing_limits = [str(item) for item in (goal.get("constraints") or []) if str(item).strip()]
+        line = f"Budget: {budget}"[:200]
+        if line not in existing_limits:
+            updates["constraints"] = [*existing_limits, line][:8]
     geo = _text(profile.get("geography")) or _text(understanding.get("geography"))
     if geo and geo.upper() != "UNKNOWN":
         updates.setdefault("constraints", list(goal.get("constraints") or []))
@@ -358,18 +270,6 @@ def draft_from_understanding(
 
 
 def ready_for_spaces(goal: dict[str, Any], understanding: dict[str, Any], profile: dict[str, Any], messages: list[dict[str, Any]]) -> bool:
+    """Space selection starts after the approach step, not after a fixed count."""
     merged = {**goal, **draft_from_understanding(goal, understanding, profile)}
-    has_what = bool(
-        _text(merged.get("description"))
-        or _text(merged.get("statement"))
-        or _text(understanding.get("primaryGoal"))
-    )
-    has_success = bool(_text(merged.get("successCriteria")))
-    asked = interview_questions_asked(messages)
-    if asked >= 3:
-        return has_what
-    if has_what and has_success and next_interview_question(merged, understanding, profile, messages) is None:
-        return True
-    if has_what and has_success and _text(merged.get("timeframe")):
-        return next_interview_question(merged, understanding, profile, messages) is None
-    return False
+    return next_interview_question(merged, understanding, profile, messages) is None

@@ -53,7 +53,21 @@ def test_messages_update_context_instead_of_reset():
     assert profile["startingLevel"] == "Area Sales Manager"
 
 
-def test_ready_for_spaces_after_budget():
+def test_one_answer_does_not_finish_intake():
+    goal = {"statement": "I want to become a bank manager", "title": "Bank manager"}
+    understanding = empty_understanding(goal["statement"])
+    messages = [
+        {"role": "assistant", "stepId": "current-level", "text": "What is your current role?"},
+        {"role": "user", "stepId": "current-level", "text": "Student"},
+    ]
+    profile = apply_message_answers(goal, messages)
+    question = next_interview_question(goal, understanding, profile, messages)
+    assert question is not None
+    assert question.stepId == "location"
+    assert ready_for_spaces(goal, understanding, profile, messages) is False
+
+
+def test_ready_for_spaces_after_the_approach():
     goal = {
         "statement": "Become a zonal sales manager in a bank",
         "description": "Banking career",
@@ -62,9 +76,15 @@ def test_ready_for_spaces_after_budget():
     understanding = empty_understanding(goal["statement"])
     messages = [
         {"role": "assistant", "stepId": "current-level"},
+        {"role": "assistant", "stepId": "location"},
         {"role": "assistant", "stepId": "timeframe"},
         {"role": "assistant", "stepId": "hours"},
     ]
+    assert ready_for_spaces(goal, understanding, {}, messages) is False
+    question = next_interview_question(goal, understanding, {}, messages)
+    assert question is not None
+    assert question.stepId == "approach"
+    messages.append({"role": "assistant", "stepId": "approach"})
     assert ready_for_spaces(goal, understanding, {}, messages)
 
 

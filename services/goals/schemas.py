@@ -91,10 +91,10 @@ class PlanPhase(BaseModel):
 
 class DayTask(BaseModel):
     id: str = ""
-    text: str
+    text: str = Field(description="One concrete action in plain words. No jargon and no invented facts.")
     done: bool = False
-    why: str = ""
-    definitionOfDone: str = ""
+    why: str = Field(default="", description="One short sentence on why this action is next.")
+    definitionOfDone: str = Field(default="", description="The visible result that shows this action is finished.")
     note: str = ""
 
 
@@ -117,22 +117,22 @@ class PlanDay(BaseModel):
 
 class PlanStrategy(BaseModel):
     id: str = ""
-    title: str
-    body: str
-    measurableGoal: str = ""
-    why: str = ""
-    proofPoints: list[str] = Field(default_factory=list)
-    effort: str = ""
+    title: str = Field(description="3–8 plain words naming this approach for this goal.")
+    body: str = Field(description="One or two short sentences: what to do and how. No jargon.")
+    measurableGoal: str = Field(default="", description="One check the user can see. Not the final life outcome.")
+    why: str = Field(default="", description="One short sentence.")
+    proofPoints: list[str] = Field(default_factory=list, description="Up to 3 visible outputs.")
+    effort: str = Field(default="", description="A short time note that fits the user's hours.")
     tags: list[str] = Field(default_factory=list)
 
 
 class PriorityRecommendation(BaseModel):
     id: str = ""
-    title: str
-    reason: str
+    title: str = Field(description="A verb plus the concrete thing to do next.")
+    reason: str = Field(description="One sentence on why this is the next action.")
     priority: str = "HIGH"
-    howSteps: list[str] = Field(default_factory=list)
-    measurableGoal: str = ""
+    howSteps: list[str] = Field(default_factory=list, description="2 or 3 short actions.")
+    measurableGoal: str = Field(default="", description="The output that proves this action is done.")
     milestoneTitle: str = ""
     suggestedDurationMinutes: int | None = None
     relatedStrategyId: str = ""
@@ -215,6 +215,14 @@ class GoalCriticResult(BaseModel):
     repairedMilestones: list[GoalMilestone] = Field(default_factory=list)
 
 
+class GoalStepWriterResult(BaseModel):
+    """Whether the current steps are usable, and the steps the person should follow."""
+
+    accepted: bool = False
+    issues: list[str] = Field(default_factory=list)
+    days: list[PlanDay] = Field(default_factory=list)
+
+
 DOMAIN_CATEGORIES = (
     "CAREER",
     "EDUCATION",
@@ -260,6 +268,8 @@ class InterviewQuestion(BaseModel):
     field: str = ""
     options: list[GoalOption] = Field(default_factory=list)
     leverage: str = ""
+    note: str = ""
+    brief: list[str] = Field(default_factory=list)
 
 
 class GoalInterviewResult(BaseModel):

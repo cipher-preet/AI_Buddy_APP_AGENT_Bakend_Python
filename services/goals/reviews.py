@@ -8,7 +8,6 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field
 
 from apps.api_gateway.config.setting import settings
-from services.goals.baseline import load_space_context
 from services.goals.progress import chart_actual, consultant_progress, is_done_status
 from services.goals.schemas import PlanStrategy, PriorityRecommendation
 from services.goals.store import GoalStore, utc_now
@@ -109,101 +108,57 @@ def _compact_context(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def fallback_coach(goal: dict[str, Any], context: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    """Coach from the plan itself. Space tasks, notes, and transcripts are ignored."""
+    del context
     plan = goal.get("approvedPlan") or {}
     title = str(goal.get("title") or "this goal")
-    open_tasks = [item for item in (context.get("tasks") or []) if not is_done_status(item.get("status"))]
-    done_tasks = [item for item in (context.get("tasks") or []) if is_done_status(item.get("status"))]
-    notes = list(context.get("notes") or [])
-    transcripts = list(context.get("transcripts") or [])
-    space_names = [str(item.get("name") or "your Space") for item in (context.get("spaces") or [])]
-    home = ", ".join(space_names) if space_names else "the linked Space"
+    deadline = str(((plan.get("successDefinition") or {}) if isinstance(plan.get("successDefinition"), dict) else {}).get("deadlineLabel") or goal.get("timeframe") or "the deadline")
+    open_days = [
+        day
+        for day in (plan.get("days") or [])
+        if isinstance(day, dict) and str(day.get("status") or "open").lower() not in {"done", "skipped"}
+    ]
+    next_day = open_days[0] if open_days else None
+    next_title = str((next_day or {}).get("title") or "")
+    if next_title:
+        focus = f"Do “{next_title}” before {deadline}."
+    else:
+        focus = f"Finish the next open step for “{title}” before {deadline}."
 
     blockers = [row.get("text") for row in evidence if row.get("category") == "BLOCKER"]
-    next_task = open_tasks[0] if open_tasks else None
-    next_note = notes[0] if notes else None
-    if next_task:
-        focus = f"Finish “{next_task.get('title')}” in {home}."
-    elif next_note:
-        focus = f"Turn the note “{next_note.get('title')}” into the next checkable task."
-    else:
-        focus = f"Capture one task or note in {home} so “{title}” can be tracked."
-
     summary_bits = [
-        f"Execution: {len(done_tasks)} Space task(s) done, {len(open_tasks)} still open.",
-        f"{len(notes)} note(s) and {len(transcripts)} transcript snippet(s) from {home}.",
+        f"The plan for “{title}” is measured on its own steps.",
+        f"Deadline: {deadline}.",
     ]
     if blockers:
         summary_bits.append(str(blockers[0]))
-    summary_bits.append("Outcome stays unverified until the real-world success condition is confirmed.")
+    summary_bits.append("The outside result is not done just because a step is checked.")
 
-    recommendations: list[dict[str, Any]] = []
-    for item in open_tasks[:3]:
-        recommendations.append(
+    recommendations = list(plan.get("priorityRecommendations") or [])[:5]
+    if next_title and not recommendations:
+        recommendations = [
             {
-                "title": f"Finish “{item.get('title')}”",
-                "reason": f"This open Space task is the next proof of progress on “{title}”.",
+                "title": next_title,
+                "reason": f"{next_title}: this is the next step inside the {deadline} deadline.",
                 "priority": "HIGH",
-                "howSteps": [
-                    f"Open {home} and complete “{item.get('title')}”.",
-                    "Write what changed in a note when you finish.",
-                ],
-                "measurableGoal": f"“{item.get('title')}” is marked done with a short evidence note.",
+                "howSteps": [f"Complete “{next_title}”.", "Check it only when the result is visible."],
+                "measurableGoal": f"“{next_title}” is finished.",
             }
-        )
-    if next_note and len(recommendations) < 3:
-        recommendations.append(
-            {
-                "title": f"Act on “{next_note.get('title')}”",
-                "reason": "This Space note should shape the next recommendation instead of sitting unused.",
-                "priority": "HIGH",
-                "howSteps": [
-                    f"Re-read “{next_note.get('title')}”.",
-                    "Turn the useful part into one task you can finish this period.",
-                ],
-                "measurableGoal": "One new or updated Space task exists because of this note.",
-            }
-        )
-    if transcripts and len(recommendations) < 3:
-        snippet = str(transcripts[0].get("title") or "the latest conversation")
-        recommendations.append(
-            {
-                "title": "Use the latest Space conversation",
-                "reason": f"A transcript in {home} mentioned “{snippet}” and should change this week’s focus.",
-                "priority": "MEDIUM",
-                "howSteps": [
-                    "Skim the latest transcript in the linked Space.",
-                    "Promote one concrete follow-up into a task.",
-                ],
-                "measurableGoal": "One follow-up from the transcript is on the Space task list.",
-            }
-        )
-    if not recommendations:
-        recommendations = list(plan.get("priorityRecommendations") or [])[:5]
+        ]
 
     strategies = list(plan.get("strategies") or [])
     if not strategies:
         strategies = [
             {
-                "title": f"Track “{title}” from {home}",
-                "body": f"Use tasks, notes, and transcripts in {home} as the evidence trail for “{title}”. Close open work before adding new streams.",
-                "measurableGoal": "Each review can point to a Space item that moved.",
-                "why": "Without Space evidence the graph and recommendations stay guesses.",
-                "proofPoints": ["Open task closed", "Note updated", "Transcript follow-up captured"],
-                "effort": "Daily",
-                "tags": ["space", "tracking"],
+                "title": f"Follow the plan for {title}",
+                "body": f"Work the open steps in order and keep {deadline} in view.",
+                "measurableGoal": "The next open step is finished.",
+                "why": f"Follow the plan for {title}: the deadline is {deadline}.",
+                "proofPoints": ["Next step finished"],
+                "effort": deadline,
+                "tags": ["plan"],
             }
         ]
-    elif open_tasks or notes or transcripts:
-        lead = strategies[0] if isinstance(strategies[0], dict) else {}
-        proof = [str(item.get("title") or "") for item in (done_tasks or open_tasks)[:3] if item.get("title")]
-        if notes:
-            proof.append(f"Note: {notes[0].get('title')}")
-        lead = {
-            **lead,
-            "why": str(lead.get("why") or f"Latest work in {home} should steer this strategy."),
-            "proofPoints": proof or list(lead.get("proofPoints") or []),
-        }
-        strategies = [lead, *[item for item in strategies[1:]]]
 
     return {
         "summary": " ".join(summary_bits)[:1500],
@@ -352,10 +307,8 @@ async def _write_snapshot(store: GoalStore, goal: dict[str, Any], period_type: s
 
 
 async def build_review(store: GoalStore, goal: dict[str, Any], period_type: str, period_key_value: str) -> None:
-    space_ids = await store.linked_space_ids(str(goal.get("_id")))
-    context = await load_space_context(store, str(goal.get("ownerId") or ""), space_ids, limit=40)
-    findings = space_findings(context)
-    evidence = await _ingest_space_evidence(store, goal, findings, period_key_value)
+    context: dict[str, Any] = {"spaces": [], "tasks": [], "notes": [], "transcripts": []}
+    evidence: list[dict[str, Any]] = []
     progress = consultant_progress(goal, evidence)
     actual = chart_actual(goal, evidence, context)
     progress = {**progress, "chartActual": actual}

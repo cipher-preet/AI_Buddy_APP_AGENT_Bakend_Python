@@ -45,6 +45,43 @@ def is_launch_style_goal(goal: dict[str, Any]) -> bool:
     return False
 
 
+def _coverage_allows(new_count: int, old_count: int, goal: dict[str, Any]) -> bool:
+    """Do not let a critic rewrite shrink a long goal back to one phase."""
+    from services.goals.brief import stated_deadline
+
+    if new_count <= 0:
+        return False
+    if old_count >= 4 and new_count <= 1:
+        return False
+    stated = stated_deadline(goal)
+    if stated and stated[0] >= 45 and new_count < 4 and new_count <= max(old_count, 1):
+        return False
+    return True
+
+
+def _repairs_are_safe(critic: GoalCriticResult) -> bool:
+    """Ignore a critic rewrite that is empty or falls back to generic filler."""
+    from services.goals.domains import GENERIC_TASK_PHRASES
+
+    chunks: list[str] = []
+    for day in critic.repairedDays or []:
+        chunks.append(_text(day.title))
+        chunks.extend(_text(task.text) for task in (day.tasks or []))
+    for strategy in critic.repairedStrategies or []:
+        chunks.append(_text(strategy.title))
+        chunks.append(_text(strategy.body))
+    for item in critic.repairedPriorityRecommendations or []:
+        chunks.append(_text(item.title))
+        chunks.append(_text(item.reason))
+    for milestone in critic.repairedMilestones or []:
+        chunks.append(_text(milestone.title))
+    blob = " ".join(chunks).lower()
+    if not blob.strip():
+        return False
+    hits = sum(1 for phrase in GENERIC_TASK_PHRASES if phrase in blob)
+    return hits < 2
+
+
 def _dump_model(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
@@ -56,7 +93,19 @@ def _dump_model(value: Any) -> dict[str, Any]:
 
 
 async def run_expert_plan_pipeline(goal: dict[str, Any]) -> dict[str, Any] | None:
-    """Strategist → Advisor → Execution → Critic for every goal type."""
+    """Strategist → Advisor → Execution → Critic, then the scheduler sets dates."""
+    try:
+        return await _run_expert_plan_pipeline(goal)
+    except Exception as error:
+        print(
+            "goal expert pipeline failed",
+            {"error": type(error).__name__, "detail": str(error)[:240]},
+            flush=True,
+        )
+        return None
+
+
+async def _run_expert_plan_pipeline(goal: dict[str, Any]) -> dict[str, Any] | None:
     context = goal_context_payload(goal)
     models: list[str] = []
 
@@ -65,8 +114,8 @@ async def run_expert_plan_pipeline(goal: dict[str, Any]) -> dict[str, Any] | Non
         schema=GoalStrategistResult,
         payload=context,
         stage="goal_strategist",
-        temperature=0.35,
-        max_tokens=3200,
+        temperature=0.2,
+        max_tokens=2200,
     )
     if strategist_call is None:
         return None
@@ -82,8 +131,8 @@ async def run_expert_plan_pipeline(goal: dict[str, Any]) -> dict[str, Any] | Non
         schema=GoalAdvisorResult,
         payload=advisor_payload,
         stage="goal_advisor",
-        temperature=0.35,
-        max_tokens=4500,
+        temperature=0.2,
+        max_tokens=2800,
     )
     advisor: GoalAdvisorResult | None = None
     if advisor_call is not None:
@@ -104,8 +153,8 @@ async def run_expert_plan_pipeline(goal: dict[str, Any]) -> dict[str, Any] | Non
         schema=GoalExecutionResult,
         payload=execution_payload,
         stage="goal_execution",
-        temperature=0.3,
-        max_tokens=6500,
+        temperature=0.15,
+        max_tokens=4500,
     )
     if execution_call is None:
         return {
@@ -138,21 +187,25 @@ async def run_expert_plan_pipeline(goal: dict[str, Any]) -> dict[str, Any] | Non
         schema=GoalCriticResult,
         payload=critic_payload,
         stage="goal_critic",
-        temperature=0.15,
-        max_tokens=4500,
+        temperature=0.1,
+        max_tokens=2800,
     )
     critic: GoalCriticResult | None = None
     if critic_call is not None:
         critic, critic_model = critic_call
         models.append(f"critic:{critic_model}")
-        if not critic.accepted and (
-            critic.repairedDays
-            or critic.repairedStrategies
-            or critic.repairedPriorityRecommendations
-            or critic.repairedChecklists
-            or critic.repairedMilestones
+        if (
+            not critic.accepted
+            and _repairs_are_safe(critic)
+            and (
+                critic.repairedDays
+                or critic.repairedStrategies
+                or critic.repairedPriorityRecommendations
+                or critic.repairedChecklists
+                or critic.repairedMilestones
+            )
         ):
-            if critic.repairedDays:
+            if critic.repairedDays and _coverage_allows(len(critic.repairedDays), len(execution.days or []), goal):
                 execution.days = critic.repairedDays
             if critic.repairedStrategies:
                 execution.strategies = critic.repairedStrategies
@@ -162,12 +215,18 @@ async def run_expert_plan_pipeline(goal: dict[str, Any]) -> dict[str, Any] | Non
                 execution.checklists = critic.repairedChecklists
             if critic.repairedScorecard:
                 execution.scorecard = critic.repairedScorecard
-            if critic.repairedMilestones:
+            if critic.repairedMilestones and _coverage_allows(
+                len(critic.repairedMilestones), len(execution.milestones or []), goal
+            ):
                 execution.milestones = critic.repairedMilestones
             if critic.rewriteSummary:
                 execution.summary = critic.rewriteSummary
             if critic.rewriteRecommendation:
                 strategy.recommendation = critic.rewriteRecommendation
+        models.append("scheduler:dates-and-steps")
+
+    if "scheduler:dates-and-steps" not in models:
+        models.append("scheduler:dates-and-steps")
 
     return {
         "strategy": strategy,

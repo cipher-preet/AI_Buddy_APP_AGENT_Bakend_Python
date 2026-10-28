@@ -201,8 +201,8 @@ async def _qdrant_snippets(user_id: str, space_ids: list[str], limit: int = 8) -
 
 
 async def build_baseline(store: GoalStore, goal: dict[str, Any], user_id: str) -> dict[str, Any]:
-    space_ids = await store.linked_space_ids(str(goal.get("_id")))
-    context = await load_space_context(store, user_id, space_ids)
+    del store, user_id
+    context = {"spaces": [], "tasks": [], "notes": [], "transcripts": []}
     router = get_llm_router()
     provider_name = settings.CONVERSATION_SEMANTIC_PROVIDER
     model = settings.CONVERSATION_SEMANTIC_MODEL

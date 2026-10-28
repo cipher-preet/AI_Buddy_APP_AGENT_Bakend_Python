@@ -176,6 +176,11 @@ class Settings(BaseSettings):
     GOAL_JOB_MAX_CONCURRENCY: int = Field(default=1, ge=1, le=4)
     GOAL_MAX_CLARIFY_TURNS: int = Field(default=8, ge=1, le=12)
     GOAL_CLARIFY_MAX_TOKENS: int = Field(default=1100, ge=200, le=4000)
+    # Achieve Goal step evaluation and rewriting. gpt-oss-120b writes the checklist.
+    GOAL_STEP_PROVIDER: str = "krutrim"
+    GOAL_STEP_MODEL: str = "gpt-oss-120b"
+    GOAL_STEP_FALLBACK_PROVIDER: str = "krutrim"
+    GOAL_STEP_FALLBACK_MODEL: str = "gemma-4-31b-it"
 
     PARALLEL_API_KEY: SecretStr | str = ""
     PARALLEL_BASE_URL: str = "https://api.parallel.ai"

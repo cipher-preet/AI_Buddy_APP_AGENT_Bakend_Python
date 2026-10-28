@@ -13,16 +13,23 @@ def _text(value: Any) -> str:
 
 def _horizon(goal: dict[str, Any], plan: dict[str, Any], max_index: int) -> int:
     source = f"{_text(goal.get('timeframe'))} {_text((plan.get('successDefinition') or {}).get('deadlineLabel'))}".lower()
-    days = re.search(r"(\d+)\s*day", source)
-    if days:
-        return max(int(days.group(1)), max_index, 1)
-    weeks = re.search(r"(\d+)\s*week", source)
-    if weeks:
-        return max(int(weeks.group(1)) * 7, max_index, 7)
+    if re.search(r"\b(a year|1 year|12 months|within a year)\b", source):
+        return max(365, max_index)
+    years = re.search(r"(\d+)\s*year", source)
+    if years:
+        return max(int(years.group(1)) * 365, max_index, 365)
     months = re.search(r"(\d+)\s*month", source)
     if months:
         return max(int(months.group(1)) * 30, max_index, 30)
-    return max(max_index, 30, 1)
+    weeks = re.search(r"(\d+)\s*week", source)
+    if weeks:
+        return max(int(weeks.group(1)) * 7, max_index, 7)
+    days = re.search(r"(\d+)\s*day", source)
+    if days:
+        return max(int(days.group(1)), max_index, 1)
+    if "no fixed" in source:
+        return max(90, max_index)
+    return max(max_index, 90, 1)
 
 
 def _category(title: str, focus: str) -> str:
