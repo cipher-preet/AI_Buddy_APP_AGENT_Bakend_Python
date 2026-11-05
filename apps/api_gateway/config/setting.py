@@ -111,12 +111,15 @@ class Settings(BaseSettings):
     # Default Krutrim model for callers that do not pick one (chat, planner, reminders).
     KRUTRIM_DEFAULT_MODEL: str = "gemma-4-31b-it"
     # Task/note extraction (window extraction, meeting extractor, task eligibility).
-    CONVERSATION_SEMANTIC_PROVIDER: str = "krutrim"
-    CONVERSATION_SEMANTIC_MODEL: str = "gpt-oss-120b"
+    CONVERSATION_SEMANTIC_PROVIDER: str = "mistral"
+    CONVERSATION_SEMANTIC_MODEL: str = "zai-glm-5-3-flash"
     CONVERSATION_SEMANTIC_FALLBACK_PROVIDER: str = "krutrim"
-    CONVERSATION_SEMANTIC_FALLBACK_MODEL: str = "gemma-4-31b-it"
+    CONVERSATION_SEMANTIC_FALLBACK_MODEL: str = "gpt-oss-120b"
     # Buddy chat "create/update task or note" argument extraction; empty = chat route.
-    CHAT_WRITE_MODEL: str = "gpt-oss-120b"
+    CHAT_WRITE_PROVIDER: str = "mistral"
+    CHAT_WRITE_MODEL: str = "zai-glm-5-3-flash"
+    CHAT_WRITE_FALLBACK_PROVIDER: str = "krutrim"
+    CHAT_WRITE_FALLBACK_MODEL: str = "gpt-oss-120b"
     CHAT_WRITE_REASONING_EFFORT: str = "low"
     # Voice reminder turns need a fast, non-reasoning model (256-token budget).
     REMINDER_EXTRACTION_MODEL: str = "gemma-4-31b-it"

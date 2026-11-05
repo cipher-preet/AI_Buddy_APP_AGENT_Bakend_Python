@@ -114,17 +114,17 @@ def _candidate_models(router: LLMRouter, capability: LLMCapability) -> list[str]
     return [item.model for item in router._cost_optimized_candidates(capability)]
 
 
-def test_semantic_extraction_selects_krutrim_gpt_oss_120b_with_gemma_fallback():
+def test_semantic_extraction_selects_mistral_glm_flash_with_gemma_fallback():
     router = _ci_router()
     for capability in (LLMCapability.HIGH_ACCURACY_REASONING, LLMCapability.SEMANTIC_EXTRACTION):
         names = _candidate_names(router, capability)
         models = _candidate_models(router, capability)
         provider, model = router.route(capability)
-        assert names == ["krutrim", "krutrim"]
-        assert models == ["gpt-oss-120b", "gemma-4-31b-it"]
-        assert getattr(provider, "name", None) == "krutrim"
-        assert model == "gpt-oss-120b"
-    expected = [("krutrim", "gpt-oss-120b"), ("krutrim", "gemma-4-31b-it")]
+        assert names == ["mistral", "krutrim"]
+        assert models == ["zai-glm-5-3-flash", "gpt-oss-120b"]
+        assert getattr(provider, "name", None) == "mistral"
+        assert model == "zai-glm-5-3-flash"
+    expected = [("mistral", "zai-glm-5-3-flash"), ("krutrim", "gpt-oss-120b")]
     assert conversation_route_spec(LLMCapability.SIMPLE_SUMMARY) == expected
     assert conversation_route_spec(LLMCapability.SEMANTIC_EXTRACTION) == expected
 
@@ -204,10 +204,10 @@ def test_short_and_long_meeting_keep_role_based_routing():
         semantic_provider, semantic_model = _route_for_input(router, LLMCapability.SEMANTIC_EXTRACTION, estimated)
         reasoning_provider, reasoning_model = _route_for_input(router, LLMCapability.HIGH_ACCURACY_REASONING, estimated)
         synthesis_provider, synthesis_model = _route_for_input(router, LLMCapability.FINAL_SYNTHESIS, estimated)
-        assert getattr(semantic_provider, "name", None) == "krutrim"
-        assert semantic_model == "gpt-oss-120b"
-        assert getattr(reasoning_provider, "name", None) == "krutrim"
-        assert reasoning_model == "gpt-oss-120b"
+        assert getattr(semantic_provider, "name", None) == "mistral"
+        assert semantic_model == "zai-glm-5-3-flash"
+        assert getattr(reasoning_provider, "name", None) == "mistral"
+        assert reasoning_model == "zai-glm-5-3-flash"
         assert getattr(synthesis_provider, "name", None) == "krutrim"
         assert synthesis_model == "gpt-oss-120b"
 
@@ -337,32 +337,32 @@ def test_unconfigured_krutrim_does_not_fall_back_to_free_models():
         }
     )
     provider, model = router.route(LLMCapability.HIGH_ACCURACY_REASONING)
-    assert getattr(provider, "name", None) == "krutrim"
-    assert model == "gpt-oss-120b"
-    assert _candidate_names(router, LLMCapability.HIGH_ACCURACY_REASONING) == []
-    assert _candidate_names(router, LLMCapability.SEMANTIC_EXTRACTION) == []
+    assert getattr(provider, "name", None) == "mistral"
+    assert model == "zai-glm-5-3-flash"
+    assert _candidate_names(router, LLMCapability.HIGH_ACCURACY_REASONING) == ["mistral"]
+    assert _candidate_names(router, LLMCapability.SEMANTIC_EXTRACTION) == ["mistral"]
     assert _candidate_names(router, LLMCapability.FINAL_SYNTHESIS) == []
     assert "groq" not in _candidate_names(router, LLMCapability.VALIDATION)
     assert "gemini" not in _candidate_names(router, LLMCapability.VALIDATION)
     assert "sarvam" not in _candidate_names(router, LLMCapability.VALIDATION)
     router = _ci_router()
     names = _candidate_names(router, LLMCapability.CHAT_ANSWER)
-    assert names == ["groq", "gemini", "mistral", "sarvam"]
+    assert names == ["krutrim", "mistral", "groq", "gemini"]
 
 
 def test_conversation_intelligence_order_includes_gemini():
     router = _ci_router()
     expected = {
-        LLMCapability.HIGH_ACCURACY_REASONING: ["krutrim", "krutrim"],
-        LLMCapability.SEMANTIC_EXTRACTION: ["krutrim", "krutrim"],
-        LLMCapability.SIMPLE_SUMMARY: ["krutrim", "krutrim"],
+        LLMCapability.HIGH_ACCURACY_REASONING: ["mistral", "krutrim"],
+        LLMCapability.SEMANTIC_EXTRACTION: ["mistral", "krutrim"],
+        LLMCapability.SIMPLE_SUMMARY: ["mistral", "krutrim"],
         LLMCapability.FINAL_SYNTHESIS: ["krutrim", "krutrim"],
         LLMCapability.VALIDATION: ["krutrim", "mistral"],
         LLMCapability.FALLBACK: ["krutrim"],
     }
     for capability, names in expected.items():
         assert _candidate_names(router, capability) == names
-    assert _candidate_names(router, LLMCapability.CHAT_ANSWER) == ["groq", "gemini", "mistral", "sarvam"]
+    assert _candidate_names(router, LLMCapability.CHAT_ANSWER) == ["krutrim", "mistral", "groq", "gemini"]
 
 
 def test_conversation_understanding_schema_requires_string_arrays():

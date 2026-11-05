@@ -216,6 +216,60 @@ def test_window_extraction_aliases_issue_description_and_keeps_valid_siblings():
     assert parsed.issues[0].kind == "open_question"
 
 
+def test_glm_flash_reads_text_chunk_and_limits_reasoning():
+    import httpx
+
+    from services.conversation.meeting_pipeline.schemas import MeetingCandidateExtractorResponse
+
+    provider = OpenAICompatibleProvider(
+        name="mistral",
+        api_key="test",
+        base_url="http://localhost",
+        default_model="zai-glm-5-3-flash",
+        timeout_seconds=1,
+        max_retries=0,
+        max_concurrency=1,
+    )
+    seen: dict[str, object] = {}
+
+    async def fake_post(path, payload):
+        seen["payload"] = payload
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "thinking",
+                                    "thinking": [{"type": "text", "text": "Look for commitments, then emit candidates."}],
+                                },
+                                {"type": "text", "text": '{"candidates": []}'},
+                            ]
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 40, "total_tokens": 60},
+            },
+        )
+
+    provider._post_with_retries = fake_post  # type: ignore[method-assign]
+    request = StructuredLLMRequest(
+        model="zai-glm-5-3-flash",
+        schema_name="MeetingCandidateExtractorResponse",
+        messages=[LLMMessage(role="user", content="extract")],
+    )
+    parsed = asyncio.run(provider.generate_structured(request, MeetingCandidateExtractorResponse))
+    assert parsed.candidates == []
+    payload = seen["payload"]
+    assert isinstance(payload, dict)
+    assert payload["reasoning_effort"] == "low"
+    assert payload["model"] == "zai-glm-5-3-flash"
+    assert payload["response_format"]["type"] == "json_schema"
+
+
 def test_mistral_prefers_json_schema_and_bounds_json_object_recovery():
     capability = structured_capabilities("mistral", "ministral-3b-2512")
     assert capability.supports_json_schema is True

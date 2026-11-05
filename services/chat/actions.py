@@ -138,25 +138,40 @@ async def extract_write_spec(
 
 
 async def _strong_write_spec(request: StructuredLLMRequest) -> ChatWriteSpec | None:
-    """Try the reasoning model first; None means fall back to the chat route."""
-    krutrim = get_llm_router().providers.get("krutrim")
-    if not settings.CHAT_WRITE_MODEL or krutrim is None or getattr(krutrim, "configured", True) is False:
-        return None
-    extra_body = {"reasoning_effort": settings.CHAT_WRITE_REASONING_EFFORT} if settings.CHAT_WRITE_REASONING_EFFORT else {}
-    strong_request = request.model_copy(
-        update={
-            "model": settings.CHAT_WRITE_MODEL,
-            "max_tokens": max(request.max_tokens or 0, 2000),
-            "metadata": {**request.metadata, "extra_body": extra_body},
-        },
-        deep=True,
+    """Try Mistral first, then Krutrim gpt-oss-120b. None means use the chat route."""
+    pairs = (
+        (settings.CHAT_WRITE_PROVIDER, settings.CHAT_WRITE_MODEL),
+        (settings.CHAT_WRITE_FALLBACK_PROVIDER, settings.CHAT_WRITE_FALLBACK_MODEL),
     )
-    try:
-        spec = await krutrim.generate_structured(strong_request, ChatWriteSpec)
-    except Exception as error:
-        print("Chat write strong model failed:", {"model": settings.CHAT_WRITE_MODEL, "error": str(error)[:300]})
-        return None
-    return spec if isinstance(spec, ChatWriteSpec) else None
+    seen: set[tuple[str, str]] = set()
+    for provider_name, model in pairs:
+        provider_name = (provider_name or "").strip()
+        model = (model or "").strip()
+        if not provider_name or not model or (provider_name, model) in seen:
+            continue
+        seen.add((provider_name, model))
+        provider = get_llm_router().providers.get(provider_name)
+        if provider is None or getattr(provider, "configured", True) is False:
+            continue
+        extra_body = {}
+        if provider_name == "krutrim" and settings.CHAT_WRITE_REASONING_EFFORT:
+            extra_body = {"reasoning_effort": settings.CHAT_WRITE_REASONING_EFFORT}
+        strong_request = request.model_copy(
+            update={
+                "model": model,
+                "max_tokens": max(request.max_tokens or 0, 2000),
+                "metadata": {**request.metadata, "extra_body": extra_body},
+            },
+            deep=True,
+        )
+        try:
+            spec = await provider.generate_structured(strong_request, ChatWriteSpec)
+        except Exception as error:
+            print("Chat write model failed:", {"provider": provider_name, "model": model, "error": str(error)[:300]})
+            continue
+        if isinstance(spec, ChatWriteSpec):
+            return spec
+    return None
 
 
 async def execute_write_action(

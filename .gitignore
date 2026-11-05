@@ -21,6 +21,7 @@ deploy/staging/*.local.env
 build/
 dist/
 *.egg-info/
+buddy-app.tar
 
 # Testing
 .pytest_cache/

@@ -1,3 +1,5 @@
+# buddy-app:latest is built on a developer machine and loaded on this host.
+# Do not add a build section here. This instance is too small to compile the image.
 services:
   reverse-proxy:
     image: caddy:2.8-alpine
@@ -21,7 +23,6 @@ services:
         max-file: "5"
 
   queue-api:
-    build: .
     image: buddy-app:latest
     restart: unless-stopped
     command: ["uvicorn", "apps.api_gateway.queue_api:app", "--host", "0.0.0.0", "--port", "8080"]
@@ -48,7 +49,6 @@ services:
     logging: *default-logging
 
   buddy-worker:
-    build: .
     image: buddy-app:latest
     restart: unless-stopped
     init: true

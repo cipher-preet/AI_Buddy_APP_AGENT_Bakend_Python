@@ -177,7 +177,7 @@ def test_atomic_event_extraction_routes_through_semantic_extraction():
     assert capability_for_stage(PipelineStage.SEMANTIC_COMPLETENESS) == LLMCapability.SEMANTIC_EXTRACTION
     assert LLMCapability.SEMANTIC_EXTRACTION in router.requested
     assert LLMCapability.FINAL_SYNTHESIS not in router.requested
-    assert _candidate_models(_ci_router(), LLMCapability.SEMANTIC_EXTRACTION) == ["gpt-oss-120b", "gemma-4-31b-it"]
+    assert _candidate_models(_ci_router(), LLMCapability.SEMANTIC_EXTRACTION) == ["zai-glm-5-3-flash", "gpt-oss-120b"]
 
 
 def test_final_synthesis_routes_through_high_accuracy_reasoning():
@@ -421,7 +421,7 @@ def test_model_route_logs_use_intended_capability_names():
     assert capability_log_name(PipelineStage.THREAD_HARD) == "HIGH_ACCURACY_REASONING"
     assert capability_log_name(PipelineStage.VALIDATION) == "VALIDATION"
     assert stage_log_name(PipelineStage.ATOMIC_EVENTS) == "atomic_event_extraction"
-    assert _candidate_models(_ci_router(), LLMCapability.SEMANTIC_EXTRACTION) == ["gpt-oss-120b", "gemma-4-31b-it"]
+    assert _candidate_models(_ci_router(), LLMCapability.SEMANTIC_EXTRACTION) == ["zai-glm-5-3-flash", "gpt-oss-120b"]
     assert _candidate_models(_ci_router(), LLMCapability.FINAL_SYNTHESIS)[0] == "gpt-oss-120b"
     assert _candidate_models(_ci_router(), LLMCapability.VALIDATION)[0] == settings.CONVERSATION_VALIDATION_FALLBACK_MODEL
     assert _candidate_models(_ci_router(), LLMCapability.VALIDATION)[-1] == settings.CONVERSATION_VALIDATION_MODEL

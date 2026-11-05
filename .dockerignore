@@ -13,3 +13,5 @@ README.md
 tests
 logs
 tmp
+*.tar
+buddy-app.tar

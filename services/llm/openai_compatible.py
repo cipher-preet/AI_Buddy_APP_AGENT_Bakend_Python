@@ -104,6 +104,10 @@ class OpenAICompatibleProvider:
             "temperature": request.temperature,
         }
         payload.update(request.metadata.get("extra_body") or {})
+        if self.name == "mistral" and _mistral_glm_model(model):
+            # GLM Flash always returns thinking + text chunks and rejects effort "none".
+            # Low keeps the JSON answer inside the output budget.
+            payload.setdefault("reasoning_effort", "low")
         if self.name == "nvidia":
             # Nemotron 3.5 thinks by default and can leave message.content empty.
             # Documents and mindmaps need the answer in content.
@@ -775,10 +779,66 @@ def _reasoning_detail_texts(message: dict[str, Any]) -> list[str]:
     return texts
 
 
+def _mistral_glm_model(model: str) -> bool:
+    return str(model or "").strip().casefold().startswith("zai-glm")
+
+
+def _flatten_chunk_text(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, list):
+        texts: list[str] = []
+        for item in value:
+            texts.extend(_flatten_chunk_text(item))
+        return texts
+    if isinstance(value, dict):
+        return _flatten_chunk_text(value.get("text") or value.get("content") or value.get("thinking"))
+    return [str(value)]
+
+
+def _split_content_chunks(content: Any) -> tuple[list[str], list[str]]:
+    """Split a chat message into answer text and thinking text.
+
+    Mistral returns zai-glm content as a list of chunks, not a string.
+    Stringifying that list is not JSON and was parsed as MALFORMED_JSON.
+    """
+    if content is None:
+        return [], []
+    if isinstance(content, str):
+        return ([content] if content else []), []
+    if isinstance(content, list):
+        answers: list[str] = []
+        thinking: list[str] = []
+        for item in content:
+            item_answers, item_thinking = _split_content_chunks(item)
+            answers.extend(item_answers)
+            thinking.extend(item_thinking)
+        return answers, thinking
+    if isinstance(content, dict):
+        kind = str(content.get("type") or "").casefold()
+        if kind in {"thinking", "reasoning", "think"}:
+            return [], _flatten_chunk_text(content.get("thinking") or content.get("text") or content.get("content"))
+        answers = _flatten_chunk_text(content.get("text") if "text" in content else content.get("content"))
+        return answers, []
+    return [str(content)], []
+
+
 def _assistant_message_text(message: dict[str, Any]) -> str:
-    content = str(message.get("content") or "")
-    reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "")
-    parts = [content, reasoning, *_reasoning_detail_texts(message), *_tool_call_argument_texts(message)]
+    answers, thinking = _split_content_chunks(message.get("content"))
+    reasoning_source = message.get("reasoning_content")
+    if reasoning_source in (None, ""):
+        reasoning_source = message.get("reasoning")
+    reasoning_answers, reasoning_thinking = _split_content_chunks(reasoning_source)
+    parts = [
+        *answers,
+        *reasoning_answers,
+        *thinking,
+        *reasoning_thinking,
+        *_reasoning_detail_texts(message),
+        *_tool_call_argument_texts(message),
+    ]
     candidates = [part for part in (_sanitize_json_text(value) for value in parts if value) if part]
     for candidate in candidates:
         try:
@@ -800,7 +860,10 @@ def _assistant_message_text(message: dict[str, Any]) -> str:
     for raw in _tool_call_argument_texts(message):
         if raw.strip():
             return raw
-    return content or reasoning
+    for raw in (*answers, *reasoning_answers, *thinking, *reasoning_thinking):
+        if str(raw).strip():
+            return str(raw)
+    return ""
 
 
 def _output_truncated(diagnostics: dict[str, Any] | None, max_tokens: int | None) -> bool:

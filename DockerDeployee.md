@@ -41,9 +41,7 @@ docker compose -f docker-compose.aws.yml --env-file .env.aws logs -f --tail=80 b
 
 `--no-build` is required. Without it, Compose sees `build: .` and compiles on the instance again. A cancelled `docker compose build` does not need to be resumed.
 
-`.env.aws` stays on the server. It is not copied into the image. The worker must log `meeting ffmpeg: /usr/bin/ffmpeg`. If it logs `ffmpeg is not installed`, the loaded image is stale — rebuild it on this PC and `docker load` again.
-
-The worker must log `meeting ffmpeg: /usr/bin/ffmpeg`. If it logs `ffmpeg is not installed`, the image is stale — rebuild with `--no-cache` as above.
+`.env.aws` stays on the server. It is not copied into the image. `docker-compose.aws.yml` has no `build` section, so Compose will not compile on the instance. The worker must log `meeting ffmpeg: /usr/bin/ffmpeg`. If it logs `ffmpeg is not installed`, rebuild the image on this PC and `docker load` again.
 
 ### Stream job ownership
 
@@ -96,3 +94,8 @@ docker compose -f docker-compose.aws.yml --env-file .env.aws ps
 ## Important
 
 The old Cloud Run worker deployment is removed from the local deployment script. Workers should be run on AWS so audio downloads, Sarvam calls, Redis Streams, MongoDB updates, and Qdrant writes happen outside Cloud Run.
+
+
+docker load -i buddy-app.tar
+docker compose -f docker-compose.aws.yml --env-file .env.aws up -d --no-build
+docker compose -f docker-compose.aws.yml --env-file .env.aws logs -f --tail=80 buddy-worker

@@ -13,7 +13,7 @@ ENV IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates gcc ffmpeg \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && test -x /usr/bin/ffmpeg \
     && /usr/bin/ffmpeg -version
@@ -22,7 +22,7 @@ COPY requirements.txt .
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     PIP_CACHE_DIR=/root/.cache/pip pip install --upgrade pip \
-    && PIP_CACHE_DIR=/root/.cache/pip pip install --prefer-binary -r requirements.txt \
+    && PIP_CACHE_DIR=/root/.cache/pip pip install --only-binary=:all: -r requirements.txt \
     && python -c "import firebase_admin; print(f'firebase-admin={firebase_admin.__version__}')" \
     && test -x /usr/bin/ffmpeg
 
