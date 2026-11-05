@@ -1,12 +1,14 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from apps.api_gateway.auth import require_matching_user, require_user
 from apps.api_gateway.config.setting import settings
+from services.auth.identity import AuthenticatedUser
 from services.daily_briefing.force import force_generate_daily_briefing
 from services.daily_briefing.store import DailyBriefingStore
 from services.db.mongo import get_database
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 class ForceGenerateBody(BaseModel):
@@ -19,11 +21,13 @@ class ForceGenerateBody(BaseModel):
 
 @router.get("")
 async def get_daily_briefing(
+    actor: AuthenticatedUser = Depends(require_user),
     user_id: str = Query(..., alias="userId", min_length=1),
     date: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
 ):
+    verified_user_id = require_matching_user(actor, user_id)
     store = DailyBriefingStore(get_database())
-    document = await store.get(user_id, date) if date else await store.get_latest(user_id)
+    document = await store.get(verified_user_id, date) if date else await store.get_latest(verified_user_id)
     if document is None:
         raise HTTPException(status_code=404, detail="Daily briefing not found.")
     document.pop("missedCandidates", None)
@@ -35,17 +39,24 @@ async def get_daily_briefing(
 
 
 @router.post("/force-generate")
-async def force_generate_daily_briefing_route(body: ForceGenerateBody):
+async def force_generate_daily_briefing_route(
+    body: ForceGenerateBody,
+    actor: AuthenticatedUser = Depends(require_user),
+):
     """
-    TEMPORARY test endpoint used by the app "Generate now" button.
-    Runs the full pipeline for the signed-in user (via Node proxy).
+    Manual regeneration for the signed-in user.
+    Node forwards that user's verified bearer token. A session-only Node request
+    mints a short-lived token for the same verified user and does not return it.
+    The midnight scheduler does not call this route. It enqueues Redis events in-process
+    and must not present an end-user token or a queue credential here.
     """
     if not settings.DAILY_BRIEFING_ALLOW_FORCE_GENERATE:
         raise HTTPException(status_code=403, detail="Force generate is disabled.")
+    user_id = require_matching_user(actor, body.userId)
     try:
         result = await force_generate_daily_briefing(
             get_database(),
-            user_id=body.userId,
+            user_id=user_id,
             date_key=body.date,
             period=body.period,
         )
@@ -54,8 +65,5 @@ async def force_generate_daily_briefing_route(body: ForceGenerateBody):
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Force generate failed: {type(error).__name__}: {error}",
-        ) from error
+        raise HTTPException(status_code=500, detail="Force generate failed.") from error
     return {"success": True, "result": result}

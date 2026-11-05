@@ -1,4 +1,5 @@
 import asyncio
+import io
 import mimetypes
 import random
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 import httpx
 from apps.api_gateway.config.setting import settings
 from services.llm.async_runtime import LoopBoundAsyncClient, LoopLocalSemaphore
+from services.runtime.file_io import read_file_bytes
 from services.speech.errors import STTProviderAuthError
 
 
@@ -79,17 +81,19 @@ async def sarvam_transcribe_from_path(
         "language_code": "unknown",
     }
 
-    with open(file_path, "rb") as audio_file:
-        files = {
-            "file": (
-                upload_filename,
-                audio_file,
-                normalized_content_type,
-            )
-        }
+    # The disk read used to happen inside httpx while it walked the multipart
+    # body on the event loop. BytesIO keeps the same multipart field shape.
+    audio_bytes = await read_file_bytes(path)
+    files = {
+        "file": (
+            upload_filename,
+            io.BytesIO(audio_bytes),
+            normalized_content_type,
+        )
+    }
 
-        async with _semaphore.get():
-            response = await _post_with_retries(url, headers, data, files)
+    async with _semaphore.get():
+        response = await _post_with_retries(url, headers, data, files)
 
     if response.status_code >= 400:
         if _is_permanent_audio_error(response):

@@ -10,7 +10,15 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from apps.api_gateway.config.setting import settings
-from services.queue.redis_queue import SPEECH_JOB_TTL_SECONDS, SPEECH_QUEUE, redis_client
+from services.queue.atomic_publish import QueuePayloadConflict, atomic_publish, submission_fingerprint
+from services.queue.redis_queue import (
+    SPEECH_JOB_TTL_SECONDS,
+    SPEECH_QUEUE,
+    SpeechVectorCutoverLocked,
+    redis_client,
+    speech_job_event,
+    speech_vector_transport,
+)
 from services.queue.streams import EventEnvelope
 
 
@@ -59,41 +67,21 @@ async def accept_event(request: Request):
         if event.eventType == "speech.transcribe.requested":
             return await _accept_speech_job(event)
         stream = _stream_for_event(payload, event)
-        accepted_key = f"queue_api:event:{event.eventId}"
-        previous = await redis_client.hgetall(accepted_key)
-        if previous:
-            return JSONResponse(
-                {
-                    "accepted": True,
-                    "duplicate": True,
-                    "eventId": event.eventId,
-                    "correlationId": event.correlationId,
-                    "stream": previous.get("stream") or stream,
-                },
-                status_code=202,
-            )
-
-        redis_message_id = await redis_client.xadd(stream, {"event": event.model_dump_json()})
-        await redis_client.hset(
-            accepted_key,
-            mapping={
-                "stream": stream,
-                "redisMessageId": redis_message_id,
-                "correlationId": event.correlationId,
-                "acceptedAt": str(int(time.time())),
-            },
+        published = await atomic_publish(
+            redis_client,
+            event_id=event.eventId,
+            queue=stream,
+            mode="stream",
+            payload=event.model_dump_json(),
+            fingerprint=submission_fingerprint(event),
+            correlation_id=event.correlationId,
+            event_type=event.eventType,
         )
-        await redis_client.expire(accepted_key, max(86400, settings.S3_PRESIGNED_URL_TTL_SECONDS * 24))
-        return JSONResponse(
-            {
-                "accepted": True,
-                "duplicate": False,
-                "eventId": event.eventId,
-                "correlationId": event.correlationId,
-                "stream": stream,
-            },
-            status_code=202,
-        )
+        return _accepted(event, published.queue, duplicate=published.outcome == "duplicate")
+    except QueuePayloadConflict:
+        return JSONResponse({"detail": "event payload conflict"}, status_code=409)
+    except SpeechVectorCutoverLocked:
+        return JSONResponse({"detail": "speech vector cutover in progress"}, status_code=503)
     except PermissionError as error:
         return JSONResponse({"detail": str(error)}, status_code=401)
     except (ValueError, json.JSONDecodeError) as error:
@@ -191,40 +179,38 @@ async def _accept_speech_job(event: EventEnvelope) -> JSONResponse:
         job.setdefault("conversation_id", event.conversationId)
     job.setdefault("status", "queued")
 
-    accepted_key = f"queue_api:event:{event.eventId}"
-    previous = await redis_client.hgetall(accepted_key)
-    if previous:
-        return JSONResponse(
-            {
-                "accepted": True,
-                "duplicate": True,
-                "eventId": event.eventId,
-                "correlationId": event.correlationId,
-                "stream": previous.get("stream") or SPEECH_QUEUE,
-            },
-            status_code=202,
-        )
-
-    await redis_client.hset(f"speech_job:{job_id}", mapping={key: str(value) for key, value in job.items() if value is not None})
-    await redis_client.expire(f"speech_job:{job_id}", SPEECH_JOB_TTL_SECONDS)
-    await redis_client.lpush(SPEECH_QUEUE, json.dumps(job))
-    await redis_client.hset(
-        accepted_key,
-        mapping={
-            "stream": SPEECH_QUEUE,
-            "redisMessageId": job_id,
-            "correlationId": event.correlationId,
-            "acceptedAt": str(int(time.time())),
-        },
+    mode = "stream" if speech_vector_transport() == "stream" else "list"
+    if mode == "stream":
+        queue_name = settings.REDIS_SPEECH_STREAM
+        queue_payload = speech_job_event(job).model_dump_json()
+    else:
+        queue_name = SPEECH_QUEUE
+        queue_payload = json.dumps(job)
+    published = await atomic_publish(
+        redis_client,
+        event_id=event.eventId,
+        queue=queue_name,
+        mode=mode,
+        payload=queue_payload,
+        fingerprint=submission_fingerprint(event),
+        correlation_id=event.correlationId,
+        check_export_lock=True,
+        event_type=event.eventType,
+        speech_job_key=f"speech_job:{job_id}",
+        speech_job_fields={key: str(value) for key, value in job.items() if value is not None},
+        speech_job_ttl=SPEECH_JOB_TTL_SECONDS,
     )
-    await redis_client.expire(accepted_key, max(86400, settings.S3_PRESIGNED_URL_TTL_SECONDS * 24))
+    return _accepted(event, published.queue, duplicate=published.outcome == "duplicate")
+
+
+def _accepted(event: EventEnvelope, stream: str, *, duplicate: bool) -> JSONResponse:
     return JSONResponse(
         {
             "accepted": True,
-            "duplicate": False,
+            "duplicate": duplicate,
             "eventId": event.eventId,
             "correlationId": event.correlationId,
-            "stream": SPEECH_QUEUE,
+            "stream": stream,
         },
         status_code=202,
     )

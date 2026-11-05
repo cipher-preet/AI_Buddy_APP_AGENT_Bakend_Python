@@ -262,10 +262,16 @@ class DocumentStore:
         model: str | None,
         space_name: str,
     ) -> dict[str, Any] | None:
+        from services.queue.job_lease import require_active_lease
+
+        await require_active_lease()
+        from services.queue.mongo_fence import fenced_find_one_and_update
+
         content_payload = content.model_dump()
         preview = build_document_preview(content_payload)
         preview["spaceName"] = space_name
-        return await self.collection.find_one_and_update(
+        return await fenced_find_one_and_update(
+            self.collection,
             {"_id": {"$in": mongo_id_candidates(document_id)}},
             {
                 "$set": {
@@ -324,7 +330,13 @@ class DocumentStore:
         )
 
     async def mark_failed(self, document_id: str, error: str) -> dict[str, Any] | None:
-        return await self.collection.find_one_and_update(
+        from services.queue.job_lease import require_active_lease
+
+        await require_active_lease()
+        from services.queue.mongo_fence import fenced_find_one_and_update
+
+        return await fenced_find_one_and_update(
+            self.collection,
             {"_id": {"$in": mongo_id_candidates(document_id)}},
             {
                 "$set": {

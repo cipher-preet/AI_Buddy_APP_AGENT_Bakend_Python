@@ -170,24 +170,30 @@ async def extract_requirements(
     return result
 
 
+def stable_evidence_id(operation_id: str, fact: str, url: str) -> str:
+    return hashlib.sha256(f"{operation_id}\n{fact}\n{url}".encode()).hexdigest()[:32]
+
+
 def evidence_docs(
     goal: dict[str, Any],
     session_id: str,
     extraction: EvidenceExtractionResult,
     sources: list[dict[str, Any]],
+    operation_id: str = "",
 ) -> list[dict[str, Any]]:
     now = utc_now()
     source_by_url = {str(item.get("url") or ""): item for item in sources}
     docs = []
     for item in extraction.requirements:
         source = source_by_url.get(item.sourceUrl) or {}
+        fact = item.text[:800]
         docs.append(
             {
-                "evidenceId": uuid4().hex,
+                "evidenceId": stable_evidence_id(operation_id, fact, item.sourceUrl) if operation_id else uuid4().hex,
                 "goalId": goal.get("_id"),
                 "ownerId": goal.get("ownerId"),
                 "sessionId": session_id,
-                "fact": item.text[:800],
+                "fact": fact,
                 "kind": item.kind if item.kind in {"FACT", "INTERPRETATION", "ASSUMPTION", "DISAGREEMENT"} else "INTERPRETATION",
                 "sourceTitle": (item.sourceTitle or source.get("title") or "")[:240],
                 "sourceUrl": item.sourceUrl,
@@ -328,7 +334,15 @@ async def run_research(
     goal: dict[str, Any],
     *,
     force_refresh: bool = False,
+    job_id: str = "",
 ) -> dict[str, Any]:
+    from services.goals.store import research_operation_id
+
+    operation_id = research_operation_id(goal.get("_id"), job_id) if job_id and store is not None else ""
+    if operation_id:
+        existing = await store.load_completed_research(goal.get("_id"), operation_id)
+        if existing:
+            return existing
     cached = [] if force_refresh else await recall_knowledge(goal)
     plan = await plan_research(goal, cached_hits=len(cached))
     session_id = uuid4().hex
@@ -346,7 +360,7 @@ async def run_research(
             "createdAt": now,
         }
         if store is not None:
-            await store.save_research_session(goal, summary, [], [])
+            await store.save_research_session(goal, summary, [], [], operation_id or None)
         return {"plan": plan.model_dump(), "sources": [], "evidence": [], "summary": summary, "cached": cached}
 
     provider = get_search_provider()
@@ -384,16 +398,18 @@ async def run_research(
         break
 
     extraction = await extract_requirements(goal, sources) if sources else EvidenceExtractionResult(insufficientEvidence=True)
-    docs = evidence_docs(goal, session_id, extraction, sources)
+    docs = evidence_docs(goal, session_id, extraction, sources, operation_id)
     if cached:
         for item in cached:
+            fact = str(item.get("fact") or "")
+            url = str(item.get("url") or "")
             docs.append(
                 {
-                    "evidenceId": uuid4().hex,
+                    "evidenceId": stable_evidence_id(operation_id, fact, url) if operation_id else uuid4().hex,
                     "goalId": goal.get("_id"),
                     "ownerId": goal.get("ownerId"),
                     "sessionId": session_id,
-                    "fact": item.get("fact"),
+                    "fact": fact,
                     "kind": "FACT",
                     "sourceTitle": item.get("title") or "cached knowledge",
                     "sourceUrl": item.get("url") or "",
@@ -424,7 +440,7 @@ async def run_research(
         "createdAt": now,
     }
     if store is not None:
-        await store.save_research_session(goal, summary, sources, docs)
+        await store.save_research_session(goal, summary, sources, docs, operation_id or None)
     return {
         "plan": plan.model_dump(),
         "sources": sources,

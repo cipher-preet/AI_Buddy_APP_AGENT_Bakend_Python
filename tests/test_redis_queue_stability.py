@@ -39,6 +39,69 @@ class _FakeRedis:
         self.reads = 0
         self.pending: dict[str, list] = {}
         self.acked: list[tuple[str, str, str]] = []
+        self.kv: dict[str, str] = {}
+
+    async def set(self, name, value, nx=False, px=None, ex=None):
+        if nx and name in self.kv:
+            return None
+        if isinstance(value, bytes):
+            value = value.decode()
+        self.kv[name] = str(value)
+        return True
+
+    async def get(self, name):
+        return self.kv.get(name)
+
+    async def delete(self, *names):
+        removed = 0
+        for name in names:
+            if name in self.kv:
+                del self.kv[name]
+                removed += 1
+        return removed
+
+    async def incr(self, name):
+        current = int(self.kv.get(name) or 0) + 1
+        self.kv[name] = str(current)
+        return current
+
+    async def pexpire(self, name, ttl):
+        return name in self.kv
+
+    async def eval(self, script, numkeys, *args):
+        if "job-lease-" in str(script):
+            from services.queue.job_lease import apply_job_lease_eval
+
+            def write(key, value, px_ms):
+                self.kv[key] = str(value)
+
+            def incr(key):
+                current = int(self.kv.get(key) or 0) + 1
+                self.kv[key] = str(current)
+                return current
+
+            return apply_job_lease_eval(
+                lambda key: self.kv.get(key),
+                write,
+                lambda key: self.kv.pop(key, None),
+                incr,
+                lambda key, ttl: key in self.kv,
+                script,
+                numkeys,
+                args,
+            )
+        key = args[0]
+        token = args[1] if len(args) > 1 else None
+        if self.kv.get(key) == token:
+            del self.kv[key]
+            return 1
+        return 0
+
+    async def xpending_range(self, stream, group, min="-", max="+", count=10, **kwargs):
+        return []
+
+    async def xclaim(self, *args, **kwargs):
+        return []
 
     async def xgroup_create(self, stream, group, id="0", mkstream=True):
         return True

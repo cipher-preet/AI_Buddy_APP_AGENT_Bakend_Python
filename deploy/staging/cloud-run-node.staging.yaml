@@ -1,0 +1,22 @@
+# NOT A DEPLOY FILE.
+# Node Cloud Run is not part of the minimum staging design.
+# The names below match Node_Backend/deploy.bat, with a staging service name.
+# Do not run gcloud. Do not copy production values into this file.
+# PROJECT: buddy-505709 is the production script project. A staging service
+# must be a new name. The live revision was not queried.
+
+# service: buddy-node-backend-staging
+# region: asia-south1
+# min-instances: 0
+# cpu-throttling: required if this service is ever created
+
+AUTH_TOKEN_SECRET: "replace-with-staging-auth-token-secret"
+SESSION_SECRET: "replace-with-staging-session-secret"
+MONGO_URI: "mongodb://staging:replace-with-staging-mongo-password@staging-mongo:27017/buddy?authSource=admin"
+GOAL_REDIS_URL: "redis://:replace-with-staging-goal-redis-password@redis-goals:6379/0"
+REMINDER_REDIS_URL: "redis://:replace-with-staging-reminder-redis-password@redis-reminder:6379/0"
+QUEUE_API_BASE_URL: "https://queue.example.invalid"
+QUEUE_API_SERVICE_TOKEN: "replace-with-staging-queue-token"
+QUEUE_API_HMAC_SECRET: "replace-with-staging-queue-hmac"
+AWS_S3_BUCKET: ""
+FCM_ENABLED: "false"

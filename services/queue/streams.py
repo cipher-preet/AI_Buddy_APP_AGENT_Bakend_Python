@@ -13,13 +13,30 @@ from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from redis.exceptions import (
     ConnectionError,
     MaxConnectionsError,
+    RedisError,
     ResponseError,
     TimeoutError as RedisTimeoutError,
 )
 
 from apps.api_gateway.config.setting import settings
+from services.observability.diagnostics import diag_log
 from services.queue.factory import use_queue_api
 from services.queue.http_queue import QueueApiPublisher
+from services.queue.job_lease import (
+    LeaseUnavailable,
+    LeavePending,
+    StaleOwnershipError,
+    acquire_lease,
+    logical_job_key,
+    reclaim_min_idle_ms,
+    release_lease,
+    remember_completion,
+    renew_lease,
+    reset_lease,
+    spawn_heartbeat,
+    preserve_pending_delivery,
+    push_lease,
+)
 from services.queue.redis_queue import redis_client
 from services.queue.shared_redis import (
     capacity_backoff_seconds,
@@ -119,9 +136,9 @@ class RedisStreamProducer:
             await QueueApiPublisher().publish(payload)
             return event.eventId
         fields = {"event": event.model_dump_json()}
-        if maxlen and maxlen > 0:
-            # Approximate trim keeps memory bounded without blocking every XADD.
-            return await self._redis.xadd(stream, fields, maxlen=maxlen, approximate=True)
+        # maxlen is accepted and ignored. Redis 7 MAXLEN removes entries that
+        # another consumer group has not delivered or acknowledged.
+        del maxlen
         return await self._redis.xadd(stream, fields)
 
 
@@ -156,13 +173,16 @@ class RedisStreamConsumer:
         self._last_claim_at = 0.0
         self._capacity_failures = 0
         self._timeout_failures = 0
+        self._inflight: set[str] = set()
+        self._handler_tasks: set[asyncio.Task[None]] = set()
 
     async def _ack_and_cleanup(self, message_id: str) -> None:
         await self._redis.xack(self.stream, self.group, message_id)
         if not self.delete_after_ack:
             return
         try:
-            # Drop finished entries immediately so Redis Cloud memory stays free.
+            # Delete only this acknowledged id. Do not trim the rest of the stream:
+            # a length cap also deletes entries that are still pending.
             await self._redis.xdel(self.stream, message_id)
         except Exception as error:
             print(
@@ -174,25 +194,9 @@ class RedisStreamConsumer:
                 },
                 flush=True,
             )
-        if self.stream_maxlen:
-            try:
-                # Exact trim after each finished job — critical on Essentials 30MB.
-                await self._redis.xtrim(self.stream, maxlen=self.stream_maxlen, approximate=False)
-            except Exception as error:
-                print(
-                    "Redis stream xtrim after ack failed:",
-                    {
-                        "stream": self.stream,
-                        "maxlen": self.stream_maxlen,
-                        "error": str(error),
-                    },
-                    flush=True,
-                )
 
     async def _xadd_bounded(self, stream: str, fields: dict[str, Any], *, maxlen: int | None = None) -> str:
-        limit = maxlen if maxlen and maxlen > 0 else self.stream_maxlen
-        if limit and limit > 0:
-            return await self._redis.xadd(stream, fields, maxlen=limit, approximate=True)
+        del maxlen
         return await self._redis.xadd(stream, fields)
 
     async def ensure_group(self) -> None:
@@ -205,32 +209,26 @@ class RedisStreamConsumer:
         except ResponseError as error:
             if "BUSYGROUP" not in str(error):
                 raise
-        if self.stream_maxlen and self.delete_after_ack:
-            try:
-                trimmed = await self._redis.xtrim(
-                    self.stream,
-                    maxlen=self.stream_maxlen,
-                    approximate=False,
-                )
-                if trimmed:
-                    print(
-                        "Redis stream trimmed on startup:",
-                        {
-                            "stream": self.stream,
-                            "maxlen": self.stream_maxlen,
-                            "removed": int(trimmed),
-                        },
-                        flush=True,
-                    )
-            except Exception as error:
-                print(
-                    "Redis stream startup trim failed:",
-                    {"stream": self.stream, "error": str(error)},
-                    flush=True,
-                )
 
     async def stop(self) -> None:
         self._shutdown.set()
+
+    async def drain(self) -> None:
+        """Finish in-flight handlers. Cancel only after the existing drain timeout."""
+        pending = {task for task in self._handler_tasks if not task.done()}
+        if not pending:
+            return
+        timeout = float(settings.WORKER_GRACEFUL_SHUTDOWN_SECONDS)
+        try:
+            await asyncio.wait(pending, timeout=timeout)
+        except asyncio.CancelledError:
+            await asyncio.shield(asyncio.wait(pending, timeout=timeout))
+            raise
+        leftover = {task for task in pending if not task.done()}
+        for task in leftover:
+            task.cancel()
+        if leftover:
+            await asyncio.wait(leftover)
 
     def pool_identity(self) -> int:
         pool = getattr(self._redis, "connection_pool", None)
@@ -255,9 +253,16 @@ class RedisStreamConsumer:
                 if self._shutdown.is_set():
                     break
                 await self._semaphore.acquire()
-                tasks.append(asyncio.create_task(self._handle_message(message_id, fields)))
-        if tasks:
-            await asyncio.gather(*tasks)
+                if self._shutdown.is_set():
+                    self._semaphore.release()
+                    break
+                task = asyncio.create_task(self._handle_message(message_id, fields))
+                self._handler_tasks.add(task)
+                task.add_done_callback(self._handler_tasks.discard)
+                tasks.append(task)
+        pending = set(tasks)
+        while pending and not self._shutdown.is_set():
+            _, pending = await asyncio.wait(pending, timeout=0.2)
 
     async def maybe_claim_stale(self) -> None:
         interval = float(getattr(settings, "REDIS_CLAIM_INTERVAL_SECONDS", 30) or 30)
@@ -334,18 +339,28 @@ class RedisStreamConsumer:
                 "concurrency": self.concurrency,
             },
         )
-        while not self._shutdown.is_set():
-            await self.maybe_claim_stale()
-            messages = await self._read_or_recover(block_ms=settings.REDIS_BLOCK_MS)
-            await self.dispatch_messages(messages)
+        try:
+            while not self._shutdown.is_set():
+                await self.maybe_claim_stale()
+                if self._shutdown.is_set():
+                    break
+                messages = await self._read_or_recover(block_ms=settings.REDIS_BLOCK_MS)
+                if self._shutdown.is_set():
+                    break
+                await self.dispatch_messages(messages)
+        finally:
+            self._shutdown.set()
+            await self.drain()
 
     async def claim_stale(self) -> None:
+        if self._shutdown.is_set():
+            return
         try:
             claimed = await self._redis.xautoclaim(
                 self.stream,
                 self.group,
                 self.consumer_name,
-                min_idle_time=settings.REDIS_CLAIM_IDLE_MS,
+                min_idle_time=reclaim_min_idle_ms(),
                 start_id="0-0",
                 count=settings.REDIS_BATCH_SIZE,
             )
@@ -355,18 +370,218 @@ class RedisStreamConsumer:
         for message_id, fields in entries:
             if self._shutdown.is_set():
                 break
+            message_key = _message_key(message_id)
+            if message_key in self._inflight:
+                diag_log(
+                    "job_duplicate_suppressed",
+                    stream=self.stream,
+                    message_id=message_key,
+                    worker_id=self.consumer_name,
+                    reason="reclaim_inflight",
+                )
+                diag_log(
+                    "queue_duplicate_suppressed",
+                    stream=self.stream,
+                    message_id=message_key,
+                    worker_id=self.consumer_name,
+                    reason="reclaim_inflight",
+                )
+                continue
+            diag_log(
+                "job_reclaimed",
+                stream=self.stream,
+                group=self.group,
+                message_id=message_key,
+                worker_id=self.consumer_name,
+                min_idle_ms=reclaim_min_idle_ms(),
+            )
             await self._semaphore.acquire()
-            await self._handle_message(message_id, fields)
+            if self._shutdown.is_set():
+                self._semaphore.release()
+                break
+            task = asyncio.create_task(self._handle_message(message_id, fields, reclaimed=True))
+            self._handler_tasks.add(task)
+            task.add_done_callback(self._handler_tasks.discard)
+            while not task.done() and not self._shutdown.is_set():
+                await asyncio.wait({task}, timeout=0.2)
 
-    async def _handle_message(self, message_id: str, fields: dict[str, Any]) -> None:
+    async def _handle_message(self, message_id: str, fields: dict[str, Any], *, reclaimed: bool = False) -> None:
+        message_key = _message_key(message_id)
         try:
-            event = EventEnvelope.model_validate_json(fields["event"])
-            await self.handler(event)
-            await self._ack_and_cleanup(message_id)
-        except Exception as error:
-            await self._handle_failure(message_id, fields, error)
+            if message_key in self._inflight:
+                diag_log(
+                    "job_duplicate_suppressed",
+                    stream=self.stream,
+                    message_id=message_key,
+                    worker_id=self.consumer_name,
+                    reason="in_flight",
+                )
+                diag_log(
+                    "queue_duplicate_suppressed",
+                    stream=self.stream,
+                    message_id=message_key,
+                    worker_id=self.consumer_name,
+                    reason="in_flight",
+                )
+                return
+            self._inflight.add(message_key)
+            try:
+                await self._process_message(message_key, fields, reclaimed=reclaimed)
+            finally:
+                self._inflight.discard(message_key)
         finally:
             self._semaphore.release()
+
+    async def _process_message(self, message_id: str, fields: dict[str, Any], *, reclaimed: bool) -> None:
+        started = time.perf_counter()
+        try:
+            event = EventEnvelope.model_validate_json(fields["event"])
+        except Exception as error:
+            await self._handle_failure(message_id, fields, error)
+            return
+
+        try:
+            decision = await acquire_lease(
+                self._redis,
+                event,
+                owner=self.consumer_name,
+                message_id=message_id,
+            )
+        except LeaseUnavailable:
+            return
+
+        if decision.action in {"busy", "duplicate"}:
+            await preserve_pending_delivery(
+                self._redis,
+                stream=self.stream,
+                group=self.group,
+                consumer_name=self.consumer_name,
+                message_id=message_id,
+            )
+            return
+        if decision.action == "completed":
+            await self._ack_and_cleanup(message_id)
+            return
+        lease = decision.lease
+        if lease is None:
+            return
+
+        scope = push_lease(lease)
+        heartbeat = spawn_heartbeat(
+            self._redis,
+            lease,
+            stream=self.stream,
+            group=self.group,
+            consumer_name=self.consumer_name,
+            message_id=message_id,
+        )
+        try:
+            diag_log(
+                "job_processing_started",
+                job_type=lease.event_type,
+                logical_job_id=lease.logical_key,
+                attempt=lease.token,
+                worker_id=lease.owner,
+                retry_count=lease.retry_count,
+                reclaimed=reclaimed,
+                stream=self.stream,
+            )
+            try:
+                await self.handler(event)
+            except asyncio.CancelledError:
+                lease.lost = True
+                lease.reason = "cancelled"
+                raise
+            if lease.lost or not await _still_owned(lease):
+                diag_log(
+                    "job_lease_expired",
+                    job_type=lease.event_type,
+                    logical_job_id=lease.logical_key,
+                    attempt=lease.token,
+                    worker_id=lease.owner,
+                    retry_count=lease.retry_count,
+                    reason=lease.reason or "lost_before_ack",
+                )
+                return
+            if lease.settled:
+                remembered = await remember_completion(self._redis, lease)
+                if not remembered:
+                    return
+            diag_log(
+                "job_processing_completed",
+                job_type=lease.event_type,
+                logical_job_id=lease.logical_key,
+                attempt=lease.token,
+                worker_id=lease.owner,
+                retry_count=lease.retry_count,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                stream=self.stream,
+            )
+            await self._ack_and_cleanup(message_id)
+        except LeavePending:
+            await preserve_pending_delivery(
+                self._redis,
+                stream=self.stream,
+                group=self.group,
+                consumer_name=self.consumer_name,
+                message_id=message_id,
+            )
+            diag_log(
+                "job_claim_rejected_active_owner",
+                job_type=lease.event_type,
+                logical_job_id=lease.logical_key,
+                attempt=lease.token,
+                worker_id=lease.owner,
+                retry_count=lease.retry_count,
+                reason="durable_owner",
+                stream=self.stream,
+            )
+            return
+        except StaleOwnershipError:
+            lease.lost = True
+            diag_log(
+                "job_lease_expired",
+                job_type=lease.event_type,
+                logical_job_id=lease.logical_key,
+                attempt=lease.token,
+                worker_id=lease.owner,
+                retry_count=lease.retry_count,
+                reason="stale_commit",
+            )
+            return
+        except Exception as error:
+            if lease.lost:
+                diag_log(
+                    "job_lease_expired",
+                    job_type=lease.event_type,
+                    logical_job_id=lease.logical_key,
+                    attempt=lease.token,
+                    worker_id=lease.owner,
+                    retry_count=lease.retry_count,
+                    reason=lease.reason or type(error).__name__,
+                )
+                return
+            diag_log(
+                "job_processing_failed",
+                job_type=lease.event_type,
+                logical_job_id=lease.logical_key,
+                attempt=lease.token,
+                worker_id=lease.owner,
+                retry_count=lease.retry_count,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                exception_type=type(error).__name__,
+                stream=self.stream,
+            )
+            await self._handle_failure(message_id, fields, error)
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+            reset_lease(scope)
+            if lease is not None and not lease.released and not lease.lost:
+                await release_lease(self._redis, lease)
 
     async def _handle_failure(self, message_id: str, fields: dict[str, Any], error: Exception) -> None:
         try:
@@ -385,7 +600,13 @@ class RedisStreamConsumer:
             await self._xadd_bounded(
                 settings.REDIS_DEAD_LETTER_STREAM,
                 {"event": json.dumps({"raw": fields, "error": str(error)})},
-                maxlen=settings.REDIS_CLOUD_DEAD_LETTER_MAXLEN if not self._uses_default_redis else None,
+            )
+            diag_log(
+                "job_dead_lettered",
+                stream=self.stream,
+                message_id=message_id,
+                worker_id=self.consumer_name,
+                reason="invalid_event_payload",
             )
             await self._ack_and_cleanup(message_id)
             return
@@ -412,7 +633,29 @@ class RedisStreamConsumer:
                     "error": str(error),
                     "sourceStream": self.stream,
                 },
-                maxlen=settings.REDIS_CLOUD_DEAD_LETTER_MAXLEN if not self._uses_default_redis else None,
+            )
+            dead_letter_reason = (
+                "retry_exhausted" if not isinstance(error, NonRetryableQueueError) else "non_retryable"
+            )
+            diag_log(
+                "job_dead_lettered",
+                job_type=event.eventType,
+                logical_job_id=logical_job_key(event),
+                worker_id=self.consumer_name,
+                retry_count=event.attempt,
+                stream=self.stream,
+                message_id=message_id,
+                reason=dead_letter_reason,
+            )
+            diag_log(
+                "queue_dead_lettered",
+                job_type=event.eventType,
+                logical_job_id=logical_job_key(event),
+                worker_id=self.consumer_name,
+                retry_count=event.attempt,
+                stream=self.stream,
+                message_id=message_id,
+                reason=dead_letter_reason,
             )
             await self._ack_and_cleanup(message_id)
             if self.on_dead_letter is not None:
@@ -444,8 +687,27 @@ class RedisStreamConsumer:
                 "error": str(error),
             },
         )
+        diag_log(
+            "job_retry_scheduled",
+            job_type=event.eventType,
+            logical_job_id=logical_job_key(event),
+            worker_id=self.consumer_name,
+            retry_count=retry.attempt,
+            stream=self.stream,
+            message_id=message_id,
+        )
+        diag_log(
+            "queue_retry_scheduled",
+            job_type=event.eventType,
+            logical_job_id=logical_job_key(event),
+            worker_id=self.consumer_name,
+            retry_count=retry.attempt,
+            stream=self.stream,
+            message_id=message_id,
+        )
         if self._uses_default_redis:
             # Conversation retry relay re-publishes from REDIS_RETRY_STREAM.
+            # The original message is acknowledged only after this write succeeds.
             await self._redis.xadd(
                 settings.REDIS_RETRY_STREAM,
                 {
@@ -495,27 +757,36 @@ class MultiplexedStreamHub:
             },
             flush=True,
         )
-        while not self._shutdown.is_set():
-            had_work = False
-            claim_consumer = self.consumers[self._claim_index % len(self.consumers)]
-            self._claim_index += 1
-            await claim_consumer.maybe_claim_stale()
+        try:
+            while not self._shutdown.is_set():
+                had_work = False
+                claim_consumer = self.consumers[self._claim_index % len(self.consumers)]
+                self._claim_index += 1
+                await claim_consumer.maybe_claim_stale()
+                for consumer in self.consumers:
+                    if self._shutdown.is_set():
+                        break
+                    if consumer._semaphore.locked():
+                        continue
+                    messages = await consumer._read_or_recover(block_ms=0)
+                    if not messages:
+                        continue
+                    had_work = True
+                    task = asyncio.create_task(consumer.dispatch_messages(messages))
+                    self._inflight.add(task)
+                    task.add_done_callback(self._inflight.discard)
+                if had_work:
+                    self._idle.hit()
+                else:
+                    await asyncio.sleep(self._idle.miss())
+        finally:
+            self._shutdown.set()
             for consumer in self.consumers:
-                if self._shutdown.is_set():
-                    break
-                if consumer._semaphore.locked():
-                    continue
-                messages = await consumer._read_or_recover(block_ms=0)
-                if not messages:
-                    continue
-                had_work = True
-                task = asyncio.create_task(consumer.dispatch_messages(messages))
-                self._inflight.add(task)
-                task.add_done_callback(self._inflight.discard)
-            if had_work:
-                self._idle.hit()
-            else:
-                await asyncio.sleep(self._idle.miss())
+                await consumer.stop()
+            if self._inflight:
+                await asyncio.wait(self._inflight, timeout=1)
+            for consumer in self.consumers:
+                await consumer.drain()
 
 
 def group_stream_runners(items: Sequence[Any]) -> list[Any]:
@@ -535,6 +806,21 @@ def group_stream_runners(items: Sequence[Any]) -> list[Any]:
             runners.append(MultiplexedStreamHub(group))
     runners.extend(others)
     return runners
+
+
+def _message_key(message_id: Any) -> str:
+    if isinstance(message_id, bytes):
+        return message_id.decode("utf-8", errors="replace")
+    return str(message_id)
+
+
+async def _still_owned(lease) -> bool:
+    try:
+        return await renew_lease(lease.redis, lease)
+    except (RedisError, OSError, LeaseUnavailable):
+        lease.lost = True
+        lease.reason = "ownership_uncertain"
+        return False
 
 
 def retry_delay(attempt: int) -> float:

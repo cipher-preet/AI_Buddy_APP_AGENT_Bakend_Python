@@ -24,6 +24,7 @@ from services.conversation.stt_failure import (
 from services.conversation.workflow import ConversationProcessingWorkflow
 from services.db.mongo import get_database
 from services.observability.diagnostics import RetryRelayWindow, active_jobs, diag_log
+from services.queue.job_lease import StaleOwnershipError, current_lease, mark_current_job_completed
 from services.queue.streams import EventEnvelope, NonRetryableQueueError, RedisStreamConsumer
 from services.queue.streams import RedisStreamProducer
 from services.queue.redis_queue import redis_client
@@ -60,6 +61,7 @@ async def handle_stt_event(event: EventEnvelope) -> None:
     sequence_number = int(payload["sequenceNumber"])
     existing = await repository.get_transcript_chunk(conversation_id, sequence_number)
     if existing and existing.sttStatus == STTStatus.COMPLETED:
+        mark_current_job_completed()
         print(
             "Duplicate STT event skipped:",
             {
@@ -174,6 +176,7 @@ async def handle_stt_event(event: EventEnvelope) -> None:
         )
         conversation = await repository.get_conversation(conversation_id)
         if conversation and conversation.status in {ConversationStatus.COMPLETED, ConversationStatus.FAILED}:
+            mark_current_job_completed()
             print(
                 "Late STT completion after terminal conversation status:",
                 {
@@ -214,7 +217,10 @@ async def handle_stt_event(event: EventEnvelope) -> None:
                     payload={"expectedLastSequence": conversation.expectedLastSequence},
                 ),
             )
+        mark_current_job_completed()
     except Exception as error:
+        if isinstance(error, StaleOwnershipError):
+            raise
         await _record_stt_sequence_failure(
             repository,
             event=event,
@@ -402,11 +408,16 @@ async def handle_processing_event(event: EventEnvelope) -> None:
         )
         print("Meeting processing completed:", {"conversationId": event.conversationId, "provider": getattr(provider, "name", None), "model": model})
         conversation = await repository.get_conversation(event.conversationId)
+        if conversation and conversation.status == ConversationStatus.COMPLETED:
+            mark_current_job_completed()
         if conversation and conversation.status in {ConversationStatus.COMPLETED, ConversationStatus.PARTIAL}:
             if getattr(conversation, "sourceType", None) == "meeting_extension":
                 _prepare_chat_index_in_background(event.userId, event.conversationId)
             await request_schedule_extraction(event.conversationId, event.userId, event.spaceId, event.eventId)
     except asyncio.TimeoutError as error:
+        lease = current_lease()
+        if lease is not None and lease.lost:
+            raise StaleOwnershipError(lease.logical_key, reason=lease.reason or "lease_lost") from error
         message = f"Conversation processing timed out after {settings.CONVERSATION_PROCESSING_TIMEOUT_SECONDS} seconds."
         print("Meeting processing timed out:", {"conversationId": event.conversationId, "error": message})
         await repository.mark_active_extraction_run_failed(event.conversationId, message)

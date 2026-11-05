@@ -102,8 +102,14 @@ def extract_webm_init(data: bytes) -> bytes:
     return b""
 
 
-def write_standalone_webm(chunk_path: Path, init_bytes: bytes, output_path: Path | None = None) -> Path:
-    payload = chunk_path.read_bytes()
+def write_standalone_webm(
+    chunk_path: Path,
+    init_bytes: bytes,
+    output_path: Path | None = None,
+    payload: bytes | None = None,
+) -> Path:
+    if payload is None:
+        payload = chunk_path.read_bytes()
     if has_webm_header(payload) or not init_bytes:
         return chunk_path
     destination = output_path or chunk_path.with_name(f"{chunk_path.stem}.standalone.webm")

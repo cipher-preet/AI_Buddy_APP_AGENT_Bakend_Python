@@ -168,7 +168,10 @@ async def transcribe_audio_service(file: UploadFile, user_id: str, space_id: str
                 await redis_client.hset(f"speech_job:{job_id}", mapping=job)
                 await expire_speech_job(job_id)
                 await push_speech_job(job)
-        except Exception:
+        except Exception as error:
+            paused = "status 503" in str(error) or "speech-vector-export-locked" in str(error)
+            if paused:
+                raise
             if not use_queue_api():
                 await redis_client.hset(
                     f"speech_job:{job_id}",

@@ -1,10 +1,12 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from apps.api_gateway.auth import require_matching_user, require_user
+from services.auth.identity import AuthenticatedUser
 from services.db.mongo import get_database
 from services.reminders.mongo_store import MongoReminderStore
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 class RegisterDeviceTokenRequest(BaseModel):
@@ -14,8 +16,11 @@ class RegisterDeviceTokenRequest(BaseModel):
 
 
 @router.post("/device-tokens")
-async def register_device_token(request: RegisterDeviceTokenRequest):
-    user_id = request.userId.strip()
+async def register_device_token(
+    request: RegisterDeviceTokenRequest,
+    actor: AuthenticatedUser = Depends(require_user),
+):
+    user_id = require_matching_user(actor, request.userId)
     token = request.token.strip()
     if not user_id or not token:
         raise HTTPException(status_code=400, detail="userId and token are required")

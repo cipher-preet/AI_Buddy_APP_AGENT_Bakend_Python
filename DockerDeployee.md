@@ -21,24 +21,41 @@ Cloud Run uses `cloud-run-api.env`. Set production secrets through a secure runt
 
 ## AWS Worker Stack
 
-On the AWS host, create `.env.aws` from `.env.aws.example`, then run:
+Do not run `docker compose build` on the EC2 instance. The instance is too small for `apt` and the Python dependency install. `queue-api` and `buddy-worker` share one image, `buddy-app:latest`. Build that image on this PC, copy it to the instance, then start the stack without a build.
 
-```bash
-docker compose -f docker-compose.aws.yml --env-file .env.aws build
-docker compose -f docker-compose.aws.yml --env-file .env.aws up -d
+On this PC, from `D:\AI_Personal_Buddy\AI_Orchestration`:
+
+```bat
+docker build -t buddy-app:latest .
+docker save buddy-app:latest -o buddy-app.tar
+scp buddy-app.tar ubuntu@3.7.237.120:~/buddy/buddy-app.tar
 ```
 
-After pulling new code, rebuild the worker so Python deps (including `firebase-admin`) and FFmpeg are installed. Pip can sit on `Collecting cryptography` / `boto3` for a few minutes on a small EC2 — do not Ctrl+C.
-
-Prefer a dedicated build so Redis/Caddy are not competing for RAM:
+On the EC2 host, in `~/buddy`, after `.env.aws` is already there:
 
 ```bash
-docker compose -f docker-compose.aws.yml --env-file .env.aws build --no-cache buddy-worker
-docker compose -f docker-compose.aws.yml --env-file .env.aws up -d
+docker load -i buddy-app.tar
+docker compose -f docker-compose.aws.yml --env-file .env.aws up -d --no-build
 docker compose -f docker-compose.aws.yml --env-file .env.aws logs -f --tail=80 buddy-worker
 ```
 
+`--no-build` is required. Without it, Compose sees `build: .` and compiles on the instance again. A cancelled `docker compose build` does not need to be resumed.
+
+`.env.aws` stays on the server. It is not copied into the image. The worker must log `meeting ffmpeg: /usr/bin/ffmpeg`. If it logs `ffmpeg is not installed`, the loaded image is stale — rebuild it on this PC and `docker load` again.
+
 The worker must log `meeting ffmpeg: /usr/bin/ffmpeg`. If it logs `ffmpeg is not installed`, the image is stale — rebuild with `--no-cache` as above.
+
+### Stream job ownership
+
+Long jobs keep a Redis lease so a slow transcription or meeting is not reclaimed at 15 seconds. Defaults are safe to leave unset:
+
+```text
+JOB_LEASE_TTL_SECONDS=90
+JOB_LEASE_HEARTBEAT_SECONDS=20
+JOB_COMPLETION_TTL_SECONDS=86400
+```
+
+`JOB_LEASE_HEARTBEAT_SECONDS` must be at most one third of `JOB_LEASE_TTL_SECONDS`. Reclaim waits at least the lease TTL even if `REDIS_CLAIM_IDLE_MS` is lower. `WORKER_GRACEFUL_SHUTDOWN_SECONDS` is how long in-flight jobs may finish after SIGTERM.
 
 ### Reminder / FCM (required when `FCM_ENABLED=true`)
 

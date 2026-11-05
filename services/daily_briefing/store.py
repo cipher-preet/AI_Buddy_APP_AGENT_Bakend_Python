@@ -218,7 +218,13 @@ class DailyBriefingStore:
         )
 
     async def mark_failed(self, user_id: str, date_key: str, error: str) -> None:
-        await self.collection.update_one(
+        from services.queue.job_lease import require_active_lease
+
+        await require_active_lease()
+        from services.queue.mongo_fence import fenced_update_one
+
+        await fenced_update_one(
+            self.collection,
             {"userId": user_id, "dateKey": date_key},
             {
                 "$set": {
@@ -240,6 +246,9 @@ class DailyBriefingStore:
         stats: SourceStats,
         pipeline_version: str = PIPELINE_VERSION,
     ) -> DailyBriefingDocument:
+        from services.queue.job_lease import require_active_lease
+
+        await require_active_lease()
         now = utc_now()
         document = DailyBriefingDocument(
             userId=user_id,
@@ -275,7 +284,10 @@ class DailyBriefingStore:
         )
         payload = document.model_dump()
         payload["status"] = BriefingStatus.READY.value
-        await self.collection.update_one(
+        from services.queue.mongo_fence import fenced_update_one
+
+        await fenced_update_one(
+            self.collection,
             {"userId": user_id, "dateKey": date_key},
             {"$set": payload},
             upsert=True,

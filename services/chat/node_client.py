@@ -5,6 +5,8 @@ from typing import Any
 import httpx
 
 from apps.api_gateway.config.setting import settings
+from services.auth.identity import same_user_id
+from services.auth.node_token import AuthNotConfigured, verify_auth_token
 
 
 class NodeApiError(ValueError):
@@ -26,14 +28,25 @@ class NodeHomeClient:
             raise NodeApiError("Please sign in again so I can save this for you.")
         return headers
 
+    def _verified_user_id(self, user_id: str) -> str:
+        if not self.auth_token:
+            raise NodeApiError("Please sign in again so I can save this for you.")
+        try:
+            identity = verify_auth_token(self.auth_token)
+        except AuthNotConfigured as error:
+            raise NodeApiError("Please sign in again so I can save this for you.") from error
+        if identity is None or not same_user_id(identity.user_id, user_id):
+            raise NodeApiError("Please sign in again so I can save this for you.")
+        return identity.user_id
+
     async def create_space(self, user_id: str, spacename: str, description: str = "New") -> dict[str, Any]:
-        # create-space currently accepts userId in body (no requireAuth).
+        verified_user_id = self._verified_user_id(user_id)
         payload = {
-            "userId": user_id,
+            "userId": verified_user_id,
             "spacename": spacename.strip(),
             "description": (description or "New").strip() or "New",
         }
-        data = await self._post("/api/v1/home/create-space", payload, require_auth=False)
+        data = await self._post("/api/v1/home/create-space", payload, require_auth=True)
         return {
             "id": str((data.get("space") or {}).get("id") or data.get("spaceId") or ""),
             "spacename": spacename.strip(),

@@ -29,6 +29,7 @@ from services.conversation.meeting_pipeline.pipeline import to_window_result as 
 from services.llm.async_runtime import is_async_lifecycle_error
 from services.conversation.workflow_state import ConversationGraphState
 from services.llm.router import LLMCapability, LLMRouter, get_llm_router
+from services.queue.job_lease import StaleOwnershipError, mark_current_job_completed, require_active_lease
 from services.queue.streams import EventEnvelope, RedisStreamProducer
 
 
@@ -46,7 +47,13 @@ class ConversationProcessingWorkflow:
         if not conversation:
             raise ValueError(f"Conversation not found: {conversation_id}")
         if conversation.status == ConversationStatus.COMPLETED:
+            mark_current_job_completed()
             return
+        # A lost lease must not publish follow-up work or open another extraction run.
+        # PROCESSING remains valid for the worker that still holds the lease, including
+        # crash recovery after the previous lease expires. A second worker cannot reach
+        # this point while that lease is active.
+        await require_active_lease()
         if conversation.status in {
             ConversationStatus.STOP_REQUESTED,
             ConversationStatus.WAITING_FOR_TRANSCRIPTS,
@@ -239,6 +246,8 @@ class ConversationProcessingWorkflow:
             terminal_status = ConversationStatus.PARTIAL if state.validation_errors else ConversationStatus.COMPLETED
             await self.repository.transition(conversation_id, terminal_status)
         except Exception as error:
+            if isinstance(error, StaleOwnershipError):
+                raise
             if run is not None:
                 await self.repository.mark_extraction_run_failed(run.id, error)
             latest = await self.repository.get_conversation(conversation_id)
@@ -607,6 +616,8 @@ class ConversationProcessingWorkflow:
                 run.checkpoints[f"{path}_shadow"],
             )
         except Exception as error:
+            if isinstance(error, StaleOwnershipError):
+                raise
             run.checkpoints[f"{path}_shadow"] = {
                 "mode": "shadow",
                 "publishedFrom": "legacy",
@@ -767,6 +778,8 @@ class ConversationProcessingWorkflow:
         try:
             published = await self.repository.publish_outputs(run, summary, memory_update)
         except Exception as error:
+            if isinstance(error, StaleOwnershipError):
+                raise
             result.extractionDiagnostics["persistenceOutcome"] = "PERSISTENCE_FAILED"
             agents._log_final_synthesis(result.extractionDiagnostics)
             run.validationErrors = [*(run.validationErrors or []), {"code": "PERSISTENCE_FAILED", "message": str(error)[:500]}]
@@ -872,6 +885,8 @@ class ConversationProcessingWorkflow:
         try:
             review = await agents.review_extraction_quality(self.router, transcript, outputs, context)
         except Exception as error:
+            if isinstance(error, StaleOwnershipError):
+                raise
             print("Quality review skipped:", {"conversationId": conversation_id, "error": str(error)[:300]})
             return result
         result.tasks, result.notes = _apply_quality_decisions(result.tasks, result.notes, review)
@@ -891,6 +906,8 @@ class ConversationProcessingWorkflow:
                 result.tasks = _dedupe_items_by_key([*result.tasks, *repair.tasks])
                 result.notes = _dedupe_items_by_key([*result.notes, *repair.notes])
             except Exception as error:
+                if isinstance(error, StaleOwnershipError):
+                    raise
                 print("Quality repair skipped:", {"conversationId": conversation_id, "error": str(error)[:300]})
         return result
 
@@ -982,6 +999,8 @@ class ConversationProcessingWorkflow:
                 state.space_id,
             )
         except Exception as error:
+            if isinstance(error, StaleOwnershipError):
+                raise
             state.warnings.append(f"missing-item-repair-v1 failed: {str(error)[:500]}")
             return
 
@@ -1026,6 +1045,8 @@ class ConversationProcessingWorkflow:
                 context,
             )
         except Exception as error:
+            if isinstance(error, StaleOwnershipError):
+                raise
             state.warnings.append(f"extraction-quality-review-v1 failed: {str(error)[:500]}")
             return
 

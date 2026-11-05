@@ -22,7 +22,7 @@ uvicorn apps.api_gateway.queue_api:app --host 0.0.0.0 --port 8080
 AWS worker:
 
 ```powershell
-python -m apps.api_gateway.workers.main
+python -m apps.api_gateway.workers.main   
 ```
 
 ## Conversation API
@@ -75,7 +75,28 @@ buddy:conversation:finalization
 buddy:conversation:processing
 buddy:conversation:retry
 buddy:dead-letter
+buddy:speech:jobs
+buddy:vector:jobs
 ```
+
+`SPEECH_VECTOR_QUEUE_TRANSPORT` defaults to `list`, which keeps `speech_transcribe_queue` and `completed_speech_queue` on LPUSH/BRPOP. Set it to `stream` only during the coordinated cutover. Do not drain those lists from worker startup. Inventory them with:
+
+```powershell
+python -m services.queue.legacy_list_migration
+```
+
+Moving the backlog requires `SPEECH_VECTOR_QUEUE_TRANSPORT=stream` and `LEGACY_QUEUE_MIGRATION_CONFIRM=yes` on that command. Stop list consumers first, set the flag on the Queue API and the worker together, run the migration, then start the stream consumers. Rollback copies pending entries, undelivered entries, retry-stream copies, and `:migrating` leftovers back to the lists. It pauses publishers until that copy finishes:
+
+```powershell
+$env:LEGACY_QUEUE_MIGRATION_CONFIRM='yes'
+python -m services.queue.legacy_list_migration --export-to-lists
+```
+
+Goal jobs left `running` after a crash are recoverable once the Redis lease expires. `ready` and `failed` stay terminal. Queue API dedupe and the queue write share one Redis script. The dedupe key remains `queue_api:event:{eventId}` for one day. A repeated submission returns the existing publication. The same event id with a different payload returns 409. `SPEECH_VECTOR_QUEUE_TRANSPORT` stays `list` until its own cutover. Replace Queue API replicas together, then replace goal workers, so an old process cannot acknowledge an abandoned goal or publish around the script.
+
+Speech and meeting file reads go through `services/runtime/file_io.py`, which uses the shared asyncio thread pool. That keeps the event loop free for lease heartbeats while a large file is read. Provider requests, worker concurrency, and the speech/vector transport flag are unchanged. Loading a full audio buffer for STT still uses memory proportional to the file. A local comparison is `python -m scripts.benchmark_worker_perf`.
+
+A goal plan version is written before the job is marked `ready`. Recovery replays that write from `durableStep` and does not call the planner again. A redelivered `ready` job inserts a missing version only when that job's own durable step still has the plan; it does not replace a version that is already stored, and startup does not scan history. Research sessions for the same goal job upsert on `goalId` + `operationId`. Baseline `evidenceVersion` advances once per baseline job. The speech-job hash is written inside the queue publish script. Redis 7 does not roll a Lua script back after a successful command, so the script checks key types before `LPUSH` or `XADD`. The AWS compose file starts Redis with AOF and a 60-second RDB snapshot. Create the goal idempotency indexes with `ensure_idempotency_indexes` in maintenance before the new workers run. Do not run old and new goal workers together during the rollout.
 
 Consumer groups:
 
@@ -85,9 +106,13 @@ stt-workers
 transcript-workers
 finalization-workers
 conversation-processing-workers
+speech-workers
+vector-workers
 ```
 
-Workers use consumer groups, stale pending-message recovery, bounded retries, retry backoff, and dead-letter routing. MongoDB remains the durable source of truth.
+Workers use consumer groups, bounded retries, retry backoff, and dead-letter routing. MongoDB remains the durable source of truth.
+
+A logical job has one active owner. The worker heartbeats a Redis lease and refreshes the stream pending entry without counting that refresh as a new delivery. Abandoned work is reclaimed only after the lease expires (`JOB_LEASE_TTL_SECONDS`, default 90). `REDIS_CLAIM_IDLE_MS` cannot make reclaim faster than that lease. A worker that loses the lease does not acknowledge the message and does not commit final artifacts.
 
 ## Storage
 

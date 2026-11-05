@@ -16,9 +16,10 @@ except ImportError:  # Dependencies are declared; this keeps tests importable be
     StateGraph = None
 
 from apps.api_gateway.config.setting import settings
+from services.auth.space_access import authorize_space_ids
 from services.chat.models import MAX_CHAT_MESSAGES
 from services.chat.planner import ChatQueryPlan, plan_chat_query
-from services.chat.repository import ChatRepository, encode_sessions_cursor
+from services.chat.repository import ChatRepository, encode_sessions_cursor, same_mongo_id
 from services.chat.retrieval import ChatRetriever, format_context
 from services.chat.text_utils import match_option, strip_tool_call_markup
 from services.chat.tools import ChatToolRunner
@@ -98,6 +99,8 @@ class ChatService:
         meeting_id = meeting_id.strip() if meeting_id else None
         if not user_id:
             raise ValueError("userId is required")
+        if space_id:
+            await authorize_space_ids(self.repository.db, user_id, [space_id], "read")
         if meeting_id:
             from services.chat.meeting.context import MeetingContextLoader
 
@@ -121,6 +124,13 @@ class ChatService:
         question = question.strip()
         auth_token = (auth_token or "").strip() or None
         meeting_id = (meeting_id or "").strip() or None
+        if user_id:
+            await authorize_space_ids(
+                self.repository.db,
+                user_id,
+                _normalize_request_space_ids(space_id, space_ids),
+                "read",
+            )
         if not meeting_id and chat_id:
             existing = await self.repository.get_session(chat_id)
             if existing and existing.meetingId is not None:
@@ -181,6 +191,7 @@ class ChatService:
         effective_space_ids = list(resolved_space_ids)
         if effective_space_id and effective_space_id not in effective_space_ids:
             effective_space_ids = [effective_space_id, *effective_space_ids]
+        await authorize_space_ids(self.repository.db, user_id, effective_space_ids, "read")
 
         if resolved_from_select:
             await self.repository.clear_pending_action(session.id)
@@ -280,7 +291,7 @@ class ChatService:
         session = await self.repository.get_session(chat_id)
         if not session:
             raise ValueError("Chat session not found")
-        if str(session.userId) != user_id:
+        if not same_mongo_id(session.userId, user_id):
             raise PermissionError("Chat session does not belong to this user")
         messages = await self.repository.list_recent_messages(chat_id, MAX_CHAT_MESSAGES)
         return {
@@ -298,6 +309,8 @@ class ChatService:
         *,
         card: bool = False,
     ) -> dict[str, Any]:
+        if space_id and str(space_id).strip():
+            await authorize_space_ids(self.repository.db, user_id, [str(space_id).strip()], "read")
         page_size = max(1, min(limit, 100))
         sessions = await self.repository.list_sessions(
             user_id,

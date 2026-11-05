@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from apps.api_gateway.config.setting import settings
+from services.observability.diagnostics import diag_log
 
 
 STUCK_IDLE_MS = 15 * 60 * 1000
@@ -30,6 +32,12 @@ async def reap_stuck_stream(
     maxlen: int | None = DEFAULT_STREAM_MAXLEN,
     idle_limit_ms: int = STUCK_IDLE_MS,
 ) -> dict[str, int]:
+    """Dead-letter a stuck pending id, then ack that id only.
+
+    ``maxlen`` is ignored. Trimming the stream to a length deletes entries that
+    are still pending or that another group has not read.
+    """
+    del maxlen
     reaped = 0
     trimmed = 0
     try:
@@ -48,16 +56,19 @@ async def reap_stuck_stream(
         if not message_id or not should_reap_pending(idle_ms=idle_ms, deliveries=deliveries, idle_limit_ms=idle_limit_ms):
             continue
         try:
+            # Dead-letter before ack. A failed write leaves the pending entry recoverable.
+            await _dead_letter_pending(
+                redis,
+                stream=stream,
+                message_id=message_id,
+                idle_ms=idle_ms,
+                deliveries=deliveries,
+            )
             await redis.xack(stream, group, message_id)
             await redis.xdel(stream, message_id)
             reaped += 1
         except Exception:
             continue
-    if maxlen and maxlen > 0:
-        try:
-            trimmed = int(await redis.xtrim(stream, maxlen=maxlen, approximate=True) or 0)
-        except Exception:
-            trimmed = 0
     if reaped or trimmed:
         print(
             "Redis reaped stuck jobs:",
@@ -65,6 +76,42 @@ async def reap_stuck_stream(
             flush=True,
         )
     return {"reaped": reaped, "trimmed": trimmed}
+
+
+async def _dead_letter_pending(
+    redis,
+    *,
+    stream: str,
+    message_id: str,
+    idle_ms: int,
+    deliveries: int,
+) -> None:
+    raw_event = ""
+    try:
+        rows = await redis.xrange(stream, min=message_id, max=message_id, count=1)
+    except Exception:
+        rows = []
+    for row in rows or []:
+        fields = row[1] if isinstance(row, (list, tuple)) and len(row) > 1 else {}
+        if isinstance(fields, dict):
+            raw_event = fields.get("event") or fields.get(b"event") or ""
+            if isinstance(raw_event, bytes):
+                raw_event = raw_event.decode("utf-8", errors="replace")
+    if not raw_event:
+        raw_event = json.dumps({"messageId": message_id, "stream": stream})
+    reason = f"reaped_stuck_pending idle_ms={int(idle_ms)} deliveries={int(deliveries)}"
+    await redis.xadd(
+        settings.REDIS_DEAD_LETTER_STREAM,
+        {"event": raw_event, "error": reason, "sourceStream": stream},
+    )
+    diag_log(
+        "job_dead_lettered",
+        stream=stream,
+        message_id=message_id,
+        retry_count=int(deliveries),
+        reason="reaped_stuck_pending",
+        idle_ms=int(idle_ms),
+    )
 
 
 def _conversation_targets() -> list[tuple[str, str, int]]:
@@ -92,11 +139,8 @@ async def maintain_conversation_redis(redis) -> dict[str, int]:
         if group:
             result = await reap_stuck_stream(redis, stream, group, maxlen=maxlen)
         else:
+            # Retry and dead-letter streams have no group here. Do not trim them.
             result = {"reaped": 0, "trimmed": 0}
-            try:
-                result["trimmed"] = int(await redis.xtrim(stream, maxlen=maxlen or DEFAULT_STREAM_MAXLEN, approximate=True) or 0)
-            except Exception:
-                pass
         totals["reaped"] += result["reaped"]
         totals["trimmed"] += result["trimmed"]
     return totals

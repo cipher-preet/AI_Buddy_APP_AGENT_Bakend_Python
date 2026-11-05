@@ -104,6 +104,9 @@ class Settings(BaseSettings):
 
     # Node Buddy API used by chat write tools (create task/note/space/reminder/event).
     NODE_API_BASE_URL: str = "http://127.0.0.1:5000"
+    # Same secret Node uses for custom HMAC bearer tokens (AUTH_TOKEN_SECRET, else SESSION_SECRET).
+    AUTH_TOKEN_SECRET: SecretStr | str = ""
+    SESSION_SECRET: SecretStr | str = ""
 
     # Default Krutrim model for callers that do not pick one (chat, planner, reminders).
     KRUTRIM_DEFAULT_MODEL: str = "gemma-4-31b-it"
@@ -150,10 +153,20 @@ class Settings(BaseSettings):
     REDIS_MEETING_MERGE_STREAM: str = "buddy:meeting:video-merge"
     REDIS_MINDMAP_STREAM: str = "buddy:mindmap:jobs"
     REDIS_DOCUMENT_STREAM: str = "buddy:document:jobs"
-    # Tight MAXLEN for Redis Cloud Essentials (30MB). Finished jobs are also XDEL'd.
+    # Speech transcription and the completed-speech vector stage. No MAXLEN:
+    # trimming can delete a pending entry that has not been acknowledged.
+    REDIS_SPEECH_STREAM: str = "buddy:speech:jobs"
+    REDIS_SPEECH_GROUP: str = "speech-workers"
+    REDIS_VECTOR_STREAM: str = "buddy:vector:jobs"
+    REDIS_VECTOR_GROUP: str = "vector-workers"
+    # list = legacy LPUSH/BRPOP. stream = Phase 2A consumer. Default stays list
+    # so a deploy does not change production until the cutover flag is set.
+    SPEECH_VECTOR_QUEUE_TRANSPORT: str = "list"
+    # Older deploys set these caps. They are not applied. Redis 7 MAXLEN deletes
+    # entries that are still pending or not yet delivered.
     REDIS_MINDMAP_STREAM_MAXLEN: int = Field(default=200, ge=20, le=100000)
     REDIS_DOCUMENT_STREAM_MAXLEN: int = Field(default=200, ge=20, le=100000)
-    # Dead-letter retention on the same tiny cloud Redis (keep near-empty).
+    # Kept so older environment files still load. Dead-letter writes are not trimmed.
     REDIS_CLOUD_DEAD_LETTER_MAXLEN: int = Field(default=50, ge=10, le=1000)
 
     REDIS_AUDIO_GROUP: str = "audio-workers"
@@ -171,6 +184,7 @@ class Settings(BaseSettings):
     REDIS_GOAL_JOBS_STREAM: str = "buddy:goals:jobs"
     REDIS_GOAL_INTERACTIVE_GROUP: str = "goal-interactive-workers"
     REDIS_GOAL_JOBS_GROUP: str = "goal-workers"
+    # Not applied. See the mindmap maxlen comment.
     REDIS_GOAL_STREAM_MAXLEN: int = Field(default=200, ge=20, le=100000)
     GOAL_CLARIFY_MAX_CONCURRENCY: int = Field(default=3, ge=1, le=8)
     GOAL_JOB_MAX_CONCURRENCY: int = Field(default=1, ge=1, le=4)
@@ -274,6 +288,13 @@ class Settings(BaseSettings):
     DAILY_BRIEFING_FORCE_DAILY_LIMIT: int = Field(default=3, ge=1, le=50)
 
     REDIS_CLAIM_IDLE_MS: int = 15000
+    # How long one worker owns a logical job. Heartbeats extend it. Reclaim waits
+    # at least this long, so a lower REDIS_CLAIM_IDLE_MS cannot steal a healthy job.
+    JOB_LEASE_TTL_SECONDS: int = Field(default=90, ge=30, le=3600)
+    # Must stay at or below one third of JOB_LEASE_TTL_SECONDS (enforced below).
+    JOB_LEASE_HEARTBEAT_SECONDS: int = Field(default=20, ge=5, le=1200)
+    # Suppress a duplicate delivery after a terminal success. Failed jobs are not recorded.
+    JOB_COMPLETION_TTL_SECONDS: int = Field(default=86400, ge=300, le=604800)
     REDIS_BLOCK_MS: int = 1000
     REDIS_BATCH_SIZE: int = 10
     REDIS_POLL_IDLE_MS: int = Field(default=400, ge=40, le=5000)
@@ -310,6 +331,8 @@ class Settings(BaseSettings):
     QUEUE_API_REQUEST_TIMEOUT_SECONDS: float = Field(default=5, gt=0, le=60)
     QUEUE_API_MAX_BODY_BYTES: int = Field(default=65536, ge=1024, le=1048576)
     QUEUE_API_SIGNATURE_TOLERANCE_SECONDS: int = Field(default=300, ge=30, le=3600)
+    # Opt in only for an operator-owned Queue API that is still on public HTTP.
+    QUEUE_API_ALLOW_PUBLIC_HTTP: bool = False
 
     STORAGE_PROVIDER: str = "local"
     AWS_ACCESS_KEY_ID: SecretStr | str = ""
@@ -519,6 +542,14 @@ class Settings(BaseSettings):
         if self.SERVICE_ROLE in {"api", "all"} and self.QUEUE_PROVIDER == "queue_api":
             if not self.QUEUE_API_BASE_URL.strip():
                 raise ValueError("QUEUE_API_BASE_URL is required when QUEUE_PROVIDER=queue_api")
+            from services.queue.transport_security import queue_api_transport_error
+
+            transport_error = queue_api_transport_error(
+                self.QUEUE_API_BASE_URL,
+                allow_public_http=bool(self.QUEUE_API_ALLOW_PUBLIC_HTTP),
+            )
+            if transport_error:
+                raise ValueError(transport_error)
             if not self._secret_value(self.QUEUE_API_SERVICE_TOKEN) and not self._secret_value(self.QUEUE_API_HMAC_SECRET):
                 raise ValueError("QUEUE_API_SERVICE_TOKEN or QUEUE_API_HMAC_SECRET is required when QUEUE_PROVIDER=queue_api")
 
@@ -540,6 +571,13 @@ class Settings(BaseSettings):
             raise ValueError("DAILY_BRIEFING_BATCH_SIZE must be >= 1")
         if self.DAILY_BRIEFING_MAX_CONCURRENCY < 1:
             raise ValueError("DAILY_BRIEFING_MAX_CONCURRENCY must be >= 1")
+        if str(self.SPEECH_VECTOR_QUEUE_TRANSPORT).strip().lower() not in {"list", "stream"}:
+            raise ValueError("SPEECH_VECTOR_QUEUE_TRANSPORT must be 'list' or 'stream'")
+        if self.JOB_LEASE_HEARTBEAT_SECONDS * 3 >= self.JOB_LEASE_TTL_SECONDS:
+            raise ValueError(
+                "JOB_LEASE_HEARTBEAT_SECONDS must stay at or below one third of "
+                "JOB_LEASE_TTL_SECONDS so two missed heartbeats cannot expire a healthy lease"
+            )
 
         if self.STORAGE_PROVIDER == "s3" and self.SERVICE_ROLE in {"api", "worker", "all"}:
             if not self.S3_AUDIO_BUCKET.strip():
@@ -608,6 +646,10 @@ class Settings(BaseSettings):
 
     def secret_value(self, value: SecretStr | str | None) -> str:
         return self._secret_value(value)
+
+    @property
+    def resolved_auth_token_secret(self) -> str:
+        return self.secret_value(self.AUTH_TOKEN_SECRET) or self.secret_value(self.SESSION_SECRET)
 
 
 settings = Settings()

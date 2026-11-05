@@ -12,6 +12,7 @@ async def log_requests(request: Request, call_next):
     process_time = time.time() - start_time
 
     if settings.ENABLE_REQUEST_LOGS:
-        print(f"{request.method} {request.url} completed in {process_time}")
+        status_code = getattr(response, "status_code", 0)
+        print(f"{request.method} {request.url.path} {status_code} {process_time:.3f}s")
 
     return response

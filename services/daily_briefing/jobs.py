@@ -10,6 +10,7 @@ from services.daily_briefing.sources import ActivitySource
 from services.daily_briefing.store import DailyBriefingStore
 from services.daily_briefing.timezones import local_day_bounds_utc
 from services.observability.diagnostics import briefing_duplicates, diag_log
+from services.queue.job_lease import LeavePending, StaleOwnershipError, mark_current_job_completed
 from services.queue.streams import EventEnvelope, NonRetryableQueueError
 
 
@@ -74,9 +75,13 @@ class DailyBriefingJobHandler:
                 period_end,
                 event.eventId,
             )
-            if claim_state in {"exists", "busy"}:
+            if claim_state == "exists":
                 finish_status = claim_state
+                mark_current_job_completed()
                 return
+            if claim_state == "busy":
+                finish_status = claim_state
+                raise LeavePending(f"{user_id}:{date_key}")
             try:
                 bundle = await self.sources.load(
                     user_id,
@@ -138,6 +143,7 @@ class DailyBriefingJobHandler:
                 )
                 transcript_count = stats.transcriptCount
                 finish_status = "READY"
+                mark_current_job_completed()
                 briefing_log(
                     "daily_briefing_completed",
                     userId=user_id,
@@ -173,6 +179,8 @@ class DailyBriefingJobHandler:
                 )
                 raise error
             except Exception as error:
+                if isinstance(error, (StaleOwnershipError, LeavePending)):
+                    raise
                 finish_status = "FAILED"
                 await self.store.mark_failed(user_id, date_key, str(error))
                 briefing_log(

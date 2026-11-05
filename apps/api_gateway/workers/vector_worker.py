@@ -1,21 +1,27 @@
 # apps/api_gateway/workers/vector_worker.py
 
 import asyncio
+import os
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
 
 from apps.api_gateway.config.setting import settings
 from services.conversation.repository import ConversationRepository
 from services.db.mongo import get_database
+from services.observability.diagnostics import diag_log
+from services.queue.job_lease import current_lease, logical_job_key, mark_current_job_completed
 from services.queue.redis_queue import (
     delete_speech_job,
-    expire_speech_job,
     get_job_result,
+    mark_vector_stored,
     pop_completed_speech_job,
     push_completed_speech_job,
-    redis_client,
+    record_vector_attempt,
+    speech_vector_transport,
+    vector_stage_settled,
 )
-from services.queue.streams import EventEnvelope, RedisStreamProducer
+from services.queue.streams import EventEnvelope, NonRetryableQueueError, RedisStreamConsumer, RedisStreamProducer
 
 from services.vector.vector_service import (
     store_transcript_in_vector_db,
@@ -48,12 +54,15 @@ def _remove_processed_audio_file(file_path: str | None) -> bool:
 
 async def process_completed_speech_job(job_id: str) -> None:
     job = await get_job_result(job_id)
-
-    if not job:
-        print("Completed speech job already cleaned up or missing:", job_id)
+    if await vector_stage_settled(job_id) or (job and str(job.get("vector_status") or "") == "stored"):
+        if job:
+            await delete_speech_job(job_id)
         return
 
-    if job.get("status") != "completed":
+    if not job or job.get("status") != "completed":
+        # Stream delivery must not finalize or embed while the transcript hash is missing.
+        if current_lease() is not None:
+            raise RuntimeError("completed speech is not durable yet")
         print("Completed speech job is not ready for vector processing:", job_id)
         return
 
@@ -68,6 +77,8 @@ async def process_completed_speech_job(job_id: str) -> None:
     space_id = str(job.get("space_id") or "").strip()
 
     if not user_id or not space_id:
+        if current_lease() is not None:
+            raise NonRetryableQueueError("completed speech job is missing user or space")
         print("Invalid completed job data:", {"job_id": job_id})
         return
 
@@ -113,6 +124,7 @@ async def process_completed_speech_job(job_id: str) -> None:
                 "audio_removed": audio_removed,
             },
         )
+        await mark_vector_stored(job_id)
         await delete_speech_job(job_id)
         return
 
@@ -125,7 +137,18 @@ async def process_completed_speech_job(job_id: str) -> None:
             language_code=language_code,
             request_id=request_id,
         )
+        await mark_vector_stored(job_id)
     except Exception as error:
+        lease = current_lease()
+        if lease is not None:
+            attempt_number = int(lease.retry_count) + 1
+            await record_vector_attempt(job_id, attempt_number)
+            if attempt_number >= VECTOR_MAX_ATTEMPTS:
+                await _record_vector_failure(
+                    job_id, user_id, space_id, conversation_id, transcript, error
+                )
+                raise NonRetryableQueueError(str(error)[:300]) from error
+            raise
         if await _schedule_vector_retry(job_id, job, error):
             return
         # Out of retries: keep the transcript durable for re-indexing; chat falls back to
@@ -159,8 +182,7 @@ async def _schedule_vector_retry(job_id: str, job: dict, error: Exception) -> bo
     if attempts >= VECTOR_MAX_ATTEMPTS:
         return False
     try:
-        await redis_client.hset(f"speech_job:{job_id}", mapping={"vector_attempts": attempts})
-        await expire_speech_job(job_id)
+        await record_vector_attempt(job_id, attempts)
     except Exception:
         return False
     delay = VECTOR_RETRY_DELAYS_SECONDS[min(attempts - 1, len(VECTOR_RETRY_DELAYS_SECONDS) - 1)]
@@ -211,7 +233,67 @@ async def _record_vector_failure(
         print("Transcript vector failure record failed:", {"job_id": job_id, "error": str(record_error)[:300]})
 
 
+def _vector_consumer_name() -> str:
+    host = (socket.gethostname() or "worker").split(".")[0][:24]
+    return f"vector-{host}-{os.getpid()}"
+
+
+def _wait_ms(event: EventEnvelope) -> int:
+    created = event.createdAt
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - created).total_seconds() * 1000))
+
+
+async def handle_vector_stream_event(event: EventEnvelope) -> None:
+    logical_id = logical_job_key(event)
+    job_id = str((event.payload or {}).get("jobId") or (event.payload or {}).get("job_id") or "").strip()
+    diag_log(
+        "vector_job_claimed",
+        job_type=event.eventType,
+        logical_job_id=logical_id,
+        queue_name=settings.REDIS_VECTOR_STREAM,
+        attempt=event.attempt,
+        wait_ms=_wait_ms(event),
+    )
+    if event.attempt:
+        diag_log(
+            "vector_job_recovered",
+            job_type=event.eventType,
+            logical_job_id=logical_id,
+            queue_name=settings.REDIS_VECTOR_STREAM,
+            attempt=event.attempt,
+        )
+    if not job_id:
+        raise NonRetryableQueueError("vector job is missing jobId")
+    await process_completed_speech_job(job_id)
+    mark_current_job_completed()
+    diag_log(
+        "vector_job_completed",
+        job_type=event.eventType,
+        logical_job_id=logical_id,
+        queue_name=settings.REDIS_VECTOR_STREAM,
+        attempt=event.attempt,
+    )
+
+
+def build_vector_stream_consumer(redis=None) -> RedisStreamConsumer:
+    # One embedding at a time, matching the previous BRPOP loop.
+    return RedisStreamConsumer(
+        stream=settings.REDIS_VECTOR_STREAM,
+        group=settings.REDIS_VECTOR_GROUP,
+        consumer_name=_vector_consumer_name(),
+        handler=handle_vector_stream_event,
+        concurrency=1,
+        max_retries=VECTOR_MAX_ATTEMPTS - 1,
+        redis=redis,
+    )
+
+
 async def start_vector_consumer():
+    if speech_vector_transport() == "stream":
+        await build_vector_stream_consumer().run_forever()
+        return
     print("Vector worker started...")
 
     while True:

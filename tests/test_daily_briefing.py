@@ -418,6 +418,9 @@ def test_scheduler_enqueues_after_configured_trigger(monkeypatch):
     counts = asyncio.run(scheduler.scan_once())
     assert counts["enqueued"] == 1
     assert enqueued[0].payload["dateKey"] == "2026-09-09"
+    assert enqueued[0].eventType == "daily.briefing.requested"
+    assert "authorization" not in enqueued[0].payload
+    assert "token" not in enqueued[0].payload
 
 
 def test_scheduler_requeues_stale_pending(monkeypatch):

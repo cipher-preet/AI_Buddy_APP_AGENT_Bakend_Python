@@ -29,4 +29,4 @@ async def publish_goal_event(
         "attempt": 0,
     }
     redis = get_goal_redis_client()
-    await redis.xadd(stream, {"event": json.dumps(envelope)}, maxlen=settings.REDIS_GOAL_STREAM_MAXLEN, approximate=True)
+    await redis.xadd(stream, {"event": json.dumps(envelope)})

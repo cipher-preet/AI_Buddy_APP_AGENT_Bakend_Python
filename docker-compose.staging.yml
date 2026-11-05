@@ -1,0 +1,192 @@
+# Isolated staging stack. Defaults bind Caddy to 127.0.0.1.
+# Do not point this file at .env.aws or the production compose project.
+# Project name kukunotes-staging keeps volumes off the production project.
+# This file does not start anything by itself.
+
+name: kukunotes-staging
+
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    environment:
+      QUEUE_API_DOMAIN: ${QUEUE_API_DOMAIN:?set QUEUE_API_DOMAIN}
+      PYTHON_API_DOMAIN: ${PYTHON_API_DOMAIN:?set PYTHON_API_DOMAIN}
+      NODE_API_DOMAIN: ${NODE_API_DOMAIN:?set NODE_API_DOMAIN}
+      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:?set CADDY_ACME_EMAIL}
+      QUEUE_API_MAX_BODY_BYTES: ${QUEUE_API_MAX_BODY_BYTES:-65536}
+    ports:
+      - "${STAGING_BIND_IP:-127.0.0.1}:${STAGING_HTTP_PORT:-8088}:80"
+      - "${STAGING_BIND_IP:-127.0.0.1}:${STAGING_HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./deploy/staging/Caddyfile:/etc/caddy/Caddyfile:ro
+      - staging_caddy_data:/data
+      - staging_caddy_config:/config
+    depends_on:
+      queue-api:
+        condition: service_healthy
+      python-api:
+        condition: service_started
+      node-api:
+        condition: service_started
+    restart: unless-stopped
+
+  queue-api:
+    build: .
+    image: kukunotes-staging-python:local
+    command: ["uvicorn", "apps.api_gateway.queue_api:app", "--host", "0.0.0.0", "--port", "8080"]
+    env_file:
+      - ${STAGING_ENV_FILE:-deploy/staging/staging.env.example}
+    environment:
+      SERVICE_ROLE: queue_api
+      QUEUE_PROVIDER: redis
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+      SPEECH_VECTOR_QUEUE_TRANSPORT: list
+    expose:
+      - "8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=3)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  python-api:
+    build: .
+    image: kukunotes-staging-python:local
+    command: ["uvicorn", "apps.api_gateway.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    env_file:
+      - ${STAGING_ENV_FILE:-deploy/staging/staging.env.example}
+    environment:
+      SERVICE_ROLE: api
+      QUEUE_PROVIDER: queue_api
+      SPEECH_VECTOR_QUEUE_TRANSPORT: list
+      MONGODB_URL: mongodb://${MONGO_USER:?set MONGO_USER}:${MONGO_PASSWORD:?set MONGO_PASSWORD}@staging-mongo:27017/buddy?authSource=admin
+    expose:
+      - "8080"
+    depends_on:
+      - staging-mongo
+      - redis-goals
+      - redis-reminder
+    restart: unless-stopped
+
+  node-api:
+    build:
+      context: ../Node_Backend
+    image: kukunotes-staging-node:local
+    env_file:
+      - ${STAGING_ENV_FILE:-deploy/staging/staging.env.example}
+    environment:
+      NODE_ENV: production
+      PORT: "5000"
+      SPEECH_VECTOR_QUEUE_TRANSPORT: list
+    expose:
+      - "5000"
+    depends_on:
+      - staging-mongo
+      - redis-goals
+      - redis-reminder
+    restart: unless-stopped
+
+  buddy-worker:
+    build: .
+    image: kukunotes-staging-python:local
+    command: ["python", "-m", "apps.api_gateway.workers.main"]
+    env_file:
+      - ${STAGING_ENV_FILE:-deploy/staging/staging.env.example}
+    environment:
+      SERVICE_ROLE: worker
+      QUEUE_PROVIDER: redis
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+      WORKER_CONCURRENCY: "1"
+      SPEECH_VECTOR_QUEUE_TRANSPORT: list
+      MONGODB_URL: mongodb://${MONGO_USER:?set MONGO_USER}:${MONGO_PASSWORD:?set MONGO_PASSWORD}@staging-mongo:27017/buddy?authSource=admin
+      FCM_ENABLED: "false"
+      HOME: /tmp
+      TMPDIR: /tmp
+      XDG_CACHE_HOME: /tmp/.cache
+      WORKER_TEMP_AUDIO_ROOT: /tmp/buddy
+      MEETING_FFMPEG_BIN: /usr/bin/ffmpeg
+      IMAGEIO_FFMPEG_EXE: /usr/bin/ffmpeg
+    tmpfs:
+      - /tmp:size=256m,mode=1777,exec,rw
+    depends_on:
+      redis:
+        condition: service_healthy
+      staging-mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    volumes:
+      - staging_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis-reminder:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1", "--requirepass", "${REMINDER_REDIS_PASSWORD:?set REMINDER_REDIS_PASSWORD}"]
+    environment:
+      REMINDER_REDIS_PASSWORD: ${REMINDER_REDIS_PASSWORD:?set REMINDER_REDIS_PASSWORD}
+    volumes:
+      - staging_reminder_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REMINDER_REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis-goals:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1", "--requirepass", "${GOAL_REDIS_PASSWORD:?set GOAL_REDIS_PASSWORD}"]
+    environment:
+      GOAL_REDIS_PASSWORD: ${GOAL_REDIS_PASSWORD:?set GOAL_REDIS_PASSWORD}
+    volumes:
+      - staging_goal_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$GOAL_REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  staging-mongo:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:?set MONGO_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:?set MONGO_PASSWORD}
+    volumes:
+      - staging_mongo_data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh -u \"$$MONGO_INITDB_ROOT_USERNAME\" -p \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --quiet --eval \"db.adminCommand('ping').ok\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    volumes:
+      - staging_qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  staging_redis_data:
+  staging_reminder_redis_data:
+  staging_goal_redis_data:
+  staging_mongo_data:
+  staging_qdrant_data:
+  staging_caddy_data:
+  staging_caddy_config:

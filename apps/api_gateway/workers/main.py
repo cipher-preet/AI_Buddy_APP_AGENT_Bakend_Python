@@ -1,4 +1,5 @@
 import asyncio
+import signal
 
 from services.queue.redis_queue import test_redis_connection
 from apps.api_gateway.workers.speech_worker import start_speech_consumer
@@ -98,6 +99,60 @@ async def _run_supervised(name: str, factory) -> None:
             await asyncio.sleep(delay)
 
 
+async def _await_until_shutdown(work: asyncio.Future) -> None:
+    """On SIGINT/SIGTERM, cancel the worker gather so each loop can drain."""
+    loop = asyncio.get_running_loop()
+    requested = asyncio.Event()
+    loop_signals: list[signal.Signals] = []
+    previous: dict[signal.Signals, signal.Handlers] = {}
+
+    def _request(*_args) -> None:
+        loop.call_soon_threadsafe(requested.set)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, requested.set)
+            loop_signals.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            try:
+                previous[sig] = signal.signal(sig, _request)
+            except (ValueError, OSError):
+                pass
+
+    watcher = asyncio.create_task(requested.wait(), name="worker-shutdown-watch")
+    try:
+        done, _pending = await asyncio.wait(
+            {work, watcher},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if work in done:
+            work.result()
+            return
+        diag_log("worker_shutdown_requested")
+        print("Worker shutdown requested; draining in-flight jobs", flush=True)
+        work.cancel()
+        try:
+            await work
+        except asyncio.CancelledError:
+            pass
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        for sig in loop_signals:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+        for sig, old in previous.items():
+            try:
+                signal.signal(sig, old)
+            except (ValueError, OSError):
+                pass
+
+
 async def main():
     install_windows_socket_exception_filter()
     await test_redis_connection()
@@ -153,25 +208,32 @@ async def main():
             await asyncio.sleep(delay)
         await _run_supervised(name, factory)
 
+    work = asyncio.gather(
+        _run_supervised("speech", start_speech_consumer),
+        _run_supervised("vector", start_vector_consumer),
+        *(
+            _staggered(consumer.stream, consumer.run_forever, index * 0.2)
+            for index, consumer in enumerate(stream_runners)
+        ),
+        _staggered("inactivity-scanner", run_inactivity_scanner, 1.0),
+        _staggered("retry-relay", run_retry_relay, 1.2),
+        _staggered("reminder-worker", start_reminder_worker, 1.5),
+        _staggered("daily-briefing-scheduler", run_daily_briefing_scheduler, 2.0),
+        _staggered("goal-scheduler", run_goal_scheduler, 2.2),
+        _staggered("worker-health", run_worker_heartbeat, 2.5),
+        _staggered("event-loop-lag", run_event_loop_lag_monitor, 2.5),
+        _staggered("redis-queue-health", run_redis_queue_health, 3.0),
+        _staggered("redis-maintenance", run_redis_maintenance, 4.0),
+    )
     try:
-        await asyncio.gather(
-            _run_supervised("speech", start_speech_consumer),
-            _run_supervised("vector", start_vector_consumer),
-            *(
-                _staggered(consumer.stream, consumer.run_forever, index * 0.2)
-                for index, consumer in enumerate(stream_runners)
-            ),
-            _staggered("inactivity-scanner", run_inactivity_scanner, 1.0),
-            _staggered("retry-relay", run_retry_relay, 1.2),
-            _staggered("reminder-worker", start_reminder_worker, 1.5),
-            _staggered("daily-briefing-scheduler", run_daily_briefing_scheduler, 2.0),
-            _staggered("goal-scheduler", run_goal_scheduler, 2.2),
-            _staggered("worker-health", run_worker_heartbeat, 2.5),
-            _staggered("event-loop-lag", run_event_loop_lag_monitor, 2.5),
-            _staggered("redis-queue-health", run_redis_queue_health, 3.0),
-            _staggered("redis-maintenance", run_redis_maintenance, 4.0),
-        )
+        await _await_until_shutdown(work)
     finally:
+        if not work.done():
+            work.cancel()
+            try:
+                await work
+            except asyncio.CancelledError:
+                pass
         await close_llm_runtime()
         await close_mongo_client()
         await close_shared_redis_clients()

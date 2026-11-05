@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from pymongo.errors import DuplicateKeyError
+
 from services.goals.baseline import build_baseline
 from services.goals.clarify import build_clarify_step
 from services.goals.plan import build_plan
 from services.goals.store import GoalStore
+from services.observability.diagnostics import diag_log
+from services.queue.job_lease import LeavePending, StaleOwnershipError, mark_current_job_completed
+from services.queue.mongo_fence import fenced_update_one
 from services.queue.streams import EventEnvelope, NonRetryableQueueError
 
 
@@ -21,10 +26,36 @@ class GoalJobHandler:
         if not goal_id or not job_id:
             raise NonRetryableQueueError("goal job missing goalId or jobId")
 
-        claim, _job = await self.store.claim(job_id)
+        claim, job = await self.store.claim(job_id)
         if claim == "missing":
             raise NonRetryableQueueError(f"goal job not found: {job_id}")
-        if claim == "done":
+        if claim == "busy":
+            raise LeavePending(job_id)
+        if claim in {"done", "terminal"}:
+            if claim == "done":
+                restored = await self.store.reconcile_missing_plan_version(job or {})
+                if restored:
+                    diag_log("goal_plan_version_reconciled", logical_job_id=job_id, job_type=job_type)
+                mark_current_job_completed()
+                diag_log("goal_job_completed", logical_job_id=job_id, job_type=job_type, reason="already_ready")
+            return
+        if claim == "recovered":
+            diag_log("goal_job_recovered", logical_job_id=job_id, job_type=job_type)
+        durable = (job or {}).get("durableStep") if isinstance(job, dict) else None
+        if isinstance(durable, dict) and durable.get("step"):
+            diag_log("goal_step_resumed", logical_job_id=job_id, job_type=job_type, step_id=str((durable.get("step") or {}).get("stepId") or ""))
+            await self.store.save_step(
+                goal_id,
+                job_id,
+                step=durable.get("step") or {},
+                draft_updates=durable.get("draft") or {},
+                status=str(durable.get("status") or "ACTIVE"),
+                assistant_text=str(durable.get("assistantText") or ""),
+                model=str(durable.get("model") or ""),
+                plan=durable.get("plan"),
+            )
+            mark_current_job_completed()
+            diag_log("goal_job_completed", logical_job_id=job_id, job_type=job_type, reason="resumed_step")
             return
 
         goal = await self.store.load_goal(goal_id)
@@ -45,9 +76,17 @@ class GoalJobHandler:
                 await self._clarify(goal, job_id)
         except NonRetryableQueueError:
             raise
+        except StaleOwnershipError:
+            diag_log("goal_stale_write_rejected", logical_job_id=job_id, job_type=job_type)
+            raise
+        except LeavePending:
+            raise
         except Exception as error:
             await self.store.fail(job_id, "The goal step failed. Try again.")
             print("goal job failed", {"jobId": job_id, "error": type(error).__name__}, flush=True)
+            return
+        mark_current_job_completed()
+        diag_log("goal_job_completed", logical_job_id=job_id, job_type=job_type)
 
     async def _clarify(self, goal: dict[str, Any], job_id: str) -> None:
         messages = await self.store.load_messages(str(goal.get("_id")))
@@ -74,7 +113,7 @@ class GoalJobHandler:
             "findings": built.get("findings") or [],
             "milestones": [],
         }
-        await self._store_findings(goal, built.get("findings") or [])
+        await self._store_findings(goal, built.get("findings") or [], job_id)
         await self.store.save_step(
             str(goal.get("_id")),
             job_id,
@@ -100,6 +139,7 @@ class GoalJobHandler:
             self.store,
             force_refresh=bool(payload.get("forceRefresh") or job_type == "research"),
             previous_plan=(goal.get("approvedPlan") or goal.get("proposedPlan")) if payload.get("preserveProgress") else None,
+            job_id=job_id,
         )
         milestones = list(built.get("milestones") or [])
         days = list(built.get("days") or [])
@@ -201,20 +241,8 @@ class GoalJobHandler:
             model=str(built.get("model") or ""),
             plan=plan,
         )
-        await self.store.db.goal_plan_versions.update_one(
-            {"goalId": goal.get("_id"), "version": 1},
-            {
-                "$set": {
-                    "ownerId": goal.get("ownerId"),
-                    "status": "proposed",
-                    "plan": plan,
-                    "updatedAt": __import__("services.goals.store", fromlist=["utc_now"]).utc_now(),
-                }
-            },
-            upsert=True,
-        )
 
-    async def _store_findings(self, goal: dict[str, Any], findings: list[dict[str, Any]]) -> None:
+    async def _store_findings(self, goal: dict[str, Any], findings: list[dict[str, Any]], job_id: str) -> None:
         from services.goals.store import utc_now
 
         now = utc_now()
@@ -225,30 +253,41 @@ class GoalJobHandler:
                 continue
             source_id = str(finding.get("sourceId") or "baseline")
             category = str(finding.get("category") or "OUTPUT")
-            await self.store.db.goal_evidence.update_one(
-                {
-                    "goalId": goal.get("_id"),
-                    "sourceType": str(finding.get("sourceType") or "baseline"),
-                    "sourceId": source_id,
-                    "sourceRevision": "baseline",
-                    "evidenceKey": category,
-                },
-                {
-                    "$setOnInsert": {
-                        "ownerId": goal.get("ownerId"),
-                        "category": category,
-                        "verification": "SOURCE_SUPPORTED" if finding.get("sourceId") else "UNVERIFIED",
-                        "text": text[:1000],
-                        "milestoneTitle": "",
-                        "createdAt": now,
-                        "updatedAt": now,
-                    }
-                },
-                upsert=True,
-            )
+            try:
+                await fenced_update_one(
+                    self.store.db.goal_evidence,
+                    {
+                        "goalId": goal.get("_id"),
+                        "sourceType": str(finding.get("sourceType") or "baseline"),
+                        "sourceId": source_id,
+                        "sourceRevision": "baseline",
+                        "evidenceKey": category,
+                    },
+                    {
+                        "$set": {
+                            "ownerId": goal.get("ownerId"),
+                            "category": category,
+                            "verification": "SOURCE_SUPPORTED" if finding.get("sourceId") else "UNVERIFIED",
+                            "text": text[:1000],
+                            "milestoneTitle": "",
+                            "updatedAt": now,
+                        },
+                        "$setOnInsert": {"createdAt": now},
+                    },
+                    upsert=True,
+                )
+            except DuplicateKeyError:
+                pass
             wrote = True
         if wrote:
-            await self.store.db.goals.update_one({"_id": goal.get("_id")}, {"$inc": {"evidenceVersion": 1}})
+            from services.goals.store import baseline_evidence_operation_id
+
+            operation_id = baseline_evidence_operation_id(goal.get("_id"), job_id)
+            await fenced_update_one(
+                self.store.db.goals,
+                {"_id": goal.get("_id"), "appliedEvidenceOps": {"$nin": [operation_id]}},
+                {"$inc": {"evidenceVersion": 1}, "$addToSet": {"appliedEvidenceOps": operation_id}},
+            )
 
     async def _evidence(self, goal: dict[str, Any], job_id: str, payload: dict[str, Any]) -> None:
         from services.goals.store import utc_now
@@ -279,36 +318,48 @@ class GoalJobHandler:
                 milestone = name
                 break
         now = utc_now()
-        await self.store.db.goal_evidence.update_one(
-            {
-                "goalId": goal.get("_id"),
-                "sourceType": source_type,
-                "sourceId": str(payload.get("sourceId") or job_id),
-                "sourceRevision": str(payload.get("sourceRevision") or "1"),
-                "evidenceKey": category,
-            },
-            {
-                "$set": {
-                    "ownerId": goal.get("ownerId"),
-                    "category": category,
-                    "verification": "SOURCE_SUPPORTED",
-                    "text": text[:1000],
-                    "milestoneTitle": milestone,
-                    "updatedAt": now,
+        try:
+            await fenced_update_one(
+                self.store.db.goal_evidence,
+                {
+                    "goalId": goal.get("_id"),
+                    "sourceType": source_type,
+                    "sourceId": str(payload.get("sourceId") or job_id),
+                    "sourceRevision": str(payload.get("sourceRevision") or "1"),
+                    "evidenceKey": category,
                 },
-                "$setOnInsert": {"createdAt": now},
-            },
-            upsert=True,
+                {
+                    "$set": {
+                        "ownerId": goal.get("ownerId"),
+                        "category": category,
+                        "verification": "SOURCE_SUPPORTED",
+                        "text": text[:1000],
+                        "milestoneTitle": milestone,
+                        "updatedAt": now,
+                    },
+                    "$setOnInsert": {"createdAt": now},
+                },
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            pass
+        from services.goals.store import space_evidence_operation_id
+
+        operation_id = space_evidence_operation_id(goal.get("_id"), job_id)
+        await fenced_update_one(
+            self.store.db.goals,
+            {"_id": goal.get("_id"), "appliedEvidenceOps": {"$nin": [operation_id]}},
+            {"$inc": {"evidenceVersion": 1}, "$addToSet": {"appliedEvidenceOps": operation_id}},
         )
-        await self.store.db.goals.update_one({"_id": goal.get("_id")}, {"$inc": {"evidenceVersion": 1}})
-        await self.store.db.goal_jobs.update_one(
+        await fenced_update_one(
+            self.store.db.goal_jobs,
             {"_id": __import__("services.goals.store", fromlist=["as_object_id"]).as_object_id(job_id)},
             {"$set": {"status": "ready", "updatedAt": now}},
         )
 
     async def _review(self, goal: dict[str, Any], job_id: str, payload: dict[str, Any]) -> None:
         from services.goals.reviews import _local_now, build_review, period_key
-        from services.goals.store import as_object_id, utc_now
+        from services.goals.store import as_object_id, review_evidence_operation_id, utc_now
 
         job = await self.store.db.goal_jobs.find_one({"_id": as_object_id(job_id)})
         merged = {**((job or {}).get("payload") or {}), **(payload or {})}
@@ -317,11 +368,14 @@ class GoalJobHandler:
         if not key:
             key = period_key(period_type, _local_now(str(goal.get("timezone") or "Asia/Kolkata")))
         await build_review(self.store, goal, period_type, key)
-        await self.store.db.goals.update_one(
-            {"_id": goal.get("_id")},
-            {"$inc": {"evidenceVersion": 1}},
+        operation_id = review_evidence_operation_id(goal.get("_id"), job_id)
+        await fenced_update_one(
+            self.store.db.goals,
+            {"_id": goal.get("_id"), "appliedEvidenceOps": {"$nin": [operation_id]}},
+            {"$inc": {"evidenceVersion": 1}, "$addToSet": {"appliedEvidenceOps": operation_id}},
         )
-        await self.store.db.goal_jobs.update_one(
+        await fenced_update_one(
+            self.store.db.goal_jobs,
             {"_id": as_object_id(job_id)},
             {"$set": {"status": "ready", "updatedAt": utc_now()}},
         )

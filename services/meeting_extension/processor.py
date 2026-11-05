@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -282,8 +283,10 @@ async def _ensure_standalone_webm(
     bucket: str,
     job_dir: Path,
 ) -> Path:
-    payload = video_path.read_bytes()
-    if has_webm_header(payload) or sequence <= 1:
+    from services.runtime.file_io import read_file_bytes, read_file_prefix
+
+    header = await read_file_prefix(video_path, 4)
+    if has_webm_header(header) or sequence <= 1:
         return video_path
     init_key = meeting_chunk_object_key(
         user_id,
@@ -302,10 +305,17 @@ async def _ensure_standalone_webm(
             error=str(error)[:200],
         )
         return video_path
-    init_bytes = extract_webm_init(init_path.read_bytes())
+    init_bytes = extract_webm_init(await read_file_bytes(init_path))
     if not init_bytes:
         return video_path
-    repaired = write_standalone_webm(video_path, init_bytes, job_dir / f"{video_path.stem}.standalone.webm")
+    payload = await read_file_bytes(video_path)
+    repaired = await asyncio.to_thread(
+        write_standalone_webm,
+        video_path,
+        init_bytes,
+        job_dir / f"{video_path.stem}.standalone.webm",
+        payload,
+    )
     diag_log(
         "meeting_webm_init_prepended",
         meetingSessionId=meeting_session_id,

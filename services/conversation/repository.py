@@ -10,6 +10,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo import ReturnDocument
 
 from apps.api_gateway.config.setting import settings
+from services.queue.mongo_fence import fenced_find_one_and_update, fenced_update_one
 from services.conversation.models import (
     AudioChunkMetadata,
     ConversationWindowDocument,
@@ -45,12 +46,18 @@ class ConversationRepository:
         data = await self.db.conversations.find_one(_id_query(conversation_id))
         return ConversationDocument.model_validate(data) if data else None
 
+    async def _guard_lease(self) -> None:
+        from services.queue.job_lease import require_active_lease
+
+        await require_active_lease()
+
     async def transition(
         self,
         conversation_id: str,
         target: ConversationStatus,
         updates: dict[str, Any] | None = None,
     ) -> ConversationDocument:
+        await self._guard_lease()
         current = await self.get_conversation(conversation_id)
         if not current:
             raise ValueError(f"Conversation not found: {conversation_id}")
@@ -61,7 +68,8 @@ class ConversationRepository:
             update_doc.update(updates)
         if target in {ConversationStatus.COMPLETED, ConversationStatus.PARTIAL}:
             update_doc.setdefault("processedAt", utc_now())
-        result = await self.db.conversations.find_one_and_update(
+        result = await fenced_find_one_and_update(
+            self.db.conversations,
             {**_id_query(conversation_id), "status": current.status.value},
             {"$set": update_doc},
             return_document=ReturnDocument.AFTER,
@@ -137,7 +145,8 @@ class ConversationRepository:
             )
         else:
             return
-        await self.db.meeting_sessions.update_one(
+        await fenced_update_one(
+            self.db.meeting_sessions,
             {"_id": to_mongo_id(conversation.id)},
             {"$set": patch},
         )
@@ -202,6 +211,7 @@ class ConversationRepository:
         provider: str,
         extra_fields: dict[str, Any] | None = None,
     ) -> None:
+        await self._guard_lease()
         now = utc_now()
         fields: dict[str, Any] = {
             "rawText": raw_text,
@@ -219,7 +229,8 @@ class ConversationRepository:
         }
         if extra_fields:
             fields.update({key: value for key, value in extra_fields.items() if value is not None})
-        result = await self.db.transcript_chunks.update_one(
+        result = await fenced_update_one(
+            self.db.transcript_chunks,
             {
                 "conversationId": {"$in": mongo_id_candidates(conversation_id)},
                 **_sequence_number_query(sequence_number),
@@ -231,7 +242,8 @@ class ConversationRepository:
             },
         )
         if result.modified_count:
-            await self.db.conversations.update_one(
+            await fenced_update_one(
+                self.db.conversations,
                 _id_query(conversation_id),
                 {
                     "$inc": {"completedTranscriptChunkCount": 1},
@@ -628,7 +640,9 @@ class ConversationRepository:
         extraction_skipped: bool = False,
         checkpoint_kind: str | None = None,
     ) -> None:
-        await self.db.conversation_windows.update_one(
+        await self._guard_lease()
+        await fenced_update_one(
+            self.db.conversation_windows,
             {"_id": to_mongo_id(window_id)},
             {
                 "$set": {
@@ -694,6 +708,7 @@ class ConversationRepository:
     async def upsert_meeting_artifacts(self, artifacts: list[MeetingArtifactDocument]) -> None:
         if not artifacts:
             return
+        await self._guard_lease()
         for artifact in artifacts:
             artifact.updatedAt = utc_now()
             doc = artifact.model_dump(by_alias=True)
@@ -703,7 +718,8 @@ class ConversationRepository:
             doc["spaceId"] = to_mongo_id(artifact.spaceId)
             if artifact.sourceWindowId is not None:
                 doc["sourceWindowId"] = to_mongo_id(artifact.sourceWindowId)
-            await self.db.meeting_artifacts.find_one_and_update(
+            await fenced_find_one_and_update(
+                self.db.meeting_artifacts,
                 {"_id": to_mongo_id(artifact_id)},
                 {"$set": doc, "$setOnInsert": {"_id": to_mongo_id(artifact_id)}},
                 upsert=True,
@@ -833,6 +849,7 @@ class ConversationRepository:
         return run
 
     async def save_extraction_run(self, run: ExtractionRunDocument) -> None:
+        await self._guard_lease()
         run.updatedAt = utc_now()
         staged_tasks = [item.model_dump() for item in run.stagedTasks]
         staged_notes = [item.model_dump() for item in run.stagedNotes]
@@ -840,7 +857,8 @@ class ConversationRepository:
         staged_issues = [item.model_dump() for item in run.stagedIssues]
         doc = extraction_run_doc(run)
         run_id = doc.pop("_id", run.id)
-        await self.db.extraction_runs.update_one(
+        await fenced_update_one(
+            self.db.extraction_runs,
             {"_id": run.id},
             {
                 "$set": doc,
@@ -871,7 +889,9 @@ class ConversationRepository:
                 await self._publish_notes(run)
 
     async def mark_extraction_run_failed(self, run_id: Any, error: Exception | str) -> None:
-        await self.db.extraction_runs.update_one(
+        await self._guard_lease()
+        await fenced_update_one(
+            self.db.extraction_runs,
             {"_id": to_mongo_id(run_id)},
             {
                 "$set": {
@@ -897,7 +917,9 @@ class ConversationRepository:
         return ExtractionRunDocument.model_validate(data) if data else None
 
     async def mark_conversation_failed(self, conversation_id: str, error: Exception | str) -> None:
-        await self.db.conversations.update_one(
+        await self._guard_lease()
+        await fenced_update_one(
+            self.db.conversations,
             {
                 **_id_query(conversation_id),
                 "status": {"$ne": ConversationStatus.COMPLETED.value},
@@ -918,13 +940,46 @@ class ConversationRepository:
         items: list[dict[str, Any]],
     ) -> None:
         collection = self.db[collection_name]
-        await collection.delete_many({"extractionRunId": run.id})
+        from services.queue.job_lease import StaleOwnershipError, current_lease
+        from services.queue.mongo_fence import FENCE_FIELD, lease_fence_token
+
+        token = lease_fence_token()
+        if token is not None:
+            # The run document was fenced above. Re-read it so a newer attempt that
+            # committed in between does not have its staged rows deleted. This is
+            # still not a multi-document transaction: a pause after this read can
+            # insert an older generation beside a newer one.
+            parent = await self.db.extraction_runs.find_one({"_id": run.id})
+            parent_fence = int((parent or {}).get(FENCE_FIELD) or 0)
+            if parent_fence > token:
+                lease = current_lease()
+                raise StaleOwnershipError(
+                    lease.logical_key if lease is not None else "extraction",
+                    reason="stale_fence",
+                )
+        query: dict[str, Any] = {"extractionRunId": run.id}
+        if token is not None:
+            # A newer attempt's staged rows carry a higher fence and must survive this delete.
+            query = {
+                "$and": [
+                    query,
+                    {
+                        "$or": [
+                            {FENCE_FIELD: {"$exists": False}},
+                            {FENCE_FIELD: None},
+                            {FENCE_FIELD: {"$lte": token}},
+                        ]
+                    },
+                ]
+            }
+        await collection.delete_many(query)
         if not items:
             return
-        await collection.insert_many(
-            [staged_collection_doc(collection_name, run, item, index) for index, item in enumerate(items)],
-            ordered=False,
-        )
+        docs = [staged_collection_doc(collection_name, run, item, index) for index, item in enumerate(items)]
+        if token is not None:
+            for doc in docs:
+                doc[FENCE_FIELD] = token
+        await collection.insert_many(docs, ordered=False)
 
     async def publish_outputs(
         self,
@@ -932,6 +987,7 @@ class ConversationRepository:
         summary: ConversationSummaryDocument,
         memory: SpaceMemoryDocument,
     ) -> dict[str, list[Any]]:
+        await self._guard_lease()
         task_ids = await self._publish_tasks(run)
         note_ids = await self._publish_notes(run)
         summary.taskIds = task_ids
@@ -940,7 +996,8 @@ class ConversationRepository:
         summary_doc["conversationId"] = to_mongo_id(summary.conversationId)
         summary_doc["userId"] = to_mongo_id(summary.userId)
         summary_doc["spaceId"] = optional_mongo_id(summary.spaceId)
-        await self.db.conversation_summaries.update_one(
+        await fenced_update_one(
+            self.db.conversation_summaries,
             {"conversationId": to_mongo_id(summary.conversationId)},
             {"$set": summary_doc, "$setOnInsert": {"_id": to_mongo_id(summary_id)}},
             upsert=True,
@@ -954,7 +1011,8 @@ class ConversationRepository:
             memory_doc["spaceId"] = to_mongo_id(memory.spaceId)
             if memory.lastUpdatedConversationId is not None:
                 memory_doc["lastUpdatedConversationId"] = to_mongo_id(memory.lastUpdatedConversationId)
-            await self.db.space_memory.update_one(
+            await fenced_update_one(
+                self.db.space_memory,
                 {"userId": to_mongo_id(memory.userId), "spaceId": to_mongo_id(memory.spaceId)},
                 {"$set": memory_doc, "$setOnInsert": {"_id": to_mongo_id(memory_id)}},
                 upsert=True,
@@ -991,7 +1049,8 @@ class ConversationRepository:
                     task_filter["$or"] = [{"spaceId": None}, {"spaceId": {"$exists": False}}]
                 else:
                     task_filter["spaceId"] = doc["spaceId"]
-                result = await self.db.tasks.find_one_and_update(
+                result = await fenced_find_one_and_update(
+                    self.db.tasks,
                     task_filter,
                     {"$set": {key: value for key, value in doc.items() if key != "createdAt"}},
                     return_document=ReturnDocument.AFTER,
@@ -1001,7 +1060,8 @@ class ConversationRepository:
                 doc["_id"] = task_id
                 filter_doc = {"fingerprint": task.fingerprint} if task.fingerprint else {"_id": task_id}
                 set_doc = {key: value for key, value in doc.items() if key not in {"_id", "createdAt"}}
-                result = await self.db.tasks.find_one_and_update(
+                result = await fenced_find_one_and_update(
+                    self.db.tasks,
                     filter_doc,
                     {
                         "$set": set_doc,
@@ -1038,7 +1098,8 @@ class ConversationRepository:
             doc["_id"] = note_id
             filter_doc = {"fingerprint": note.fingerprint} if note.fingerprint else {"_id": note_id}
             set_doc = {key: value for key, value in doc.items() if key not in {"_id", "createdAt"}}
-            result = await self.db.notes.find_one_and_update(
+            result = await fenced_find_one_and_update(
+                self.db.notes,
                 filter_doc,
                 {
                     "$set": set_doc,

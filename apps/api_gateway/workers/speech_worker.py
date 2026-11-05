@@ -1,15 +1,25 @@
 import asyncio
+import os
 import shutil
+import socket
+from datetime import datetime, timezone
 from pathlib import Path
 
+from apps.api_gateway.config.setting import settings
+from services.observability.diagnostics import diag_log
+from services.queue.job_lease import LeavePending, logical_job_key, mark_current_job_completed
 from services.queue.redis_queue import (
+    SpeechVectorCutoverLocked,
     get_job_result,
-    mark_job_processing,
     mark_job_failed,
+    mark_job_processing,
     pop_speech_job,
     push_completed_speech_job,
     save_job_result,
+    speech_vector_transport,
+    vector_stage_settled,
 )
+from services.queue.streams import EventEnvelope, NonRetryableQueueError, RedisStreamConsumer
 
 from services.speech.transcription_router import transcribe_from_path_with_fallback
 from services.storage.s3_audio_storage import (
@@ -26,11 +36,31 @@ async def process_speech_job(job: dict) -> None:
     job = _normalize_speech_job(job)
     job_id = job["job_id"]
     existing = await get_job_result(job_id)
-    if existing and existing.get("status") == "completed":
-        print("Speech job already completed:", job_id)
-        return
     if existing:
-        job = {**_normalize_speech_job(existing), **job}
+        # mark_job_processing stores only status. A crash after that write must
+        # still recover the job id and audio reference from the stream payload.
+        existing_job = dict(existing)
+        existing_job.setdefault("job_id", job_id)
+        job = {**_normalize_speech_job(existing_job), **job}
+    if existing and existing.get("status") == "completed":
+        # The transcript is already durable. Publish the vector stage unless that
+        # stage has itself been stored. List rollback re-reads this same hash.
+        if speech_vector_transport() == "stream" or not await vector_stage_settled(job_id):
+            if speech_vector_transport() == "stream":
+                diag_log(
+                    "queue_duplicate_suppressed",
+                    job_type="speech.transcribe.requested",
+                    logical_job_id=job_id,
+                    queue_name=settings.REDIS_SPEECH_STREAM,
+                    reason="speech_result_completed",
+                )
+            try:
+                await push_completed_speech_job(job_id)
+            except SpeechVectorCutoverLocked as error:
+                raise LeavePending("speech vector publish paused for rollback") from error
+        else:
+            print("Speech job already completed:", job_id)
+        return
 
     if _job_uses_s3(job):
         await _process_s3_speech_job(job)
@@ -81,9 +111,14 @@ async def _process_local_speech_job(job: dict) -> None:
 
         await save_job_result(job_id, result)
 
-        await push_completed_speech_job(job_id)
+        try:
+            await push_completed_speech_job(job_id)
+        except SpeechVectorCutoverLocked as error:
+            raise LeavePending("speech vector publish paused for rollback") from error
 
         print("Speech job completed:", job_id)
+    except LeavePending:
+        raise
     except Exception as error:
         await mark_job_failed(job_id, str(error))
         raise
@@ -259,7 +294,68 @@ def settings_delete_after_processing() -> bool:
     return settings.S3_DELETE_AFTER_PROCESSING
 
 
+def _speech_consumer_name() -> str:
+    host = (socket.gethostname() or "worker").split(".")[0][:24]
+    return f"speech-{host}-{os.getpid()}"
+
+
+def _wait_ms(event: EventEnvelope) -> int:
+    created = event.createdAt
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - created).total_seconds() * 1000))
+
+
+async def handle_speech_stream_event(event: EventEnvelope) -> None:
+    """Run the existing speech handler. Acknowledge only after it returns."""
+    logical_id = logical_job_key(event)
+    diag_log(
+        "speech_job_claimed",
+        job_type=event.eventType,
+        logical_job_id=logical_id,
+        queue_name=settings.REDIS_SPEECH_STREAM,
+        attempt=event.attempt,
+        wait_ms=_wait_ms(event),
+    )
+    if event.attempt:
+        diag_log(
+            "speech_job_recovered",
+            job_type=event.eventType,
+            logical_job_id=logical_id,
+            queue_name=settings.REDIS_SPEECH_STREAM,
+            attempt=event.attempt,
+        )
+    try:
+        await process_speech_job(dict(event.payload or {}))
+    except ValueError as error:
+        raise NonRetryableQueueError(str(error)[:300]) from error
+    mark_current_job_completed()
+    diag_log(
+        "speech_job_completed",
+        job_type=event.eventType,
+        logical_job_id=logical_id,
+        queue_name=settings.REDIS_SPEECH_STREAM,
+        attempt=event.attempt,
+    )
+
+
+def build_speech_stream_consumer(redis=None) -> RedisStreamConsumer:
+    # One job at a time, matching the previous BRPOP loop. Do not use WORKER_CONCURRENCY.
+    return RedisStreamConsumer(
+        stream=settings.REDIS_SPEECH_STREAM,
+        group=settings.REDIS_SPEECH_GROUP,
+        consumer_name=_speech_consumer_name(),
+        handler=handle_speech_stream_event,
+        concurrency=1,
+        max_retries=settings.WORKER_MAX_RETRIES,
+        redis=redis,
+    )
+
+
 async def start_speech_consumer():
+    if speech_vector_transport() == "stream":
+        await build_speech_stream_consumer().run_forever()
+        return
     print("Speech worker started...")
 
     while True:

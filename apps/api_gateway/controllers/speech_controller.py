@@ -1,3 +1,4 @@
+from services.auth.identity import same_user_id
 from services.speech.speech_service import (
     get_transcribe_job_result_service,
     start_listening_session_service,
@@ -21,13 +22,13 @@ async def transcribe_audio_controller(files, user_id: str, space_id: str):
     }
 
 
-async def get_transcribe_result_controller(job_id: str):
-
+async def get_transcribe_result_controller(job_id: str, user_id: str):
     result = await get_transcribe_job_result_service(job_id)
-
-    if not result:
+    if not isinstance(result, dict):
         return {"success": False, "message": "Job not found."}
-
+    owner = str(result.get("user_id") or result.get("userId") or "").strip()
+    if not owner or not same_user_id(owner, user_id):
+        return {"success": False, "message": "Job not found."}
     return {"success": True, "data": result}
 
 

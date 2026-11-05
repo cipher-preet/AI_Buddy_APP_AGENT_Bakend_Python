@@ -85,7 +85,6 @@ async def enqueue_mindmap_generation(
         await RedisStreamProducer(client, force_direct=True).publish(
             settings.REDIS_MINDMAP_STREAM,
             event,
-            maxlen=settings.REDIS_MINDMAP_STREAM_MAXLEN,
         )
     except MindmapRedisConfigError as error:
         await store.mark_failed(mindmap_id, str(error))

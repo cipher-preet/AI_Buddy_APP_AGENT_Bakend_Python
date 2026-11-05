@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from apps.api_gateway.config.setting import settings
+from services.queue.transport_security import queue_api_transport_error
 
 
 class QueueApiError(RuntimeError):
@@ -31,6 +32,12 @@ class QueueApiPublisher:
     async def publish(self, payload: dict[str, Any]) -> QueueApiPublishResult:
         if not self.base_url:
             raise QueueApiError("QUEUE_API_BASE_URL is required")
+        transport_error = queue_api_transport_error(
+            self.base_url,
+            allow_public_http=bool(settings.QUEUE_API_ALLOW_PUBLIC_HTTP),
+        )
+        if transport_error:
+            raise QueueApiError(transport_error)
 
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         if len(body) > settings.QUEUE_API_MAX_BODY_BYTES:
@@ -38,7 +45,9 @@ class QueueApiPublisher:
 
         headers = _auth_headers(body)
         timeout = httpx.Timeout(settings.QUEUE_API_REQUEST_TIMEOUT_SECONDS)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        # follow_redirects stays off so a downgrade cannot resend the bearer.
+        # verify stays on. Do not log headers.
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, verify=True) as client:
             response = await client.post(f"{self.base_url}/internal/events", content=body, headers=headers)
         if response.status_code != 202:
             raise QueueApiError(f"Queue API publish failed with status {response.status_code}")

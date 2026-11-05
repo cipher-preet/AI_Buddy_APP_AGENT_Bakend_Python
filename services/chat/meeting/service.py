@@ -93,6 +93,9 @@ class MeetingChatService:
 
         context = await self.loader.load(user_id, meeting_id)
         requested_space_ids = [sid for sid in (space_ids or []) if sid]
+        from services.auth.space_access import authorize_space_ids
+
+        await authorize_space_ids(self.repository.db, user_id, requested_space_ids, "read")
         session = await self.repository.get_or_create_meeting_session(
             user_id,
             meeting_id,

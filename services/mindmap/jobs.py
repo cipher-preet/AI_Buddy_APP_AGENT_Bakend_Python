@@ -7,6 +7,7 @@ from services.mindmap.schemas import MindmapStatus, SourceStats
 from services.mindmap.source_scope import empty_context_message, scope_from_stored
 from services.mindmap.sources import MindmapSource
 from services.mindmap.store import MindmapStore
+from services.queue.job_lease import LeavePending, StaleOwnershipError, mark_current_job_completed
 from services.queue.streams import EventEnvelope, NonRetryableQueueError
 
 
@@ -37,10 +38,11 @@ class MindmapJobHandler:
         if claim_state == "missing":
             raise NonRetryableQueueError(f"mindmap document not found: {mindmap_id}")
         if claim_state == "exists":
+            mark_current_job_completed()
             return
         if claim_state == "busy":
             mindmap_log("job_busy", mindmapId=mindmap_id, jobId=event.eventId)
-            return
+            raise LeavePending(mindmap_id)
 
         try:
             scope = scope_from_stored(payload.get("sourceScope") or (doc or {}).get("sourceScope"))
@@ -92,6 +94,7 @@ class MindmapJobHandler:
                 source_stats=bundle.sourceStats or SourceStats(),
                 model=model,
             )
+            mark_current_job_completed()
             mindmap_log(
                 "job_ready",
                 mindmapId=mindmap_id,
@@ -112,6 +115,8 @@ class MindmapJobHandler:
             await self.store.mark_failed(mindmap_id, str(error))
             raise NonRetryableQueueError(str(error)) from error
         except Exception as error:
+            if isinstance(error, (StaleOwnershipError, LeavePending)):
+                raise
             await self.store.mark_failed(mindmap_id, f"{type(error).__name__}: {error}")
             mindmap_log(
                 "job_failed",

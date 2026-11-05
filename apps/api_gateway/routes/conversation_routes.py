@@ -1,8 +1,9 @@
 from datetime import datetime
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from apps.api_gateway.auth import raise_for_access, require_matching_user, require_user
 from apps.api_gateway.controllers.conversation_controller import (
     conversation_status_controller,
     complete_audio_upload_controller,
@@ -11,10 +12,13 @@ from apps.api_gateway.controllers.conversation_controller import (
     start_conversation_controller,
     stop_conversation_controller,
 )
+from services.auth.identity import AuthenticatedUser
+from services.auth.space_access import AccessDenied, require_space_operation
+from services.db.mongo import get_database
 from services.storage.s3_audio_storage import PermanentS3StorageError
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 class StartConversationRequest(BaseModel):
@@ -51,14 +55,28 @@ class AudioUploadCompleteRequest(BaseModel):
     durationMs: int | None = Field(default=None, ge=0)
 
 
+async def _owner(actor: AuthenticatedUser, supplied_user_id: str, space_id: str) -> str:
+    user_id = require_matching_user(actor, supplied_user_id)
+    try:
+        await require_space_operation(get_database(), user_id, space_id.strip(), "write")
+    except AccessDenied as error:
+        raise_for_access(error)
+    return user_id
+
+
 @router.post("/start")
-async def start_conversation(request: StartConversationRequest):
-    return await _call(start_conversation_controller(request.userId, request.spaceId))
+async def start_conversation(
+    request: StartConversationRequest,
+    actor: AuthenticatedUser = Depends(require_user),
+):
+    user_id = await _owner(actor, request.userId, request.spaceId)
+    return await _call(start_conversation_controller(user_id, request.spaceId.strip()))
 
 
 @router.post("/{conversation_id}/audio")
 async def ingest_audio(
     conversation_id: str,
+    actor: AuthenticatedUser = Depends(require_user),
     user_id: str = Form(...),
     space_id: str = Form(...),
     chunk_id: str = Form(...),
@@ -67,11 +85,12 @@ async def ingest_audio(
     duration_ms: int | None = Form(default=None),
     file: UploadFile = File(...),
 ):
+    verified_user_id = await _owner(actor, user_id, space_id)
     return await _call(
         ingest_audio_controller(
             conversation_id=conversation_id,
-            user_id=user_id,
-            space_id=space_id,
+            user_id=verified_user_id,
+            space_id=space_id.strip(),
             chunk_id=chunk_id,
             sequence_number=sequence_number,
             captured_at=captured_at,
@@ -82,12 +101,17 @@ async def ingest_audio(
 
 
 @router.post("/{conversation_id}/audio/upload-url")
-async def create_audio_upload_url(conversation_id: str, request: AudioUploadUrlRequest):
+async def create_audio_upload_url(
+    conversation_id: str,
+    request: AudioUploadUrlRequest,
+    actor: AuthenticatedUser = Depends(require_user),
+):
+    user_id = await _owner(actor, request.userId, request.spaceId)
     return await _call(
         create_audio_upload_url_controller(
             conversation_id=conversation_id,
-            user_id=request.userId,
-            space_id=request.spaceId,
+            user_id=user_id,
+            space_id=request.spaceId.strip(),
             sequence_number=request.sequenceNumber,
             content_type=request.contentType,
             extension=request.extension,
@@ -98,12 +122,17 @@ async def create_audio_upload_url(conversation_id: str, request: AudioUploadUrlR
 
 
 @router.post("/{conversation_id}/audio/complete")
-async def complete_audio_upload(conversation_id: str, request: AudioUploadCompleteRequest):
+async def complete_audio_upload(
+    conversation_id: str,
+    request: AudioUploadCompleteRequest,
+    actor: AuthenticatedUser = Depends(require_user),
+):
+    user_id = await _owner(actor, request.userId, request.spaceId)
     return await _call(
         complete_audio_upload_controller(
             conversation_id=conversation_id,
-            user_id=request.userId,
-            space_id=request.spaceId,
+            user_id=user_id,
+            space_id=request.spaceId.strip(),
             chunk_id=request.chunkId,
             sequence_number=request.sequenceNumber,
             object_key=request.objectKey,
@@ -116,12 +145,17 @@ async def complete_audio_upload(conversation_id: str, request: AudioUploadComple
 
 
 @router.post("/{conversation_id}/stop")
-async def stop_conversation(conversation_id: str, request: StopConversationRequest):
+async def stop_conversation(
+    conversation_id: str,
+    request: StopConversationRequest,
+    actor: AuthenticatedUser = Depends(require_user),
+):
+    user_id = await _owner(actor, request.userId, request.spaceId)
     return await _call(
         stop_conversation_controller(
             conversation_id=conversation_id,
-            user_id=request.userId,
-            space_id=request.spaceId,
+            user_id=user_id,
+            space_id=request.spaceId.strip(),
             last_sequence_number=request.lastSequenceNumber,
             stopped_at_client=request.stoppedAtClient,
         )
@@ -129,8 +163,14 @@ async def stop_conversation(conversation_id: str, request: StopConversationReque
 
 
 @router.get("/{conversation_id}/status")
-async def conversation_status(conversation_id: str, user_id: str, space_id: str):
-    return await _call(conversation_status_controller(conversation_id, user_id, space_id))
+async def conversation_status(
+    conversation_id: str,
+    user_id: str,
+    space_id: str,
+    actor: AuthenticatedUser = Depends(require_user),
+):
+    verified_user_id = require_matching_user(actor, user_id)
+    return await _call(conversation_status_controller(conversation_id, verified_user_id, space_id))
 
 
 async def _call(awaitable):

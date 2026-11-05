@@ -103,7 +103,6 @@ async def enqueue_document_generation(
         await RedisStreamProducer(client, force_direct=True).publish(
             settings.REDIS_DOCUMENT_STREAM,
             event,
-            maxlen=settings.REDIS_DOCUMENT_STREAM_MAXLEN,
         )
     except MindmapRedisConfigError as error:
         await store.mark_failed(document_id, str(error))

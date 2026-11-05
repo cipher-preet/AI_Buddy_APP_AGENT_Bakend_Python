@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from apps.api_gateway.config.setting import settings
+from services.auth.space_access import require_space_operation
 from services.chat.planner import ChatQueryPlan
 from services.chat.write_tools import WRITE_TOOL_NAMES, ChatWriteToolRegistry, tool_catalog_for_prompt
 from services.chat.writes import ChatWriteStore
@@ -328,6 +329,13 @@ async def execute_write_action(
                 tool_args.pop(key, None)
         if "description" not in tool_args and not (spec.description or "").strip():
             pass  # already omitted
+    mutating_space_id = None
+    if spec.action in {"create_task", "create_note"} and space_id:
+        mutating_space_id = space_id
+    elif spec.action in {"update_space", "delete_space"} and entity_id:
+        mutating_space_id = entity_id
+    if mutating_space_id:
+        await require_space_operation(store.db, user_id, mutating_space_id, "write")
     result = await tools.run(spec.action, tool_args)
     if not result.ok:
         return {

@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 import httpx
 
 from apps.api_gateway.config.setting import settings
+from services.runtime.file_io import read_file_bytes
 from services.speech.errors import (
     STTPermanentAudioError,
     STTProviderAuthError,
@@ -60,7 +61,7 @@ async def deepgram_transcribe_from_path(
 
     DeepgramClient, FileSource, PrerecordedOptions = sdk
     source: FileSource = {
-        "buffer": path.read_bytes(),
+        "buffer": await read_file_bytes(path),
         "mimetype": mimetype,
     }
     options = _prerecorded_options(PrerecordedOptions, language, resolved_keyterms)
@@ -100,7 +101,7 @@ async def _deepgram_transcribe_with_http(
                 "https://api.deepgram.com/v1/listen",
                 params=params,
                 headers=headers,
-                content=path.read_bytes(),
+                content=await read_file_bytes(path),
             )
     except Exception as error:
         raise _classify_deepgram_error(error) from error

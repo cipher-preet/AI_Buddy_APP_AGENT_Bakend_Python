@@ -33,5 +33,4 @@ def build_document_consumer() -> RedisStreamConsumer:
         max_retries=settings.DOCUMENT_MAX_RETRIES,
         redis=get_mindmap_redis_client(),
         delete_after_ack=True,
-        stream_maxlen=settings.REDIS_DOCUMENT_STREAM_MAXLEN,
     )

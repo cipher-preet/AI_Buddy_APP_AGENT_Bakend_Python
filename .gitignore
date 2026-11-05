@@ -11,6 +11,8 @@ venv/
 # Environment variables
 .env
 .env.*
+deploy/staging/staging.env
+deploy/staging/*.local.env
 
 # FastAPI / Uvicorn
 *.log

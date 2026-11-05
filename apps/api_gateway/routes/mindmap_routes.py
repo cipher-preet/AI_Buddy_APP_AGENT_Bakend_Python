@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from apps.api_gateway.auth import raise_for_access, require_matching_user, require_user
+from services.auth.identity import AuthenticatedUser
+from services.auth.space_access import AccessDenied, require_owned_resource, require_space_operation
 from services.mindmap.source_scope import parse_source_scope
 
 from services.db.mongo import get_database
@@ -15,7 +18,7 @@ from services.mindmap.store import (
 )
 from services.plans.plan_limits import PlanLimitExceeded
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 class GenerateMindmapBody(BaseModel):
@@ -28,14 +31,21 @@ class GenerateMindmapBody(BaseModel):
 
 
 @router.post("/generate")
-async def generate_mindmap(body: GenerateMindmapBody):
+async def generate_mindmap(
+    body: GenerateMindmapBody,
+    actor: AuthenticatedUser = Depends(require_user),
+):
+    user_id = require_matching_user(actor, body.userId)
     try:
+        await require_space_operation(get_database(), user_id, body.spaceId.strip(), "write")
         result = await enqueue_mindmap_generation(
             get_database(),
-            user_id=body.userId.strip(),
+            user_id=user_id,
             space_id=body.spaceId.strip(),
             scope=parse_source_scope(body.scope, body.date, body.timeZone, dates=body.dates),
         )
+    except AccessDenied as error:
+        raise_for_access(error)
     except PlanLimitExceeded as error:
         raise HTTPException(
             status_code=403,
@@ -61,11 +71,17 @@ async def generate_mindmap(body: GenerateMindmapBody):
 
 @router.get("")
 async def get_latest_mindmap(
+    actor: AuthenticatedUser = Depends(require_user),
     user_id: str = Query(..., alias="userId", min_length=1),
     space_id: str = Query(..., alias="spaceId", min_length=1),
 ):
+    verified_user_id = require_matching_user(actor, user_id)
+    try:
+        access = await require_space_operation(get_database(), verified_user_id, space_id.strip(), "read")
+    except AccessDenied as error:
+        raise_for_access(error)
     store = MindmapStore(get_database())
-    document = await store.get_latest_ready(user_id.strip(), space_id.strip())
+    document = await store.get_latest_ready(access.owner_user_id, space_id.strip())
     if document is None:
         raise HTTPException(status_code=404, detail="Mind map not found for this space.")
     return {"success": True, "mindmap": public_mindmap_doc(document)}
@@ -73,15 +89,21 @@ async def get_latest_mindmap(
 
 @router.get("/list")
 async def list_mindmaps(
+    actor: AuthenticatedUser = Depends(require_user),
     user_id: str = Query(..., alias="userId", min_length=1),
     space_id: str = Query(..., alias="spaceId", min_length=1),
     limit: int = Query(24, ge=1, le=50),
     view: str | None = Query(default=None),
 ):
+    verified_user_id = require_matching_user(actor, user_id)
+    try:
+        access = await require_space_operation(get_database(), verified_user_id, space_id.strip(), "read")
+    except AccessDenied as error:
+        raise_for_access(error)
     card = view == "card"
     store = MindmapStore(get_database())
     documents = await store.list_for_space(
-        user_id.strip(),
+        access.owner_user_id,
         space_id.strip(),
         limit=limit,
         card=card,
@@ -94,19 +116,48 @@ async def list_mindmaps(
 
 
 @router.get("/{mindmap_id}")
-async def get_mindmap_by_id(mindmap_id: str):
+async def get_mindmap_by_id(
+    mindmap_id: str,
+    actor: AuthenticatedUser = Depends(require_user),
+):
     store = MindmapStore(get_database())
     document = await store.get(mindmap_id.strip())
     if document is None:
         raise HTTPException(status_code=404, detail="Mind map not found.")
+    try:
+        await require_owned_resource(
+            get_database(),
+            actor.user_id,
+            document,
+            operation="read",
+            missing_detail="Mind map not found.",
+        )
+    except AccessDenied as error:
+        raise_for_access(error)
     return {"success": True, "mindmap": public_mindmap_doc(document)}
 
 
 @router.delete("/{mindmap_id}/nodes/{node_id}")
-async def remove_mindmap_node(mindmap_id: str, node_id: str):
+async def remove_mindmap_node(
+    mindmap_id: str,
+    node_id: str,
+    actor: AuthenticatedUser = Depends(require_user),
+):
     store = MindmapStore(get_database())
+    current = await store.get(mindmap_id.strip())
+    if current is None:
+        raise HTTPException(status_code=404, detail="Mind map not found.")
     try:
+        await require_owned_resource(
+            get_database(),
+            actor.user_id,
+            current,
+            operation="write",
+            missing_detail="Mind map not found.",
+        )
         document = await store.remove_node(mindmap_id.strip(), node_id.strip())
+    except AccessDenied as error:
+        raise_for_access(error)
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except Exception as error:

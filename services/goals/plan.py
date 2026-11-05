@@ -1390,12 +1390,18 @@ def _preserve_progress(previous: dict[str, Any] | None, plan: dict[str, Any]) ->
     return plan
 
 
-async def prepare_plan_context(store: Any | None, goal: dict[str, Any], *, force_refresh: bool = False) -> dict[str, Any]:
+async def prepare_plan_context(
+    store: Any | None,
+    goal: dict[str, Any],
+    *,
+    force_refresh: bool = False,
+    job_id: str = "",
+) -> dict[str, Any]:
     from services.goals.gaps import analyze_gaps
     from services.goals.research import compact_evidence_pack, run_research
 
     try:
-        research = await run_research(store, goal, force_refresh=force_refresh)
+        research = await run_research(store, goal, force_refresh=force_refresh, job_id=job_id)
     except Exception as error:
         print(
             "goal research failed; planning from user context only",
@@ -1444,11 +1450,18 @@ def _attach_consultant_fields(plan: dict[str, Any], goal: dict[str, Any], valida
     return annotate_execution(plan, goal)
 
 
-async def build_plan(goal: dict[str, Any], store: Any | None = None, *, force_refresh: bool = False, previous_plan: dict[str, Any] | None = None) -> dict[str, Any]:
+async def build_plan(
+    goal: dict[str, Any],
+    store: Any | None = None,
+    *,
+    force_refresh: bool = False,
+    previous_plan: dict[str, Any] | None = None,
+    job_id: str = "",
+) -> dict[str, Any]:
     """Research, gaps, then Strategist → Advisor → Execution → Critic, then validate."""
     from services.goals.validator import strip_mismatched_items, validate_plan
 
-    prepared = await prepare_plan_context(store, goal, force_refresh=force_refresh)
+    prepared = await prepare_plan_context(store, goal, force_refresh=force_refresh, job_id=job_id)
     goal = prepared["goal"]
     assert wants_expert_pipeline(goal)
     pipeline = await run_expert_plan_pipeline(goal)

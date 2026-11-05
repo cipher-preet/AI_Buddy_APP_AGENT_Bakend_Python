@@ -11,6 +11,7 @@ from services.document_it.store import DocumentStore
 from services.document_it.templates import load_template_spec
 from services.mindmap.source_scope import empty_context_message, scope_from_stored
 from services.mindmap.sources import MindmapSource
+from services.queue.job_lease import LeavePending, StaleOwnershipError, mark_current_job_completed
 from services.queue.streams import EventEnvelope, NonRetryableQueueError
 
 
@@ -51,10 +52,11 @@ class DocumentJobHandler:
         if claim_state == "missing":
             raise NonRetryableQueueError(f"document not found: {document_id}")
         if claim_state == "exists":
+            mark_current_job_completed()
             return
         if claim_state == "busy":
             document_log("job_busy", documentId=document_id, jobId=event.eventId)
-            return
+            raise LeavePending(document_id)
 
         try:
             template = await load_template_spec(self.database, template_code)
@@ -128,6 +130,7 @@ class DocumentJobHandler:
                 model=model,
                 space_name=bundle.spaceName,
             )
+            mark_current_job_completed()
             document_log(
                 "job_ready",
                 documentId=document_id,
@@ -150,6 +153,8 @@ class DocumentJobHandler:
             await self.store.mark_failed(document_id, str(error))
             raise NonRetryableQueueError(str(error)) from error
         except Exception as error:
+            if isinstance(error, (StaleOwnershipError, LeavePending)):
+                raise
             await self.store.mark_failed(document_id, f"{type(error).__name__}: {error}")
             document_log(
                 "job_failed",

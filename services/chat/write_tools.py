@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from services.auth.space_access import AccessDenied
 from services.chat.writes import ChatWriteStore
 
 
@@ -72,6 +73,8 @@ class ChatWriteToolRegistry:
                 summary=_success_summary(tool_name, data, args),
                 data=data,
             )
+        except AccessDenied:
+            raise
         except Exception as error:
             return WriteToolResult(
                 ok=False,

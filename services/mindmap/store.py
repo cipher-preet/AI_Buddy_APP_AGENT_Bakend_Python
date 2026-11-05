@@ -225,8 +225,14 @@ class MindmapStore:
         source_stats: SourceStats,
         model: str | None,
     ) -> dict[str, Any] | None:
+        from services.queue.job_lease import require_active_lease
+
+        await require_active_lease()
         graph_payload = graph.model_dump()
-        return await self.collection.find_one_and_update(
+        from services.queue.mongo_fence import fenced_find_one_and_update
+
+        return await fenced_find_one_and_update(
+            self.collection,
             {"_id": {"$in": mongo_id_candidates(mindmap_id)}},
             {
                 "$set": {
@@ -344,7 +350,13 @@ class MindmapStore:
         )
 
     async def mark_failed(self, mindmap_id: str, error: str) -> dict[str, Any] | None:
-        return await self.collection.find_one_and_update(
+        from services.queue.job_lease import require_active_lease
+
+        await require_active_lease()
+        from services.queue.mongo_fence import fenced_find_one_and_update
+
+        return await fenced_find_one_and_update(
+            self.collection,
             {"_id": {"$in": mongo_id_candidates(mindmap_id)}},
             {
                 "$set": {

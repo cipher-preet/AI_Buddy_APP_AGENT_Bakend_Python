@@ -34,7 +34,6 @@ def build_mindmap_consumer() -> RedisStreamConsumer:
         max_retries=settings.MINDMAP_MAX_RETRIES,
         redis=get_mindmap_redis_client(),
         delete_after_ack=True,
-        stream_maxlen=settings.REDIS_MINDMAP_STREAM_MAXLEN,
     )
 
 

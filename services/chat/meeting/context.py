@@ -7,7 +7,7 @@ from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from services.conversation.repository import mongo_id_candidates
+from services.conversation.repository import mongo_id_candidates, same_mongo_id
 from services.db.mongo import get_database
 
 
@@ -70,7 +70,7 @@ class MeetingContextLoader:
         owner_doc = session or conversation
         if not owner_doc:
             raise ValueError("Meeting not found")
-        if str(owner_doc.get("userId")) != str(user_id):
+        if not same_mongo_id(owner_doc.get("userId"), user_id):
             raise PermissionError("Meeting does not belong to this user")
 
         space_id = (session or {}).get("spaceId") or (conversation or {}).get("spaceId")

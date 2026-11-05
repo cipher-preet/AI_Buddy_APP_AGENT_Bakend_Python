@@ -10,10 +10,12 @@ from pydantic import BaseModel, Field
 from apps.api_gateway.config.setting import settings
 from services.goals.progress import chart_actual, consultant_progress, is_done_status
 from services.goals.schemas import PlanStrategy, PriorityRecommendation
-from services.goals.store import GoalStore, utc_now
+from services.goals.store import GoalStore, space_ingest_operation_id, utc_now
 from services.llm.models import LLMMessage, StructuredLLMRequest
 from services.llm.router import get_llm_router
 from services.prompts.loader import load_prompt
+from services.queue.job_lease import StaleOwnershipError
+from services.queue.mongo_fence import fenced_update_one
 
 
 class ReviewDraft(BaseModel):
@@ -258,6 +260,8 @@ def apply_coach_updates(plan: dict[str, Any], drafted: dict[str, Any]) -> dict[s
 async def _ingest_space_evidence(
     store: GoalStore, goal: dict[str, Any], findings: list[dict[str, Any]], revision: str
 ) -> list[dict[str, Any]]:
+    from pymongo.errors import DuplicateKeyError
+
     now = utc_now()
     wrote = False
     for finding in findings:
@@ -266,37 +270,47 @@ async def _ingest_space_evidence(
         if not text or not source_id:
             continue
         category = str(finding.get("category") or "OUTPUT")
-        await store.db.goal_evidence.update_one(
-            {
-                "goalId": goal.get("_id"),
-                "sourceType": str(finding.get("sourceType") or "space"),
-                "sourceId": source_id,
-                "sourceRevision": revision,
-                "evidenceKey": category,
-            },
-            {
-                "$set": {
-                    "ownerId": goal.get("ownerId"),
-                    "category": category,
-                    "verification": "SOURCE_SUPPORTED",
-                    "text": text[:1000],
-                    "milestoneTitle": "",
-                    "updatedAt": now,
+        try:
+            await fenced_update_one(
+                store.db.goal_evidence,
+                {
+                    "goalId": goal.get("_id"),
+                    "sourceType": str(finding.get("sourceType") or "space"),
+                    "sourceId": source_id,
+                    "sourceRevision": revision,
+                    "evidenceKey": category,
                 },
-                "$setOnInsert": {"createdAt": now},
-            },
-            upsert=True,
-        )
+                {
+                    "$set": {
+                        "ownerId": goal.get("ownerId"),
+                        "category": category,
+                        "verification": "SOURCE_SUPPORTED",
+                        "text": text[:1000],
+                        "milestoneTitle": "",
+                        "updatedAt": now,
+                    },
+                    "$setOnInsert": {"createdAt": now},
+                },
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            pass
         wrote = True
     if wrote:
-        await store.db.goals.update_one({"_id": goal.get("_id")}, {"$inc": {"evidenceVersion": 1}})
+        operation_id = space_ingest_operation_id(goal.get("_id"), revision)
+        await fenced_update_one(
+            store.db.goals,
+            {"_id": goal.get("_id"), "appliedEvidenceOps": {"$nin": [operation_id]}},
+            {"$inc": {"evidenceVersion": 1}, "$addToSet": {"appliedEvidenceOps": operation_id}},
+        )
     cursor = store.db.goal_evidence.find({"goalId": goal.get("_id")}).sort("createdAt", -1).limit(80)
     return await cursor.to_list(length=80)
 
 
 async def _write_snapshot(store: GoalStore, goal: dict[str, Any], period_type: str, period_key_value: str, actual: int) -> None:
     now = utc_now()
-    await store.db.goal_snapshots.update_one(
+    await fenced_update_one(
+        store.db.goal_snapshots,
         {"goalId": goal.get("_id"), "periodType": period_type, "periodKey": period_key_value},
         {
             "$set": {"target": 100, "actual": actual, "updatedAt": now},
@@ -324,15 +338,19 @@ async def build_review(store: GoalStore, goal: dict[str, Any], period_type: str,
         next_plan = apply_coach_updates(approved, drafted)
         await store.patch_goal(str(goal.get("_id")), {"approvedPlan": next_plan})
         try:
-            await store.db.goal_plan_versions.update_one(
+            await fenced_update_one(
+                store.db.goal_plan_versions,
                 {"goalId": goal.get("_id"), "version": int(goal.get("activePlanVersion") or 1)},
                 {"$set": {"plan": next_plan, "updatedAt": utc_now()}},
             )
+        except StaleOwnershipError:
+            raise
         except Exception as error:
             print("goal plan coach update skipped", {"error": type(error).__name__}, flush=True)
 
     now = utc_now()
-    await store.db.goal_reviews.update_one(
+    await fenced_update_one(
+        store.db.goal_reviews,
         {"goalId": goal.get("_id"), "periodType": period_type, "periodKey": period_key_value},
         {
             "$set": {
@@ -356,7 +374,8 @@ async def build_review(store: GoalStore, goal: dict[str, Any], period_type: str,
         approved = goal.get("approvedPlan") or {}
         if isinstance(approved, dict) and approved.get("milestones"):
             try:
-                await store.db.goal_plan_versions.update_one(
+                await fenced_update_one(
+                    store.db.goal_plan_versions,
                     {"goalId": goal.get("_id"), "version": active + 1, "status": "proposed"},
                     {
                         "$setOnInsert": {
@@ -368,6 +387,8 @@ async def build_review(store: GoalStore, goal: dict[str, Any], period_type: str,
                     },
                     upsert=True,
                 )
+            except StaleOwnershipError:
+                raise
             except Exception as error:
                 print("goal plan revision skipped", {"error": type(error).__name__}, flush=True)
 

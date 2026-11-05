@@ -33,7 +33,11 @@ def test_duplicate_speech_job_does_not_call_processor(monkeypatch):
     async def fail_transcribe(**kwargs):
         raise AssertionError("duplicate completed jobs must not be transcribed again")
 
+    async def already_stored(job_id):
+        return True
+
     monkeypatch.setattr(speech_worker, "get_job_result", completed)
+    monkeypatch.setattr(speech_worker, "vector_stage_settled", already_stored)
     monkeypatch.setattr(speech_worker, "transcribe_from_path_with_fallback", fail_transcribe)
 
     asyncio.run(speech_worker.process_speech_job({"job_id": "job-1"}))
@@ -503,7 +507,15 @@ def test_empty_completed_speech_job_skips_vector_and_cleans_up(monkeypatch):
     async def delete_job(job_id):
         deleted.append(job_id)
 
+    async def not_settled(job_id):
+        return False
+
+    async def mark_stored(job_id):
+        return None
+
     monkeypatch.setattr(vector_worker, "get_job_result", get_result)
+    monkeypatch.setattr(vector_worker, "vector_stage_settled", not_settled)
+    monkeypatch.setattr(vector_worker, "mark_vector_stored", mark_stored)
     monkeypatch.setattr(vector_worker, "store_transcript_in_vector_db", fail_store)
     monkeypatch.setattr(vector_worker, "delete_speech_job", delete_job)
 
@@ -635,6 +647,47 @@ def test_missing_s3_bucket_is_permanent_and_marked_failed(monkeypatch):
     assert failures and failures[0] == ("job-1", "Speech S3 job is missing s3_bucket")
 
 
+def _fake_atomic_publish(redis, numkeys, args):
+    dedupe = args[0]
+    queue = args[1]
+    mode = args[numkeys]
+    payload = args[numkeys + 1]
+    fingerprint = args[numkeys + 2]
+    write_speech = args[numkeys + 6] if len(args) > numkeys + 6 else "0"
+    speech_key = args[3] if numkeys >= 4 else ""
+    speech_fields = json.loads(args[numkeys + 8]) if write_speech == "1" and len(args) > numkeys + 8 else {}
+
+    def remember_speech() -> None:
+        if write_speech == "1" and speech_key and speech_key not in redis.records:
+            redis.records[speech_key] = dict(speech_fields)
+
+    existing = redis.records.get(dedupe)
+    if existing:
+        if existing.get("payloadHash") and existing.get("payloadHash") != fingerprint:
+            from services.queue.atomic_publish import QueuePayloadConflict
+
+            raise QueuePayloadConflict(dedupe)
+        remember_speech()
+        return ["duplicate", existing.get("redisMessageId", ""), existing.get("stream") or queue]
+    message_id = "list"
+    if mode == "list" and hasattr(redis, "lpush"):
+        redis.lpush_sync = True
+    if mode == "stream":
+        message_id = "1-0"
+        redis.xadded.append((queue, {"event": payload}))
+    else:
+        redis.pushed.append((queue, json.loads(payload)))
+        message_id = "list"
+    redis.records[dedupe] = {
+        "state": "published",
+        "stream": queue,
+        "redisMessageId": message_id,
+        "payloadHash": fingerprint,
+    }
+    remember_speech()
+    return ["published", message_id, queue]
+
+
 def test_queue_api_accepts_hmac_event_and_replays_duplicate(monkeypatch):
     monkeypatch.setattr(settings, "QUEUE_API_SERVICE_TOKEN", "")
     monkeypatch.setattr(settings, "QUEUE_API_HMAC_SECRET", "test-secret")
@@ -657,6 +710,9 @@ def test_queue_api_accepts_hmac_event_and_replays_duplicate(monkeypatch):
 
         async def expire(self, key, ttl):
             return True
+
+        async def eval(self, script, numkeys, *args):
+            return _fake_atomic_publish(self, numkeys, args)
 
     fake_redis = Redis()
     monkeypatch.setattr(queue_api, "redis_client", fake_redis)
@@ -708,6 +764,9 @@ def test_queue_api_accepts_audio_stream_target(monkeypatch):
         async def expire(self, key, ttl):
             return True
 
+        async def eval(self, script, numkeys, *args):
+            return _fake_atomic_publish(self, numkeys, args)
+
     fake_redis = Redis()
     monkeypatch.setattr(queue_api, "redis_client", fake_redis)
     client = TestClient(queue_api.app)
@@ -750,6 +809,9 @@ def test_queue_api_accepts_legacy_speech_job(monkeypatch):
 
         async def lpush(self, queue, payload):
             self.pushed.append((queue, json.loads(payload)))
+
+        async def eval(self, script, numkeys, *args):
+            return _fake_atomic_publish(self, numkeys, args)
 
         async def expire(self, key, ttl):
             return True
