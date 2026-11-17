@@ -8,6 +8,7 @@ from pymongo import ReturnDocument
 
 from services.conversation.models import utc_now
 from services.conversation.repository import mongo_id_candidates
+from services.db.list_cursor import cursor_match, decode_list_cursor, encode_list_cursor, list_stamp
 from services.mindmap.schemas import (
     ACTIVE_STATUSES,
     PIPELINE_VERSION,
@@ -258,7 +259,8 @@ class MindmapStore:
         *,
         limit: int = 24,
         card: bool = False,
-    ) -> list[dict[str, Any]]:
+        cursor: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
         capped = max(1, min(int(limit), 50))
         projection = (
             {
@@ -274,19 +276,26 @@ class MindmapStore:
                 "graph": 0,
             }
         )
-        docs = await (
-            self.collection.find(
-                {
-                    "userId": {"$in": mongo_id_candidates(user_id)},
-                    "spaceId": {"$in": mongo_id_candidates(space_id)},
-                    "status": MindmapStatus.READY.value,
-                },
-                projection,
-            )
-            .sort([("version", -1), ("updatedAt", -1)])
-            .limit(capped)
-            .to_list(length=capped)
+        query: dict[str, Any] = {
+            "userId": {"$in": mongo_id_candidates(user_id)},
+            "spaceId": {"$in": mongo_id_candidates(space_id)},
+            "status": MindmapStatus.READY.value,
+        }
+        if cursor:
+            updated_at, version, doc_id = decode_list_cursor(cursor)
+            query.update(cursor_match(updated_at, version, doc_id, version_first=True))
+        fetched = await (
+            self.collection.find(query, projection)
+            .sort([("version", -1), ("updatedAt", -1), ("_id", -1)])
+            .limit(capped + 1)
+            .to_list(length=capped + 1)
         )
+        has_more = len(fetched) > capped
+        docs = fetched[:capped]
+        next_cursor = None
+        if has_more and docs:
+            last = docs[-1]
+            next_cursor = encode_list_cursor(list_stamp(last), int(last.get("version") or 0), last.get("_id"))
         def needs_preview_refresh(doc: dict[str, Any]) -> bool:
             preview = doc.get("preview")
             if not isinstance(preview, dict):
@@ -304,7 +313,7 @@ class MindmapStore:
                     {"_id": doc["_id"]},
                     {"$set": {"preview": preview}},
                 )
-        return docs
+        return docs, next_cursor
 
     async def remove_node(self, mindmap_id: str, node_id: str) -> dict[str, Any] | None:
         document = await self.get(mindmap_id)

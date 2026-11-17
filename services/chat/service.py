@@ -287,16 +287,32 @@ class ChatService:
 
         return None, question
 
-    async def load_chat(self, user_id: str, chat_id: str, *, card: bool = False) -> dict[str, Any]:
+    async def load_chat(
+        self,
+        user_id: str,
+        chat_id: str,
+        *,
+        card: bool = False,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
         session = await self.repository.get_session(chat_id)
         if not session:
             raise ValueError("Chat session not found")
         if not same_mongo_id(session.userId, user_id):
             raise PermissionError("Chat session does not belong to this user")
-        messages = await self.repository.list_recent_messages(chat_id, MAX_CHAT_MESSAGES)
+        if limit is None:
+            messages = await self.repository.list_recent_messages(chat_id, MAX_CHAT_MESSAGES)
+            return {
+                "chat": _session_response(session, card=card),
+                "messages": [_message_response(message) for message in messages],
+            }
+
+        documents, next_cursor = await self.repository.list_message_page(chat_id, limit, cursor)
         return {
             "chat": _session_response(session, card=card),
-            "messages": [_message_response(message) for message in messages],
+            "messages": _stored_message_responses(documents),
+            "nextCursor": next_cursor,
         }
 
     async def list_chats(
@@ -613,6 +629,28 @@ def _langchain_memory_to_llm_messages(history: list[BaseMessage]) -> list[LLMMes
         elif message.type == "ai":
             messages.append(LLMMessage(role="assistant", content=str(message.content)))
     return messages
+
+
+def _stored_message_responses(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from langchain_core.messages import messages_from_dict
+
+    results: list[dict[str, Any]] = []
+    for document in documents:
+        history = document.get("History")
+        payloads: list[Any] = []
+        if isinstance(history, str):
+            payloads = [json.loads(history)]
+        elif isinstance(history, list):
+            payloads = history
+        elif isinstance(history, dict):
+            payloads = [history]
+        parsed = messages_from_dict(payloads) if payloads else []
+        document_id = str(document.get("_id"))
+        for index, message in enumerate(parsed):
+            item = _message_response(message)
+            item["id"] = document_id if len(parsed) == 1 else f"{document_id}-{index}"
+            results.append(item)
+    return results
 
 
 def _message_response(message: BaseMessage) -> dict[str, Any]:

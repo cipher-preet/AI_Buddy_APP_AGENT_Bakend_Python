@@ -93,10 +93,20 @@ async def load_chat_by_session_id(
     session_id: str,
     actor: AuthenticatedUser = Depends(require_user),
     user_id: str = Query(..., alias="userId"),
+    limit: int | None = Query(default=None, ge=1, le=50),
+    cursor: str | None = Query(default=None),
     view: str | None = Query(default=None),
 ):
     verified_user_id = require_matching_user(actor, user_id)
-    return await _call(load_chat_controller(verified_user_id, session_id, card=_card_view(view)))
+    return await _call(
+        load_chat_controller(
+            verified_user_id,
+            session_id,
+            card=_card_view(view),
+            limit=limit,
+            cursor=cursor,
+        )
+    )
 
 
 @router.get("")
@@ -119,10 +129,20 @@ async def load_chat(
     chat_id: str,
     actor: AuthenticatedUser = Depends(require_user),
     user_id: str = Query(..., alias="userId"),
+    limit: int | None = Query(default=None, ge=1, le=50),
+    cursor: str | None = Query(default=None),
     view: str | None = Query(default=None),
 ):
     verified_user_id = require_matching_user(actor, user_id)
-    return await _call(load_chat_controller(verified_user_id, chat_id, card=_card_view(view)))
+    return await _call(
+        load_chat_controller(
+            verified_user_id,
+            chat_id,
+            card=_card_view(view),
+            limit=limit,
+            cursor=cursor,
+        )
+    )
 
 
 async def _call(awaitable):

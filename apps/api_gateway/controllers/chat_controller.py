@@ -35,8 +35,24 @@ async def ask_chat_controller(
     }
 
 
-async def load_chat_controller(user_id: str, chat_id: str, *, card: bool = False):
-    return {"success": True, "data": await ChatService().load_chat(user_id, chat_id, card=card)}
+async def load_chat_controller(
+    user_id: str,
+    chat_id: str,
+    *,
+    card: bool = False,
+    limit: int | None = None,
+    cursor: str | None = None,
+):
+    return {
+        "success": True,
+        "data": await ChatService().load_chat(
+            user_id,
+            chat_id,
+            card=card,
+            limit=limit,
+            cursor=cursor,
+        ),
+    }
 
 
 async def list_chats_controller(

@@ -336,9 +336,9 @@ def test_document_list_uses_space_owner_for_viewers_and_rejects_revoked(api, mon
         def __init__(self, database):
             pass
 
-        async def list_for_space(self, user_id, space_id, limit=24, card=False):
+        async def list_for_space(self, user_id, space_id, limit=24, card=False, cursor=None):
             listed.append(user_id)
-            return []
+            return [], None
 
     monkeypatch.setattr("apps.api_gateway.routes.document_routes.DocumentStore", Store)
     monkeypatch.setattr("apps.api_gateway.routes.document_routes.get_database", _shared_space)

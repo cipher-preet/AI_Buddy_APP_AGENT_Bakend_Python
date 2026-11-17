@@ -10,6 +10,7 @@ from pymongo import ReturnDocument
 from apps.api_gateway.config.setting import settings
 from services.conversation.models import utc_now
 from services.conversation.repository import mongo_id_candidates
+from services.db.list_cursor import cursor_match, decode_list_cursor, encode_list_cursor, list_stamp
 from services.mindmap.source_scope import SourceScope, active_scope_filter
 from services.document_it.schemas import (
     ACTIVE_STATUSES,
@@ -300,7 +301,8 @@ class DocumentStore:
         *,
         limit: int = 24,
         card: bool = False,
-    ) -> list[dict[str, Any]]:
+        cursor: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
         capped = max(1, min(int(limit), 50))
         projection = (
             {
@@ -309,25 +311,34 @@ class DocumentStore:
                 "templateTitle": 1,
                 "preview": 1,
                 "fileName": 1,
+                "version": 1,
                 "updatedAt": 1,
                 "createdAt": 1,
             }
             if card
             else LIST_OMIT
         )
-        return await (
-            self.collection.find(
-                {
-                    "userId": {"$in": mongo_id_candidates(user_id)},
-                    "spaceId": {"$in": mongo_id_candidates(space_id)},
-                    "status": DocumentStatus.READY.value,
-                },
-                projection,
-            )
-            .sort([("updatedAt", -1), ("version", -1)])
-            .limit(capped)
-            .to_list(length=capped)
+        query: dict[str, Any] = {
+            "userId": {"$in": mongo_id_candidates(user_id)},
+            "spaceId": {"$in": mongo_id_candidates(space_id)},
+            "status": DocumentStatus.READY.value,
+        }
+        if cursor:
+            updated_at, version, doc_id = decode_list_cursor(cursor)
+            query.update(cursor_match(updated_at, version, doc_id, version_first=False))
+        docs = await (
+            self.collection.find(query, projection)
+            .sort([("updatedAt", -1), ("version", -1), ("_id", -1)])
+            .limit(capped + 1)
+            .to_list(length=capped + 1)
         )
+        has_more = len(docs) > capped
+        page = docs[:capped]
+        next_cursor = None
+        if has_more and page:
+            last = page[-1]
+            next_cursor = encode_list_cursor(list_stamp(last), int(last.get("version") or 0), last.get("_id"))
+        return page, next_cursor
 
     async def mark_failed(self, document_id: str, error: str) -> dict[str, Any] | None:
         from services.queue.job_lease import require_active_lease

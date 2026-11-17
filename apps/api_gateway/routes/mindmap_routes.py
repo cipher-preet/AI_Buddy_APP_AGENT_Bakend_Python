@@ -94,6 +94,7 @@ async def list_mindmaps(
     space_id: str = Query(..., alias="spaceId", min_length=1),
     limit: int = Query(24, ge=1, le=50),
     view: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
 ):
     verified_user_id = require_matching_user(actor, user_id)
     try:
@@ -102,16 +103,21 @@ async def list_mindmaps(
         raise_for_access(error)
     card = view == "card"
     store = MindmapStore(get_database())
-    documents = await store.list_for_space(
-        access.owner_user_id,
-        space_id.strip(),
-        limit=limit,
-        card=card,
-    )
+    try:
+        documents, next_cursor = await store.list_for_space(
+            access.owner_user_id,
+            space_id.strip(),
+            limit=limit,
+            card=card,
+            cursor=cursor.strip() if isinstance(cursor, str) and cursor.strip() else None,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     present = public_mindmap_card if card else public_mindmap_summary
     return {
         "success": True,
         "mindmaps": [present(doc) for doc in documents],
+        "nextCursor": next_cursor,
     }
 
 

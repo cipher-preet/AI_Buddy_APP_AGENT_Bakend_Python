@@ -7,7 +7,7 @@ from typing import Any
 
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from pymongo import ASCENDING, IndexModel
+from pymongo import ASCENDING, DESCENDING, IndexModel
 from pymongo.errors import AutoReconnect
 
 from apps.api_gateway.config.setting import settings
@@ -174,6 +174,33 @@ class ChatRepository:
         history = self.get_message_history(chat_id, limit)
         return await history.aget_messages()
 
+    async def list_message_page(
+        self,
+        chat_id: Any,
+        limit: int,
+        cursor: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Newest page first in storage order, returned oldest-to-newest for display."""
+        page_size = max(1, min(limit, 50))
+        query: dict[str, Any] = {"SessionId": str(chat_id)}
+        if cursor:
+            cursor_created_at, cursor_id = decode_messages_cursor(cursor)
+            query["$or"] = [
+                {"createdAt": {"$lt": cursor_created_at}},
+                {"createdAt": cursor_created_at, "_id": {"$lt": cursor_id}},
+            ]
+        documents = (
+            await self.db.chat_message_store.find(query)
+            .sort([("createdAt", DESCENDING), ("_id", DESCENDING)])
+            .limit(page_size + 1)
+            .to_list(page_size + 1)
+        )
+        has_more = len(documents) > page_size
+        page = documents[:page_size]
+        chronological = list(reversed(page))
+        next_cursor = encode_messages_cursor(page[-1]) if has_more and page else None
+        return chronological, next_cursor
+
     async def sync_message_count(self, chat_id: Any) -> int:
         count = len(await self.list_recent_messages(chat_id, MAX_CHAT_MESSAGES))
         await self.db.chat_sessions.update_one(
@@ -265,6 +292,31 @@ def is_native_object_id(value: Any) -> bool:
 
 def _id_query(value: Any) -> dict[str, Any]:
     return {"_id": to_mongo_id(value)}
+
+
+def encode_messages_cursor(document: dict[str, Any]) -> str:
+    created_at = document.get("createdAt")
+    if not isinstance(created_at, datetime):
+        object_id = document.get("_id")
+        created_at = object_id.generation_time if isinstance(object_id, ObjectId) else datetime.min
+    payload = {
+        "createdAt": created_at.isoformat(),
+        "id": str(document.get("_id")),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def decode_messages_cursor(cursor: str) -> tuple[datetime, ObjectId]:
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+        created_at = datetime.fromisoformat(str(payload["createdAt"]))
+        cursor_id = to_mongo_id(payload["id"])
+    except Exception as error:
+        raise ValueError("Invalid chat messages cursor") from error
+    if not isinstance(cursor_id, ObjectId):
+        raise ValueError("Invalid chat messages cursor")
+    return created_at, cursor_id
 
 
 def encode_sessions_cursor(session: ChatSessionDocument) -> str:
