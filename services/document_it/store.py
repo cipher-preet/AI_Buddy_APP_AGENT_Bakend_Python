@@ -104,15 +104,49 @@ class DocumentStore:
                 return doc
         return None
 
-    async def get(self, document_id: str, *, include_docx: bool = False) -> dict[str, Any] | None:
-        projection = None if include_docx else PUBLIC_OMIT
-        return await self.collection.find_one(
-            {"_id": {"$in": mongo_id_candidates(document_id)}},
-            projection,
+    def _files(self):
+        return self.db.spaceDocumentFiles
+
+    async def _attach_stored_payload(
+        self,
+        doc: dict[str, Any] | None,
+        *,
+        include_docx: bool,
+    ) -> dict[str, Any] | None:
+        if not doc:
+            return None
+        needs_content = "content" not in doc
+        if not needs_content and not include_docx:
+            return doc
+        side = await self._files().find_one(
+            {"_id": doc.get("_id")},
+            {"content": 1, "docxBase64": 1},
         )
+        if side:
+            if needs_content and "content" in side:
+                doc["content"] = side.get("content")
+            if include_docx and side.get("docxBase64"):
+                doc["docxBase64"] = side["docxBase64"]
+        if needs_content and "content" not in doc:
+            inline = await self.collection.find_one({"_id": doc.get("_id")}, {"content": 1})
+            if inline and "content" in inline:
+                doc["content"] = inline["content"]
+        if include_docx and not doc.get("docxBase64"):
+            inline = await self.collection.find_one({"_id": doc.get("_id")}, {"docxBase64": 1})
+            if inline and inline.get("docxBase64"):
+                doc["docxBase64"] = inline["docxBase64"]
+        return doc
+
+    async def get(self, document_id: str, *, include_docx: bool = False) -> dict[str, Any] | None:
+        doc = await self.collection.find_one(
+            {"_id": {"$in": mongo_id_candidates(document_id)}},
+            PUBLIC_OMIT,
+        )
+        return await self._attach_stored_payload(doc, include_docx=include_docx)
 
     async def get_by_job(self, job_id: str) -> dict[str, Any] | None:
-        return await self.collection.find_one({"jobId": str(job_id)}, PUBLIC_OMIT)
+        doc = await self.collection.find_one({"jobId": str(job_id)}, PUBLIC_OMIT)
+        return await self._attach_stored_payload(doc, include_docx=False)
 
     async def next_version(self, user_id: str, space_id: str, template_code: str) -> int:
         latest = await self.collection.find_one(
@@ -209,7 +243,10 @@ class DocumentStore:
         )
 
     async def claim(self, document_id: str, job_id: str) -> tuple[str, dict[str, Any] | None]:
-        existing = await self.get(document_id)
+        existing = await self.collection.find_one(
+            {"_id": {"$in": mongo_id_candidates(document_id)}},
+            {"docxBase64": 0, "content": 0},
+        )
         if existing is None:
             return "missing", None
         if existing.get("status") == DocumentStatus.READY.value:
@@ -246,6 +283,7 @@ class DocumentStore:
                     "error": None,
                 }
             },
+            projection={"docxBase64": 0, "content": 0},
             return_document=ReturnDocument.AFTER,
         )
         if updated is None:
@@ -271,7 +309,20 @@ class DocumentStore:
         content_payload = content.model_dump()
         preview = build_document_preview(content_payload)
         preview["spaceName"] = space_name
-        return await fenced_find_one_and_update(
+        encoded = base64.b64encode(docx_bytes).decode("ascii")
+        now = utc_now()
+        await self._files().update_one(
+            {"_id": document_id},
+            {
+                "$set": {
+                    "docxBase64": encoded,
+                    "content": content_payload,
+                    "inlineUpdatedAt": now,
+                }
+            },
+            upsert=True,
+        )
+        stored = await fenced_find_one_and_update(
             self.collection,
             {"_id": {"$in": mongo_id_candidates(document_id)}},
             {
@@ -281,18 +332,21 @@ class DocumentStore:
                     "progress": 100,
                     "message": "Document ready",
                     "error": None,
-                    "content": content_payload,
                     "preview": preview,
-                    "docxBase64": base64.b64encode(docx_bytes).decode("ascii"),
                     "docxBytes": len(docx_bytes),
                     "fileName": file_name,
                     "sourceStats": source_stats.model_dump(),
                     "model": model,
-                    "updatedAt": utc_now(),
-                }
+                    "updatedAt": now,
+                },
+                "$unset": {"docxBase64": "", "content": ""},
             },
             return_document=ReturnDocument.AFTER,
         )
+        if stored is not None:
+            stored["content"] = content_payload
+            stored["docxBase64"] = encoded
+        return stored
 
     async def list_for_space(
         self,
@@ -382,6 +436,7 @@ class DocumentStore:
             return
         drop_ids = [doc["_id"] for doc in docs[max_versions:]]
         if drop_ids:
+            await self._files().delete_many({"_id": {"$in": drop_ids}})
             await self.collection.delete_many({"_id": {"$in": drop_ids}})
 
 

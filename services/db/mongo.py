@@ -4,6 +4,7 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo import ASCENDING, DESCENDING, IndexModel
 
 from apps.api_gateway.config.setting import settings
+from services.db.heavy_payloads import schedule_heavy_payload_offload
 from services.llm.async_runtime import current_loop_id
 
 
@@ -195,6 +196,7 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
     await database.tasks.create_indexes(
         [
             IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("status", ASCENDING)]),
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("deletedAt", ASCENDING), ("_id", DESCENDING)]),
             IndexModel([("userId", ASCENDING), ("createdAt", ASCENDING)]),
             IndexModel([("sourceConversationId", ASCENDING)]),
             IndexModel([("fingerprint", ASCENDING)], unique=True, sparse=True),
@@ -203,6 +205,7 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
     await database.notes.create_indexes(
         [
             IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("updatedAt", DESCENDING)]),
+            IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("deletedAt", ASCENDING), ("_id", DESCENDING)]),
             IndexModel([("userId", ASCENDING), ("createdAt", ASCENDING)]),
             IndexModel([("sourceConversationId", ASCENDING)]),
             IndexModel([("fingerprint", ASCENDING)], unique=True, sparse=True),
@@ -239,6 +242,18 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
         [
             IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("version", DESCENDING)]),
             IndexModel([("userId", ASCENDING), ("spaceId", ASCENDING), ("status", ASCENDING), ("updatedAt", DESCENDING)]),
+            IndexModel(
+                [
+                    ("userId", ASCENDING),
+                    ("spaceId", ASCENDING),
+                    ("status", ASCENDING),
+                    ("version", DESCENDING),
+                    ("updatedAt", DESCENDING),
+                    ("_id", DESCENDING),
+                ],
+                name="space_mindmaps_ready_list",
+            ),
+            IndexModel([("userId", ASCENDING), ("deletedAt", ASCENDING)], name="space_mindmaps_user_deleted"),
             IndexModel([("jobId", ASCENDING)]),
             IndexModel([("status", ASCENDING), ("updatedAt", ASCENDING)]),
         ]
@@ -261,6 +276,18 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
                     ("updatedAt", DESCENDING),
                 ]
             ),
+            IndexModel(
+                [
+                    ("userId", ASCENDING),
+                    ("spaceId", ASCENDING),
+                    ("status", ASCENDING),
+                    ("updatedAt", DESCENDING),
+                    ("version", DESCENDING),
+                    ("_id", DESCENDING),
+                ],
+                name="space_documents_ready_list",
+            ),
+            IndexModel([("userId", ASCENDING), ("deletedAt", ASCENDING)], name="space_documents_user_deleted"),
             IndexModel([("jobId", ASCENDING)]),
             IndexModel([("status", ASCENDING), ("updatedAt", ASCENDING)]),
         ]
@@ -285,3 +312,4 @@ async def ensure_mongo_indexes(db: AsyncIOMotorDatabase | None = None) -> None:
         await database.meeting_recording_chunks.drop_index("meetingSessionId_1_sequence_1")
     except Exception:
         pass
+    schedule_heavy_payload_offload(database)

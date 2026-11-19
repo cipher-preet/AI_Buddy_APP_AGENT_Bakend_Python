@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from pymongo import ReturnDocument
+from pymongo import ReturnDocument, UpdateOne
 
 from services.conversation.models import utc_now
 from services.conversation.repository import mongo_id_candidates
@@ -74,17 +74,30 @@ class MindmapStore:
                 return doc
         return None
 
+    def _graphs(self):
+        return self.db.spaceMindmapGraphs
+
+    async def _attach_graph(self, doc: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not doc or isinstance(doc.get("graph"), dict):
+            return doc
+        stored = await self._graphs().find_one({"_id": doc.get("_id")}, {"graph": 1})
+        if stored and isinstance(stored.get("graph"), dict):
+            doc["graph"] = stored["graph"]
+        return doc
+
     async def get(self, mindmap_id: str) -> dict[str, Any] | None:
-        return await self.collection.find_one(
+        doc = await self.collection.find_one(
             {"_id": {"$in": mongo_id_candidates(mindmap_id)}},
             PUBLIC_OMIT,
         )
+        return await self._attach_graph(doc)
 
     async def get_by_job(self, job_id: str) -> dict[str, Any] | None:
-        return await self.collection.find_one({"jobId": str(job_id)}, PUBLIC_OMIT)
+        doc = await self.collection.find_one({"jobId": str(job_id)}, PUBLIC_OMIT)
+        return await self._attach_graph(doc)
 
     async def get_latest_ready(self, user_id: str, space_id: str) -> dict[str, Any] | None:
-        return await self.collection.find_one(
+        doc = await self.collection.find_one(
             {
                 "userId": {"$in": mongo_id_candidates(user_id)},
                 "spaceId": {"$in": mongo_id_candidates(space_id)},
@@ -93,6 +106,7 @@ class MindmapStore:
             PUBLIC_OMIT,
             sort=[("version", -1), ("updatedAt", -1)],
         )
+        return await self._attach_graph(doc)
 
     async def next_version(self, user_id: str, space_id: str) -> int:
         latest = await self.collection.find_one(
@@ -181,7 +195,10 @@ class MindmapStore:
         )
 
     async def claim(self, mindmap_id: str, job_id: str) -> tuple[str, dict[str, Any] | None]:
-        existing = await self.get(mindmap_id)
+        existing = await self.collection.find_one(
+            {"_id": {"$in": mongo_id_candidates(mindmap_id)}},
+            {"graph": 0},
+        )
         if existing is None:
             return "missing", None
         if existing.get("status") == MindmapStatus.READY.value:
@@ -212,6 +229,7 @@ class MindmapStore:
                     "error": None,
                 }
             },
+            projection={"graph": 0},
             return_document=ReturnDocument.AFTER,
         )
         if updated is None:
@@ -232,7 +250,14 @@ class MindmapStore:
         graph_payload = graph.model_dump()
         from services.queue.mongo_fence import fenced_find_one_and_update
 
-        return await fenced_find_one_and_update(
+        now = utc_now()
+        preview = build_mindmap_preview(graph_payload)
+        await self._graphs().update_one(
+            {"_id": mindmap_id},
+            {"$set": {"graph": graph_payload, "inlineUpdatedAt": now}},
+            upsert=True,
+        )
+        stored = await fenced_find_one_and_update(
             self.collection,
             {"_id": {"$in": mongo_id_candidates(mindmap_id)}},
             {
@@ -242,15 +267,18 @@ class MindmapStore:
                     "progress": 100,
                     "message": "Mind map ready",
                     "error": None,
-                    "graph": graph_payload,
-                    "preview": build_mindmap_preview(graph_payload),
+                    "preview": preview,
                     "sourceStats": source_stats.model_dump(),
                     "model": model,
-                    "updatedAt": utc_now(),
-                }
+                    "updatedAt": now,
+                },
+                "$unset": {"graph": ""},
             },
             return_document=ReturnDocument.AFTER,
         )
+        if stored is not None:
+            stored["graph"] = graph_payload
+        return stored
 
     async def list_for_space(
         self,
@@ -300,19 +328,38 @@ class MindmapStore:
             preview = doc.get("preview")
             if not isinstance(preview, dict):
                 return True
-            nodes = preview.get("nodes")
-            return not (isinstance(nodes, list) and len(nodes) > 0)
+            return not isinstance(preview.get("nodes"), list)
 
         stale = [doc for doc in docs if needs_preview_refresh(doc)]
-        for doc in stale:
-            full = await self.collection.find_one({"_id": doc["_id"]}, {"graph": 1})
-            preview = build_mindmap_preview((full or {}).get("graph"))
-            doc["preview"] = preview
-            if preview:
-                await self.collection.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {"preview": preview}},
-                )
+        if stale:
+            stale_ids = [doc["_id"] for doc in stale]
+            graphs: dict[Any, Any] = {}
+            side_rows = await self._graphs().find({"_id": {"$in": stale_ids}}, {"graph": 1}).to_list(
+                length=len(stale_ids)
+            )
+            for row in side_rows:
+                if isinstance(row.get("graph"), dict):
+                    graphs[row["_id"]] = row["graph"]
+            missing_ids = [doc_id for doc_id in stale_ids if doc_id not in graphs]
+            if missing_ids:
+                inline_rows = await self.collection.find(
+                    {"_id": {"$in": missing_ids}},
+                    {"graph": 1},
+                ).to_list(length=len(missing_ids))
+                for row in inline_rows:
+                    if isinstance(row.get("graph"), dict):
+                        graphs[row["_id"]] = row["graph"]
+            updates = []
+            for doc in stale:
+                preview = build_mindmap_preview(graphs.get(doc["_id"]))
+                doc["preview"] = preview
+                if preview:
+                    updates.append(UpdateOne({"_id": doc["_id"]}, {"$set": {"preview": preview}}))
+            if updates:
+                try:
+                    await self.collection.bulk_write(updates, ordered=False)
+                except Exception as error:
+                    print(f"Mind map preview refresh failed: {type(error).__name__}: {error}", flush=True)
         return docs, next_cursor
 
     async def remove_node(self, mindmap_id: str, node_id: str) -> dict[str, Any] | None:
@@ -344,19 +391,27 @@ class MindmapStore:
         ]
         next_graph = {"nodes": next_nodes, "edges": next_edges}
         preview = build_mindmap_preview(next_graph)
-
-        return await self.collection.find_one_and_update(
+        now = utc_now()
+        await self._graphs().update_one(
+            {"_id": document.get("_id")},
+            {"$set": {"graph": next_graph, "inlineUpdatedAt": now}},
+            upsert=True,
+        )
+        updated = await self.collection.find_one_and_update(
             {"_id": {"$in": mongo_id_candidates(mindmap_id)}},
             {
                 "$set": {
-                    "graph": next_graph,
                     "preview": preview,
-                    "updatedAt": utc_now(),
+                    "updatedAt": now,
                     "message": "Mind map updated",
-                }
+                },
+                "$unset": {"graph": ""},
             },
             return_document=ReturnDocument.AFTER,
         )
+        if updated is not None:
+            updated["graph"] = next_graph
+        return updated
 
     async def mark_failed(self, mindmap_id: str, error: str) -> dict[str, Any] | None:
         from services.queue.job_lease import require_active_lease
@@ -397,6 +452,7 @@ class MindmapStore:
             return
         drop_ids = [doc["_id"] for doc in docs[MAX_VERSIONS_PER_SPACE:]]
         if drop_ids:
+            await self._graphs().delete_many({"_id": {"$in": drop_ids}})
             await self.collection.delete_many({"_id": {"$in": drop_ids}})
 
 

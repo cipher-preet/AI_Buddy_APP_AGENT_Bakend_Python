@@ -33,15 +33,16 @@ def encode_list_cursor(updated_at: datetime, version: int, doc_id: Any) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-def decode_list_cursor(cursor: str) -> tuple[datetime, int, ObjectId]:
+def decode_list_cursor(cursor: str) -> tuple[datetime, int, ObjectId | str]:
     try:
         payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
         updated_at = datetime.fromisoformat(str(payload["updatedAt"]))
         version = int(payload["version"])
-        doc_id = ObjectId(str(payload["id"]))
+        raw_id = str(payload["id"])
+        doc_id: ObjectId | str = ObjectId(raw_id) if ObjectId.is_valid(raw_id) else raw_id
     except Exception as error:
         raise ValueError("Invalid list cursor") from error
-    if not isinstance(updated_at, datetime):
+    if not isinstance(updated_at, datetime) or not raw_id:
         raise ValueError("Invalid list cursor")
     return _as_utc(updated_at), version, doc_id
 
@@ -49,7 +50,7 @@ def decode_list_cursor(cursor: str) -> tuple[datetime, int, ObjectId]:
 def cursor_match(
     updated_at: datetime,
     version: int,
-    doc_id: ObjectId,
+    doc_id: ObjectId | str,
     *,
     version_first: bool,
 ) -> dict[str, Any]:

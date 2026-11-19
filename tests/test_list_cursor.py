@@ -15,6 +15,15 @@ def test_list_cursor_round_trip():
     assert decoded_id == doc_id
 
 
+def test_list_cursor_keeps_string_ids():
+    stamp = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+    doc_id = "4f6b5c1e-1c2d-4a7e-9b10-2a6d8e4c91ab"
+    encoded = encode_list_cursor(stamp, 1, doc_id)
+    _stamp, version, decoded_id = decode_list_cursor(encoded)
+    assert version == 1
+    assert decoded_id == doc_id
+
+
 def test_list_cursor_rejects_garbage():
     try:
         decode_list_cursor("not-a-cursor")
