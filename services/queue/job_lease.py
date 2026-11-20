@@ -291,6 +291,9 @@ def logical_job_key(event: Any) -> str:
             # createdAt survives the retry relay's new event id, and a later force click has a new one.
             base = f"{base}|force:{_iso_stamp(event) or _field(getattr(event, 'eventId', None))}"
         return base
+    if kind == "email.activity.ready" and conversation:
+        version = _clean(payload.get("processingVersion")) or "1"
+        return f"{kind}|conversation:{_field(conversation)}|v:{_field(version)}"
     if kind.startswith("goal."):
         goal_id = _clean(payload.get("goalId")) or conversation
         goal_job = job_id or _clean(getattr(event, "eventId", None))

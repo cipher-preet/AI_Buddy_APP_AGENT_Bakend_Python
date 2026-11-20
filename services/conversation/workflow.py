@@ -9,9 +9,17 @@ from services.conversation.context import load_space_context
 from services.conversation.fingerprints import note_fingerprint, task_fingerprint
 from services.conversation.intelligence import score_and_filter_result
 from services.conversation.incremental import IncrementalMeetingProcessor
-from services.conversation.models import ConversationStatus, ConversationSummaryDocument, ExtractionOutcome, ExtractionRunStatus, WindowProcessingStatus
+from services.conversation.models import (
+    ConversationStatus,
+    ConversationSummaryDocument,
+    ExtractionOutcome,
+    ExtractionRunStatus,
+    WindowExtractionResult,
+    WindowProcessingStatus,
+)
 from services.conversation.repository import ConversationRepository
 from services.conversation.transcript import assemble_transcript, estimate_tokens, segment_transcript
+from services.conversation.windowing import is_useful_chunk
 from services.conversation.semantic_input import (
     SEMANTIC_INPUT_ASSEMBLY_FAILED,
     assemble_semantic_window_input,
@@ -30,6 +38,7 @@ from services.llm.async_runtime import is_async_lifecycle_error
 from services.conversation.workflow_state import ConversationGraphState
 from services.llm.router import LLMCapability, LLMRouter, get_llm_router
 from services.queue.job_lease import StaleOwnershipError, mark_current_job_completed, require_active_lease
+from services.email.activity import enqueue_activity_email
 from services.queue.streams import EventEnvelope, RedisStreamProducer
 
 
@@ -137,6 +146,9 @@ class ConversationProcessingWorkflow:
                     await self._run_incremental_finalization(conversation, run, windows, context=None)
                     return
 
+            if await self._finish_silent_meeting(conversation, run):
+                return
+
             chunks = await self.repository.list_transcript_chunks(conversation_id)
             assembled = assemble_transcript(chunks)
             context = await load_space_context(self.repository, conversation.userId, conversation.spaceId)
@@ -239,12 +251,21 @@ class ConversationProcessingWorkflow:
                 artifact_space_id,
             )
             memory = await agents.update_space_memory(self.router, previous_memory, summary)
-            await self.repository.publish_outputs(run, summary, memory)
+            published = await self.repository.publish_outputs(run, summary, memory)
             await self.repository.schedule_transcript_expiry(conversation_id)
             run.status = ExtractionRunStatus.PUBLISHED
             await self.repository.save_extraction_run(run)
             terminal_status = ConversationStatus.PARTIAL if state.validation_errors else ConversationStatus.COMPLETED
             await self.repository.transition(conversation_id, terminal_status)
+            await enqueue_activity_email(
+                user_id=str(conversation.userId),
+                space_id=str(conversation.spaceId or ""),
+                conversation_id=conversation_id,
+                source_type=getattr(conversation, "sourceType", None),
+                processing_version=conversation.processingVersion,
+                task_count=len((published or {}).get("taskIds") or []),
+                note_count=len((published or {}).get("noteIds") or []),
+            )
         except Exception as error:
             if isinstance(error, StaleOwnershipError):
                 raise
@@ -697,6 +718,36 @@ class ConversationProcessingWorkflow:
             accounting=conversation.lastAccounting or {},
         )
 
+    async def _finish_silent_meeting(self, conversation, run) -> bool:
+        """Finish a meeting that was recorded with no speech, and still queue its email."""
+        if getattr(conversation, "sourceType", None) != "meeting_extension":
+            return False
+        chunks = await self.repository.list_transcript_chunks(str(conversation.id))
+        if meeting_recording_has_speech(chunks):
+            return False
+        print(
+            "Silent meeting finished with no conversation:",
+            {"conversationId": str(conversation.id)},
+        )
+        await self._publish_final_result(
+            conversation,
+            run,
+            WindowExtractionResult(
+                extractionDiagnostics={
+                    "pipelineMode": "meeting_pipeline",
+                    "finalSynthesisVerdict": "NO_PUBLISHABLE_ARTIFACTS",
+                    "silentRecording": True,
+                }
+            ),
+            "none",
+            "none",
+            [],
+            utc_ms(),
+            path="silent_recording",
+            accounting=conversation.lastAccounting or {},
+        )
+        return True
+
     async def _publish_final_result(
         self,
         conversation,
@@ -759,7 +810,18 @@ class ConversationProcessingWorkflow:
             if getattr(conversation, "sourceType", None) == "meeting_extension"
             else conversation.spaceId,
         )
-        memory_update = await agents.update_space_memory(self.router, previous_memory, summary)
+        # An empty recording has nothing to remember. Skipping the model call
+        # keeps a finished meeting from failing before the ready email is queued.
+        has_memory_input = bool(
+            result.tasks
+            or result.notes
+            or result.decisions
+            or (result.summary or result.narrative or "").strip()
+        )
+        if has_memory_input:
+            memory_update = await agents.update_space_memory(self.router, previous_memory, summary)
+        else:
+            memory_update = previous_memory
         expected_tasks = [task for task in result.tasks if task.operation != "NO_ACTION"]
         expected_notes = list(result.notes)
         persistence = {
@@ -874,6 +936,15 @@ class ConversationProcessingWorkflow:
         if accounting.get("permanentFailures") or (path != "short_raw_transcript" and not result.tasks and not result.notes and coverage and coverage.meaningfulArtifactCount):
             terminal = ConversationStatus.PARTIAL
         await self.repository.transition(conversation_id, terminal)
+        await enqueue_activity_email(
+            user_id=str(conversation.userId),
+            space_id=str(conversation.spaceId or ""),
+            conversation_id=conversation_id,
+            source_type=getattr(conversation, "sourceType", None),
+            processing_version=conversation.processingVersion,
+            task_count=len(task_ids),
+            note_count=len(note_ids),
+        )
 
     async def _quality_review_and_repair(self, result, transcript: str, context: dict, conversation_id: str, space_id: str):
         outputs = {
@@ -1211,6 +1282,10 @@ def _compact_items(items: list[dict]) -> list[dict]:
         }
         for item in items
     ]
+
+
+def meeting_recording_has_speech(chunks) -> bool:
+    return any(is_useful_chunk(chunk) for chunk in chunks)
 
 
 def utc_ms() -> int:

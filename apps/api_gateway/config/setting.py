@@ -156,6 +156,8 @@ class Settings(BaseSettings):
     REDIS_MEETING_MERGE_STREAM: str = "buddy:meeting:video-merge"
     REDIS_MINDMAP_STREAM: str = "buddy:mindmap:jobs"
     REDIS_DOCUMENT_STREAM: str = "buddy:document:jobs"
+    # Listening and meeting activity mail. The Node API drains this stream.
+    REDIS_EMAIL_STREAM: str = "buddy:email:delivery"
     # Speech transcription and the completed-speech vector stage. No MAXLEN:
     # trimming can delete a pending entry that has not been acknowledged.
     REDIS_SPEECH_STREAM: str = "buddy:speech:jobs"
