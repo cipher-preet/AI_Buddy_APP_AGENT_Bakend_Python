@@ -15,9 +15,8 @@ from services.schedule_extraction.events_pipeline import CalendarEventPipeline
 from services.schedule_extraction.llm import ExtractionCaller, RoutedExtractionCaller
 from services.schedule_extraction.log import extraction_log
 from services.schedule_extraction.reminder_schedule import ReminderScheduler
-from services.schedule_extraction.reminders_pipeline import ReminderPipeline
 from services.schedule_extraction.schemas import PipelineOutcome
-from services.schedule_extraction.validation import CandidateValidator, drop_reminders_covered_by_events
+from services.schedule_extraction.validation import CandidateValidator
 from services.schedule_extraction.writer import ScheduleWriter
 
 CLAIM_STALE = timedelta(minutes=15)
@@ -42,7 +41,6 @@ class ScheduleExtractionJob:
         self.jobs = database.schedule_extractions
         caller = caller or RoutedExtractionCaller()
         self.events = CalendarEventPipeline(caller)
-        self.reminders = ReminderPipeline(caller)
         self.scheduler = scheduler or ReminderScheduler()
         self.now = now
 
@@ -113,7 +111,7 @@ class ScheduleExtractionJob:
             settings.SCHEDULE_EXTRACTION_MAX_ITEMS,
             now=self._now(),
         )
-        pipelines = [pipeline for pipeline in (self.events, self.reminders) if pipeline.name not in done]
+        pipelines = [pipeline for pipeline in (self.events,) if pipeline.name not in done]
         results = await asyncio.gather(*(pipeline.run(ctx, validator) for pipeline in pipelines), return_exceptions=True)
         outcomes: dict[str, PipelineOutcome] = {}
         for pipeline, result in zip(pipelines, results):
@@ -136,17 +134,6 @@ class ScheduleExtractionJob:
                 ctx.user_id, conversation_id, ctx.timezone_name, events_outcome.items, events_outcome
             )
             done.add(self.events.name)
-        reminders_outcome = outcomes.get(self.reminders.name)
-        if reminders_outcome and not reminders_outcome.error:
-            items = drop_reminders_covered_by_events(
-                reminders_outcome.items,
-                events_outcome.items if events_outcome and not events_outcome.error else [],
-                reminders_outcome,
-            )
-            written["reminderIds"] = await writer.write_reminders(
-                ctx.user_id, conversation_id, ctx.timezone_name, items, reminders_outcome
-            )
-            done.add(self.reminders.name)
 
         stats = {
             name: {

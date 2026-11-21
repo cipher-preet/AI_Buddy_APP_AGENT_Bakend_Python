@@ -7,7 +7,6 @@ the Node mail worker so a slow SMTP call cannot stall transcription.
 from __future__ import annotations
 
 from apps.api_gateway.config.setting import settings
-from services.queue.shared_redis import get_shared_redis_client, normalize_redis_url
 from services.queue.streams import EventEnvelope, RedisStreamProducer
 
 EMAIL_EVENT_TYPE = "email.activity.ready"
@@ -25,21 +24,16 @@ def activity_email_event_id(kind: str, conversation_id: str, processing_version:
 
 
 def activity_email_redis_url(reminder_url: str | None = None, conversation_url: str | None = None) -> str:
-    """The Node mail worker reads REMINDER_REDIS_URL first, then REDIS_URL."""
+    """Mail uses REMINDER_REDIS_URL only. The worker's REDIS_URL is private and Node cannot read it."""
+    del conversation_url
     reminder = settings.REMINDER_REDIS_URL if reminder_url is None else reminder_url
-    conversation = settings.REDIS_URL if conversation_url is None else conversation_url
-    return str(reminder or "").strip() or str(conversation or "").strip()
+    return str(reminder or "").strip()
 
 
 def get_activity_email_redis():
-    url = activity_email_redis_url()
-    if not url:
-        raise RuntimeError("Activity email Redis is not configured")
-    return get_shared_redis_client(
-        normalize_redis_url(url),
-        max_connections=settings.MINDMAP_REDIS_MAX_CONNECTIONS,
-        label="email",
-    )
+    from services.reminders.redis_client import get_reminder_redis_client
+
+    return get_reminder_redis_client()
 
 
 def should_enqueue_activity_email(kind: str, task_count: int, note_count: int) -> bool:
@@ -72,6 +66,9 @@ async def enqueue_activity_email(
         claimed = await redis.set(claim_key, "1", nx=True, ex=QUEUED_TTL_SECONDS)
         if not claimed:
             return
+        from services.reminders.redis_client import describe_redis_url, get_reminder_redis_url
+
+        target = describe_redis_url(get_reminder_redis_url())
         await RedisStreamProducer(redis, force_direct=True).publish(
             settings.REDIS_EMAIL_STREAM,
             EventEnvelope(
@@ -91,6 +88,16 @@ async def enqueue_activity_email(
                     "noteCount": int(note_count),
                 },
             ),
+        )
+        print(
+            "Activity email queued on reminder Redis",
+            {
+                "conversationId": conversation_id,
+                "kind": kind,
+                "host": target["host"],
+                "port": target["port"],
+            },
+            flush=True,
         )
     except Exception as error:
         if redis is not None:

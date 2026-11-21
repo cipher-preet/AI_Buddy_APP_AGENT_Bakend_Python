@@ -25,7 +25,7 @@ def test_listening_without_cards_is_not_queued():
 
 def test_email_redis_matches_the_node_worker():
     assert activity_email_redis_url("redis://reminder:6379/0", "redis://conversation:6379/0") == "redis://reminder:6379/0"
-    assert activity_email_redis_url("", "redis://conversation:6379/0") == "redis://conversation:6379/0"
+    assert activity_email_redis_url("", "redis://conversation:6379/0") == ""
 
 
 def test_event_id_is_stable_for_one_processing_version():

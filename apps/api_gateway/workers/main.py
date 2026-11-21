@@ -18,12 +18,7 @@ from apps.api_gateway.workers.meeting_extension_worker import (
     build_meeting_merge_consumer,
     build_meeting_video_consumer,
 )
-from apps.api_gateway.workers.reminder_worker import start_reminder_worker
 from apps.api_gateway.workers.schedule_extraction_worker import build_schedule_extraction_consumer
-from apps.api_gateway.workers.daily_briefing_worker import (
-    build_daily_briefing_consumer,
-    run_daily_briefing_scheduler,
-)
 from apps.api_gateway.workers.mindmap_worker import build_mindmap_consumer, ensure_mindmap_redis
 from apps.api_gateway.workers.document_worker import build_document_consumer
 from apps.api_gateway.workers.goal_worker import build_goal_consumers, run_goal_scheduler
@@ -170,7 +165,6 @@ async def main():
     processing_consumer = build_processing_consumer()
     transcript_ready_consumer = build_transcript_ready_consumer()
     window_extraction_consumer = build_window_extraction_consumer()
-    daily_briefing_consumer = build_daily_briefing_consumer()
     mindmap_consumer = build_mindmap_consumer()
     document_consumer = build_document_consumer()
     meeting_video_consumer = build_meeting_video_consumer()
@@ -186,7 +180,6 @@ async def main():
             window_extraction_consumer,
             finalization_consumer,
             processing_consumer,
-            daily_briefing_consumer,
             mindmap_consumer,
             document_consumer,
             meeting_video_consumer,
@@ -217,8 +210,6 @@ async def main():
         ),
         _staggered("inactivity-scanner", run_inactivity_scanner, 1.0),
         _staggered("retry-relay", run_retry_relay, 1.2),
-        _staggered("reminder-worker", start_reminder_worker, 1.5),
-        _staggered("daily-briefing-scheduler", run_daily_briefing_scheduler, 2.0),
         _staggered("goal-scheduler", run_goal_scheduler, 2.2),
         _staggered("worker-health", run_worker_heartbeat, 2.5),
         _staggered("event-loop-lag", run_event_loop_lag_monitor, 2.5),

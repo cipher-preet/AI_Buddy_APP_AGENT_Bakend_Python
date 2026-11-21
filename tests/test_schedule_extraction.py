@@ -283,11 +283,8 @@ def test_job_writes_event_with_linked_ai_call_and_separate_reminder():
     linked = reminders["Pricing review with Rahul"]
     assert linked["_id"] == event["reminderId"]
     assert linked["timeLabel"] == "2:45 PM"
-    bank = reminders["Call HDFC bank"]
-    assert bank["aiCalling"] is True and bank["deliveryType"] == "AI_CALL"
-    assert bank["source"] == "ai" and bank["deliveryStatus"] == "SCHEDULED"
-    assert set(redis.schedule) == {linked["scheduledOccurrenceId"], bank["scheduledOccurrenceId"]}
-    assert bank["scheduledOccurrenceId"] == f"{bank['_id']}:2026-10-01T05:30:00Z"
+    assert "Call HDFC bank" not in reminders
+    assert set(redis.schedule) == {linked["scheduledOccurrenceId"]}
 
 
 def test_rerun_is_idempotent():
@@ -297,7 +294,7 @@ def test_rerun_is_idempotent():
     asyncio.run(_job(database, FakeCaller(), redis).run(CONVERSATION_ID, "job-2"))
 
     assert len(database.calendar_events.docs) == 1
-    assert len(database.reminders.docs) == 2
+    assert len(database.reminders.docs) == 1
 
 
 def test_finished_job_is_not_rerun():
@@ -333,23 +330,22 @@ def test_existing_user_reminder_is_not_duplicated():
     assert len(database.reminders.docs) == 1
 
 
-def test_one_pipeline_failing_keeps_other_and_retry_skips_finished_pipeline():
+def test_calendar_failure_retries_without_the_reminder_extractor():
     database, redis = FakeDatabase(), FakeRedis()
     with pytest.raises(RetryableExtractionError):
-        asyncio.run(_job(database, FakeCaller(fail={"reminder"}), redis).run(CONVERSATION_ID, "job-1"))
+        asyncio.run(_job(database, FakeCaller(fail={"calendar"}), redis).run(CONVERSATION_ID, "job-1"))
 
-    assert len(database.calendar_events.docs) == 1
+    assert database.calendar_events.docs == []
     job_doc = database.schedule_extractions.docs[0]
     assert job_doc["status"] == "RETRY_PENDING"
-    assert job_doc["completedPipelines"] == ["calendar_events"]
 
     caller = FakeCaller()
     result = asyncio.run(_job(database, caller, redis).run(CONVERSATION_ID, "job-1"))
 
     assert result["status"] == "READY"
-    assert caller.calls == ["meeting-reminder-extractor-v1"]
+    assert caller.calls == ["meeting-calendar-extractor-v1"]
     assert len(database.calendar_events.docs) == 1
-    assert {doc["title"] for doc in database.reminders.docs} == {"Pricing review with Rahul", "Call HDFC bank"}
+    assert {doc["title"] for doc in database.reminders.docs} == {"Pricing review with Rahul"}
 
 
 def test_final_attempt_marks_failed_without_raising():
@@ -362,15 +358,15 @@ def test_final_attempt_marks_failed_without_raising():
     assert database.calendar_events.docs == [] and database.reminders.docs == []
 
 
-def test_redis_outage_raises_and_retry_schedules_existing_reminder():
+def test_redis_outage_raises_and_retry_schedules_linked_reminder():
     database, redis = FakeDatabase(), FakeRedis()
     redis.fail = True
     with pytest.raises(RuntimeError):
-        asyncio.run(_job(database, FakeCaller(events=[]), redis).run(CONVERSATION_ID, "job-1"))
+        asyncio.run(_job(database, FakeCaller(), redis).run(CONVERSATION_ID, "job-1"))
     assert len(database.reminders.docs) == 1 and redis.schedule == {}
 
     redis.fail = False
-    asyncio.run(_job(database, FakeCaller(events=[]), redis).run(CONVERSATION_ID, "job-1"))
+    asyncio.run(_job(database, FakeCaller(), redis).run(CONVERSATION_ID, "job-1"))
 
     assert len(database.reminders.docs) == 1
     assert list(redis.schedule) == [database.reminders.docs[0]["scheduledOccurrenceId"]]

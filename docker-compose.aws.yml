@@ -32,6 +32,7 @@ services:
       SERVICE_ROLE: queue_api
       QUEUE_PROVIDER: redis
       REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      REMINDER_REDIS_URL: "${REMINDER_REDIS_URL:?set REMINDER_REDIS_URL}"
     expose:
       - "8080"
     read_only: true
@@ -59,6 +60,7 @@ services:
       SERVICE_ROLE: worker
       QUEUE_PROVIDER: redis
       REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      REMINDER_REDIS_URL: "${REMINDER_REDIS_URL:?set REMINDER_REDIS_URL}"
       WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-1}"
       HOME: /tmp
       TMPDIR: /tmp

@@ -69,7 +69,7 @@ async def accept_event(request: Request):
             return await _accept_speech_job(event)
         stream = _stream_for_event(payload, event)
         published = await atomic_publish(
-            redis_client,
+            _redis_for_stream(stream),
             event_id=event.eventId,
             queue=stream,
             mode="stream",
@@ -87,6 +87,12 @@ async def accept_event(request: Request):
         return JSONResponse({"detail": str(error)}, status_code=401)
     except (ValueError, json.JSONDecodeError) as error:
         return JSONResponse({"detail": str(error)}, status_code=400)
+    except Exception as error:
+        from services.reminders.redis_client import ReminderRedisConfigError
+
+        if isinstance(error, ReminderRedisConfigError):
+            return JSONResponse({"detail": "REMINDER_REDIS_URL is not configured"}, status_code=503)
+        raise
 
 
 def _verify_request(request: Request, body: bytes) -> None:
@@ -118,6 +124,15 @@ def _verify_request(request: Request, body: bytes) -> None:
         expected_header = f"sha256={expected_sig}"
         if not hmac.compare_digest(signature, expected_header):
             raise PermissionError("Invalid request signature")
+
+
+def _redis_for_stream(stream: str):
+    """Meeting and listening mail must land on reminder Redis, where the Node mailer reads."""
+    if stream == settings.REDIS_EMAIL_STREAM:
+        from services.reminders.redis_client import get_reminder_redis_client
+
+        return get_reminder_redis_client()
+    return redis_client
 
 
 def _stream_for_event(payload: dict[str, Any], event: EventEnvelope) -> str:

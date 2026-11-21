@@ -4,7 +4,6 @@ import asyncio
 
 import pytest
 
-from apps.api_gateway.config.setting import settings
 from services.conversation.models import utc_now
 from services.daily_briefing import force as force_module
 from tests.daily_briefing_fakes import FakeDatabase
@@ -25,10 +24,9 @@ class _FakeProducer:
 
 
 @pytest.fixture
-def launched(monkeypatch):
+def launched():
     _FakeProducer.calls = []
     _FakeProducer.fail = False
-    monkeypatch.setattr(force_module, "RedisStreamProducer", _FakeProducer)
     return _FakeProducer.calls
 
 
@@ -66,70 +64,14 @@ def test_in_flight_briefing_does_not_start_second_job(launched):
     assert launched == []
 
 
-def test_failed_briefing_regenerates_and_counts(launched):
+def test_force_generate_does_not_queue_a_briefing(launched):
     database = FakeDatabase()
-    _seed(database, status="FAILED")
+    _seed(database, status="FAILED", headline="keep")
 
     result = asyncio.run(_force(database))
 
-    assert result["forced"] is True
-    assert len(launched) == 1
-    doc = database.daily_briefings.docs[0]
-    assert doc["status"] == "PENDING"
-    assert doc["forceCount"] == 1
-
-
-def test_force_limit_blocks_extra_paid_runs(launched):
-    database = FakeDatabase()
-    _seed(database, status="FAILED", forceCount=settings.DAILY_BRIEFING_FORCE_DAILY_LIMIT)
-
-    with pytest.raises(PermissionError):
-        asyncio.run(_force(database))
+    assert result["status"] == "SKIPPED"
+    assert result["forced"] is False
     assert launched == []
-
-
-def test_skipped_briefing_keeps_count_after_regenerate(launched):
-    database = FakeDatabase()
-    _seed(database, status="SKIPPED", forceCount=1)
-
-    asyncio.run(_force(database))
-
-    assert len(launched) == 1
-    assert database.daily_briefings.docs[0]["forceCount"] == 2
-
-
-def test_force_job_is_queued_to_briefing_worker(launched):
-    database = FakeDatabase()
-    _seed(database, status="FAILED")
-
-    asyncio.run(_force(database))
-
-    [(stream, event)] = launched
-    assert stream == settings.REDIS_DAILY_BRIEFING_STREAM
-    assert event.eventType == "daily.briefing.requested"
-    assert event.payload["dateKey"] == DATE
-
-
-def test_publish_failure_falls_back_to_in_process_run(launched, monkeypatch):
-    ran: list = []
-
-    async def fake_job(database, event):
-        ran.append(event)
-
-    monkeypatch.setattr(force_module, "_run_force_job", fake_job)
-    _FakeProducer.fail = True
-    database = FakeDatabase()
-
-    asyncio.run(_force(database))
-
-    assert len(ran) == 1
-
-
-def test_missing_briefing_defaults_to_yesterday(launched):
-    database = FakeDatabase()
-
-    result = asyncio.run(force_module.force_generate_daily_briefing(database, user_id=USER))
-
-    assert result["forced"] is True
-    today = force_module.date_key_for(force_module.datetime.now(force_module.timezone.utc), result["timezone"])
-    assert result["dateKey"] < today
+    assert database.daily_briefings.docs[0]["headline"] == "keep"
+    assert database.daily_briefings.docs[0]["status"] == "FAILED"

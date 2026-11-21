@@ -12,6 +12,8 @@ from services.queue.streams import EventEnvelope, RedisStreamConsumer
 
 
 async def handle_daily_briefing_event(event: EventEnvelope) -> None:
+    del event
+    return
     handler = DailyBriefingJobHandler(get_database())
     with active_jobs.track("briefing"):
         await handler.handle(event)
@@ -29,6 +31,7 @@ def build_daily_briefing_consumer() -> RedisStreamConsumer:
 
 
 async def run_daily_briefing_scheduler() -> None:
+    return
     scheduler = DailyBriefingScheduler(get_database())
     interval = settings.DAILY_BRIEFING_SCAN_INTERVAL_SECONDS
     while True:

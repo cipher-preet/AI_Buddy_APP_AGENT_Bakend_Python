@@ -53,6 +53,7 @@ def build_reminder_worker() -> ReminderWorker:
 
 
 async def start_reminder_worker() -> None:
+    return
     enabled = bool(settings.ENABLE_REMINDER_WORKER)
     print(f"Reminder worker config: enabled={'true' if enabled else 'false'}", flush=True)
     if not enabled:
