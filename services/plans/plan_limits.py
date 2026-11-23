@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -75,7 +76,7 @@ def _is_paid_plan_expired(subscription: dict[str, Any] | None) -> bool:
     return period_end <= datetime.now(timezone.utc)
 
 
-async def _resolve_plan_limits(database, user_id: str) -> tuple[str, dict[str, Any]]:
+async def _resolve_plan_limits(database, user_id: str) -> tuple[str, dict[str, Any], datetime | None]:
     user_ids = mongo_id_candidates(user_id)
     subscription = await database.usersubscriptions.find_one({"userId": {"$in": user_ids}})
     if subscription is None:
@@ -90,7 +91,8 @@ async def _resolve_plan_limits(database, user_id: str) -> tuple[str, dict[str, A
         limits = dict(DEFAULT_FREE_LIMITS)
         if isinstance(free_plan, dict) and isinstance(free_plan.get("limits"), dict):
             limits.update(free_plan["limits"])
-        return "free", limits
+        created_at = subscription.get("createdAt") if isinstance(subscription, dict) else None
+        return "free", limits, _as_utc(created_at)
 
     plan_code = str((subscription or {}).get("planCode") or "free")
     plan = None
@@ -106,14 +108,49 @@ async def _resolve_plan_limits(database, user_id: str) -> tuple[str, dict[str, A
     if isinstance(plan, dict) and isinstance(plan.get("limits"), dict):
         limits.update(plan["limits"])
         plan_code = str(plan.get("code") or plan_code)
-    return plan_code, limits
+    return plan_code, limits, _free_period_start(subscription if isinstance(subscription, dict) else None, plan_code)
 
 
-async def _count_resource(database, user_id: str, resource: PlanCountableResource) -> int:
+def _add_one_calendar_month(value: datetime) -> datetime:
+    year = value.year + (1 if value.month == 12 else 0)
+    month = 1 if value.month == 12 else value.month + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return value.replace(year=year, month=month, day=min(value.day, last_day))
+
+
+def _free_period_start(subscription: dict[str, Any] | None, plan_code: str = "free") -> datetime | None:
+    """Match the Node free-month window so create checks and renewals agree."""
+    if plan_code != "free" or not isinstance(subscription, dict):
+        return None
+    now = datetime.now(timezone.utc)
+    start = _as_utc(subscription.get("currentPeriodStart")) or _as_utc(subscription.get("createdAt"))
+    end = _as_utc(subscription.get("currentPeriodEnd"))
+    if end is not None and end > now:
+        return start
+    period_end = end or (_add_one_calendar_month(start) if start is not None else None)
+    if period_end is None:
+        return None
+    if period_end > now:
+        return start
+    rolled = _add_one_calendar_month(period_end)
+    if rolled > now:
+        return period_end
+    return now
+
+
+async def _count_resource(
+    database,
+    user_id: str,
+    resource: PlanCountableResource,
+    *,
+    since: datetime | None = None,
+) -> int:
     collection_name, id_field = COLLECTION_BY_RESOURCE[resource]
     query: dict[str, Any] = {id_field: {"$in": mongo_id_candidates(user_id)}}
     if resource != "goals":
         query["$or"] = [{"deletedAt": None}, {"deletedAt": {"$exists": False}}]
+    if since is not None:
+        query["createdAt"] = {"$gte": since}
     return int(await database[collection_name].count_documents(query))
 
 
@@ -124,14 +161,14 @@ async def assert_plan_count_allowed(
     resource: PlanCountableResource,
     next_count: int = 1,
 ) -> PlanQuota:
-    plan_code, limits = await _resolve_plan_limits(database, user_id)
+    plan_code, limits, period_start = await _resolve_plan_limits(database, user_id)
     raw_limit = limits.get(resource, DEFAULT_FREE_LIMITS[resource])
     try:
         limit = int(raw_limit)
     except (TypeError, ValueError):
         limit = DEFAULT_FREE_LIMITS[resource]
 
-    used = await _count_resource(database, user_id, resource)
+    used = await _count_resource(database, user_id, resource, since=period_start)
     if limit != UNLIMITED and used + max(0, next_count) > limit:
         message = f"Plan limit reached. Upgrade your plan to create more {resource}."
         raise PlanLimitExceeded(
