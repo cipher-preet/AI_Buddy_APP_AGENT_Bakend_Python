@@ -85,6 +85,18 @@ services:
         condition: service_healthy
     logging: *default-logging
 
+  meeting-bot-worker:
+    image: buddy-app:latest
+    profiles: ["meeting-bots"]
+    restart: unless-stopped
+    init: true
+    command: ["python", "-m", "apps.api_gateway.workers.meeting_bot_worker"]
+    env_file:
+      - .env.aws
+    environment:
+      MEETING_FFMPEG_BIN: /usr/bin/ffmpeg
+      MEETING_BOT_TEMP_DIR: /var/tmp/meeting-bots
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
