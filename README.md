@@ -25,6 +25,9 @@ AWS worker:
 python -m apps.api_gateway.workers.main   
 ```
 
+# this is the bot worker 
+python -m apps.api_gateway.workers.meeting_bot_worker
+
 ## Conversation API
 
 ```text

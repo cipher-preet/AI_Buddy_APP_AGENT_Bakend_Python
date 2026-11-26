@@ -514,13 +514,23 @@ def load_local_env() -> None:
     load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
 
-async def main():
+async def run_meeting_bot_worker() -> None:
+    """Send queued bots into meetings. Safe to run beside the other worker loops."""
     load_local_env()
-    logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    async with httpx.AsyncClient(timeout=25, follow_redirects=False) as http:
-        worker = MeetingBotWorker(http)
-        await asyncio.gather(worker.loop(["queued", "attendance"]), worker.loop(["importing"]))
+    try:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=False) as http:
+            worker = MeetingBotWorker(http)
+            print("meeting bot joiner started", flush=True)
+            await asyncio.gather(worker.loop(["queued", "attendance"]), worker.loop(["importing"]))
+    except ValueError as error:
+        print(f"meeting bot joiner disabled: {error}", flush=True)
+        await asyncio.Event().wait()
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    await run_meeting_bot_worker()
 
 
 if __name__ == "__main__":

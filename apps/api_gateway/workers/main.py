@@ -18,6 +18,7 @@ from apps.api_gateway.workers.meeting_extension_worker import (
     build_meeting_merge_consumer,
     build_meeting_video_consumer,
 )
+from apps.api_gateway.workers.meeting_bot_worker import run_meeting_bot_worker
 from apps.api_gateway.workers.schedule_extraction_worker import build_schedule_extraction_consumer
 from apps.api_gateway.workers.mindmap_worker import build_mindmap_consumer, ensure_mindmap_redis
 from apps.api_gateway.workers.document_worker import build_document_consumer
@@ -208,6 +209,7 @@ async def main():
             _staggered(consumer.stream, consumer.run_forever, index * 0.2)
             for index, consumer in enumerate(stream_runners)
         ),
+        _staggered("meeting-bot", run_meeting_bot_worker, 1.5),
         _staggered("inactivity-scanner", run_inactivity_scanner, 1.0),
         _staggered("retry-relay", run_retry_relay, 1.2),
         _staggered("goal-scheduler", run_goal_scheduler, 2.2),
