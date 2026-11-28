@@ -61,7 +61,7 @@ def test_chat_write_spec_falls_back_to_krutrim_gpt_oss(monkeypatch):
     monkeypatch.setattr(actions, "get_llm_router", lambda: _router(primary, fallback))
     spec = asyncio.run(actions._strong_write_spec(_write_request()))
     assert spec is not None and spec.title == "Server notes"
-    assert fallback.requests[0].model == "gpt-oss-120b"
+    assert fallback.requests[0].model == "gemma-4-31b-it"
     assert fallback.requests[0].metadata["extra_body"] == {"reasoning_effort": settings.CHAT_WRITE_REASONING_EFFORT}
 
 

@@ -42,6 +42,7 @@ from services.conversation.meeting_pipeline.windows import (
 )
 from services.conversation.models import EvidenceSpan, ExtractedNote, ExtractedTask, WindowExtractionResult
 from services.llm.async_runtime import reraise_if_hard_runtime
+from services.llm.errors import provider_pressure
 from services.llm.router import LLMRouter
 
 
@@ -365,9 +366,14 @@ async def _extract_windows(
     attempts = 0
     while pending:
         await asyncio.gather(*(run_one(index) for index in pending))
-        pending = [index for index in pending if candidates[index] is None]
-        if not pending:
+        failed = [index for index in pending if candidates[index] is None]
+        if not failed:
             break
+        # The model chain already failed over. Calling it again only repeats the refusal.
+        pressured = [index for index in failed if provider_pressure(errors[index])]
+        if pressured:
+            raise pending_error(errors, pressured)
+        pending = failed
         attempts += 1
         retries += len(pending)
         if attempts >= _MAX_WINDOW_ATTEMPTS:

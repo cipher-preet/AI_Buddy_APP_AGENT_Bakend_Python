@@ -114,12 +114,12 @@ class Settings(BaseSettings):
     CONVERSATION_SEMANTIC_PROVIDER: str = "mistral"
     CONVERSATION_SEMANTIC_MODEL: str = "zai-glm-5-3-flash"
     CONVERSATION_SEMANTIC_FALLBACK_PROVIDER: str = "krutrim"
-    CONVERSATION_SEMANTIC_FALLBACK_MODEL: str = "gpt-oss-120b"
+    CONVERSATION_SEMANTIC_FALLBACK_MODEL: str = "gemma-4-31b-it"
     # Buddy chat "create/update task or note" argument extraction; empty = chat route.
     CHAT_WRITE_PROVIDER: str = "mistral"
     CHAT_WRITE_MODEL: str = "zai-glm-5-3-flash"
     CHAT_WRITE_FALLBACK_PROVIDER: str = "krutrim"
-    CHAT_WRITE_FALLBACK_MODEL: str = "gpt-oss-120b"
+    CHAT_WRITE_FALLBACK_MODEL: str = "gemma-4-31b-it"
     CHAT_WRITE_REASONING_EFFORT: str = "low"
     # Voice reminder turns need a fast, non-reasoning model (256-token budget).
     REMINDER_EXTRACTION_MODEL: str = "gemma-4-31b-it"
@@ -131,7 +131,7 @@ class Settings(BaseSettings):
     CONVERSATION_VALIDATION_PROVIDER: str = "mistral"
     CONVERSATION_VALIDATION_MODEL: str = "ministral-14b-latest"
     CONVERSATION_VALIDATION_FALLBACK_PROVIDER: str = "krutrim"
-    CONVERSATION_VALIDATION_FALLBACK_MODEL: str = "gpt-oss-120b"
+    CONVERSATION_VALIDATION_FALLBACK_MODEL: str = "gemma-4-31b-it"
 
     QDRANT_API_KEY: SecretStr | str = ""
     QDRANT_URL: str = "http://localhost:6333"
@@ -247,7 +247,7 @@ class Settings(BaseSettings):
     DOCUMENT_CONTEXT_TOKEN_BUDGET: int = Field(default=14000, ge=1000, le=100000)
     DOCUMENT_MAX_VERSIONS_PER_SPACE: int = Field(default=20, ge=3, le=100)
 
-    DAILY_BRIEFING_ENABLED: bool = True
+    DAILY_BRIEFING_ENABLED: bool = False
     DAILY_BRIEFING_TRIGGER_HOUR: int = Field(default=0, ge=0, le=23)
     DAILY_BRIEFING_TRIGGER_MINUTE: int = Field(default=5, ge=0, le=59)
     DAILY_BRIEFING_GRACE_MINUTES: int = Field(default=5, ge=0, le=180)

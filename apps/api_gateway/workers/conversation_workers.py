@@ -502,6 +502,25 @@ def build_window_extraction_consumer() -> RedisStreamConsumer:
     )
 
 
+async def release_processing_for_retry(event: EventEnvelope, error: Exception) -> None:
+    """A dropped notes job must not stay in processing, or the meeting never finishes."""
+    del error
+    conversation_id = event.conversationId
+    if not conversation_id:
+        return
+    try:
+        repository = ConversationRepository(get_database())
+        conversation = await repository.get_conversation(conversation_id)
+        if conversation is None or conversation.status != ConversationStatus.PROCESSING:
+            return
+        await repository.transition(conversation_id, ConversationStatus.RETRY_PENDING)
+    except Exception as release_error:
+        print(
+            "Processing retry release failed:",
+            {"conversationId": conversation_id, "error": str(release_error)[:300]},
+        )
+
+
 def build_processing_consumer() -> RedisStreamConsumer:
     return RedisStreamConsumer(
         stream=settings.REDIS_PROCESSING_STREAM,
@@ -509,6 +528,7 @@ def build_processing_consumer() -> RedisStreamConsumer:
         consumer_name=f"processing-{uuid4().hex[:8]}",
         handler=_tracked_handler("processing", handle_processing_event),
         concurrency=settings.PROCESSING_WORKER_CONCURRENCY,
+        on_dead_letter=release_processing_for_retry,
     )
 
 

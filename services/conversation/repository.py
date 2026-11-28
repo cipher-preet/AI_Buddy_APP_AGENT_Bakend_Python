@@ -1311,8 +1311,21 @@ class ConversationRepository:
                         ConversationStatus.WAITING_FOR_TRANSCRIPTS.value,
                         ConversationStatus.FINALIZING.value,
                         ConversationStatus.READY_FOR_PROCESSING.value,
+                        ConversationStatus.RETRY_PENDING.value,
                     ]
                 },
+                "expectedLastSequence": {"$ne": None},
+                "updatedAt": {"$lte": before},
+                "receivedAudioChunkCount": {"$gt": 0},
+            }
+        ).limit(limit)
+        return [ConversationDocument.model_validate(doc) async for doc in cursor]
+
+    async def find_abandoned_processing_conversations(self, before: datetime, limit: int = 100) -> list[ConversationDocument]:
+        """Notes jobs left in processing after the worker gave up. A live job is still inside its timeout."""
+        cursor = self.db.conversations.find(
+            {
+                "status": ConversationStatus.PROCESSING.value,
                 "expectedLastSequence": {"$ne": None},
                 "updatedAt": {"$lte": before},
                 "receivedAudioChunkCount": {"$gt": 0},

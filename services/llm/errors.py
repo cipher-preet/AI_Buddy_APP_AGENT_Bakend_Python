@@ -5,11 +5,13 @@ class LLMProviderError(Exception):
         retryable: bool = False,
         status_code: int | None = None,
         failure_reason: str | None = None,
+        provider_outage: bool = False,
     ):
         super().__init__(message)
         self.retryable = retryable
         self.status_code = status_code
         self.failure_reason = failure_reason
+        self.provider_outage = provider_outage
 
 
 class AsyncLifecycleError(LLMProviderError):
@@ -25,3 +27,32 @@ class StructuredOutputError(LLMProviderError):
 
 def is_retryable_status(status_code: int | None) -> bool:
     return status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def provider_pressure(error: BaseException | None) -> bool:
+    """The provider refused this call. Another attempt on the same model will not finish the job."""
+    if error is None:
+        return False
+    if getattr(error, "provider_outage", False):
+        return True
+    status = getattr(error, "status_code", None)
+    if status in {429, 500, 502, 503, 504}:
+        return True
+    text = str(error).casefold()
+    return any(
+        token in text
+        for token in (
+            "not enough capacity",
+            "backend_out_of_capacity",
+            "db_unavailable",
+            "verifying your key",
+            "too many requests",
+            "error 429",
+            "error 500",
+            "error 502",
+            "error 503",
+            "error 504",
+            "all structured llm fallbacks failed",
+            "all llm fallbacks failed",
+        )
+    )

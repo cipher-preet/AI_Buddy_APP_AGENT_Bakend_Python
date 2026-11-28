@@ -420,6 +420,40 @@ def test_mindmap_by_id_hides_other_users(api, monkeypatch):
     assert owner.json()["mindmap"]["userId"] == USER_A
 
 
+def test_shared_teammate_can_move_mindmap_nodes(api, monkeypatch):
+    moved = []
+
+    class Store:
+        def __init__(self, database):
+            pass
+
+        async def get(self, mindmap_id):
+            if mindmap_id != "map-1":
+                return None
+            return {"_id": "map-1", "userId": USER_A, "spaceId": SPACE_A, "graph": {"nodes": []}}
+
+        async def update_positions(self, mindmap_id, positions):
+            moved.append((mindmap_id, positions))
+            return {
+                "_id": "map-1",
+                "userId": USER_A,
+                "spaceId": SPACE_A,
+                "graph": {"nodes": [{"id": "n1", "position": positions[0]}]},
+            }
+
+    monkeypatch.setattr("apps.api_gateway.routes.mindmap_routes.MindmapStore", Store)
+    monkeypatch.setattr("apps.api_gateway.routes.mindmap_routes.get_database", _shared_space)
+    body = {"positions": [{"id": "n1", "x": 12, "y": 40}]}
+    viewer = api.patch("/api/v1/mindmap/map-1/layout", json=body, headers=_auth(USER_B))
+    assert viewer.status_code == 200
+    assert moved == [("map-1", [{"id": "n1", "x": 12.0, "y": 40.0}])]
+
+    monkeypatch.setattr("apps.api_gateway.routes.mindmap_routes.get_database", _owned_space)
+    outsider = api.patch("/api/v1/mindmap/map-1/layout", json=body, headers=_auth(USER_B))
+    assert outsider.status_code == 404
+    assert len(moved) == 1
+
+
 def test_speech_job_and_listening_are_bound_to_the_token_user(api, monkeypatch):
     started = []
 

@@ -413,6 +413,78 @@ class MindmapStore:
             updated["graph"] = next_graph
         return updated
 
+    async def update_positions(
+        self,
+        mindmap_id: str,
+        positions: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        document = await self.get(mindmap_id)
+        if document is None:
+            return None
+
+        lookup: dict[str, dict[str, float]] = {}
+        for item in positions:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("id") or "").strip()
+            if not node_id:
+                continue
+            try:
+                x = float(item["x"])
+                y = float(item["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if x != x or y != y:
+                continue
+            lookup[node_id] = {"x": x, "y": y}
+        if not lookup:
+            raise ValueError("At least one node position is required.")
+
+        graph = document.get("graph") if isinstance(document.get("graph"), dict) else {}
+        nodes = graph.get("nodes") if isinstance(graph.get("nodes"), list) else []
+        edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+        next_nodes: list[Any] = []
+        moved = False
+        for node in nodes:
+            if not isinstance(node, dict):
+                next_nodes.append(node)
+                continue
+            update = lookup.get(str(node.get("id") or ""))
+            if update is None:
+                next_nodes.append(node)
+                continue
+            copied = dict(node)
+            position = copied.get("position") if isinstance(copied.get("position"), dict) else {}
+            copied["position"] = {**position, "x": update["x"], "y": update["y"]}
+            next_nodes.append(copied)
+            moved = True
+        if not moved:
+            raise ValueError("Node not found on this mind map.")
+
+        next_graph = {"nodes": next_nodes, "edges": edges}
+        preview = build_mindmap_preview(next_graph)
+        now = utc_now()
+        await self._graphs().update_one(
+            {"_id": document.get("_id")},
+            {"$set": {"graph": next_graph, "inlineUpdatedAt": now}},
+            upsert=True,
+        )
+        updated = await self.collection.find_one_and_update(
+            {"_id": {"$in": mongo_id_candidates(mindmap_id)}},
+            {
+                "$set": {
+                    "preview": preview,
+                    "updatedAt": now,
+                    "message": "Mind map layout updated",
+                },
+                "$unset": {"graph": ""},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated is not None:
+            updated["graph"] = next_graph
+        return updated
+
     async def mark_failed(self, mindmap_id: str, error: str) -> dict[str, Any] | None:
         from services.queue.job_lease import require_active_lease
 

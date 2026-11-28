@@ -62,7 +62,7 @@ def conversation_route_spec(capability) -> list[tuple[str, str]]:
         )
         if fallback[0] and fallback[1] and fallback not in pairs:
             pairs.append(fallback)
-        return pairs
+        return _with_other_provider(pairs)
     if role == "synthesis":
         pairs = [(settings.CONVERSATION_SYNTHESIS_PROVIDER, settings.CONVERSATION_SYNTHESIS_MODEL)]
         fallback = (
@@ -71,7 +71,7 @@ def conversation_route_spec(capability) -> list[tuple[str, str]]:
         )
         if fallback[0] and fallback[1] and fallback not in pairs:
             pairs.append(fallback)
-        return pairs
+        return _with_other_provider(pairs)
     if role == "validation":
         preferred = (
             settings.CONVERSATION_VALIDATION_FALLBACK_PROVIDER,
@@ -94,7 +94,26 @@ def conversation_route_spec(capability) -> list[tuple[str, str]]:
                 settings.CONVERSATION_VALIDATION_FALLBACK_MODEL,
             )
         ]
-    return [(settings.CONVERSATION_SEMANTIC_PROVIDER, settings.CONVERSATION_SEMANTIC_MODEL)]
+    return _with_other_provider([(settings.CONVERSATION_SEMANTIC_PROVIDER, settings.CONVERSATION_SEMANTIC_MODEL)])
+
+
+def _with_other_provider(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Keep one model on a second provider when every configured model shares one account.
+
+    A Krutrim key-database outage fails every Krutrim model. The notes job still
+    has to finish, on the provider that is answering.
+    """
+    names = {provider for provider, model in pairs if provider and model}
+    if len(names) != 1:
+        return pairs
+    only = next(iter(names))
+    if only == "mistral":
+        extra = ("krutrim", settings.KRUTRIM_DEFAULT_MODEL)
+    else:
+        extra = (settings.CONVERSATION_SEMANTIC_PROVIDER, settings.CONVERSATION_SEMANTIC_MODEL)
+    if extra[0] and extra[1] and extra[0] != only and extra not in pairs:
+        return [*pairs, extra]
+    return pairs
 
 
 def provider_model_for(provider_name: str) -> str:

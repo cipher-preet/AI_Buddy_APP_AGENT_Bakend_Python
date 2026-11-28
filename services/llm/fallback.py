@@ -56,7 +56,10 @@ class FallbackLLMProvider:
     async def generate(self, request: LLMRequest) -> LLMResponse:
         last_error: Exception | None = None
         estimated_tokens = _estimate_request_tokens(request.messages, request.max_tokens)
+        blocked_providers: set[str] = set()
         for candidate in self.candidates:
+            if candidate.provider.name in blocked_providers:
+                continue
             if not _candidate_fits(candidate, estimated_tokens):
                 continue
             routed_request = request.model_copy(deep=True)
@@ -105,9 +108,16 @@ class FallbackLLMProvider:
                         "error": str(error)[:300],
                     },
                 )
+                if _provider_outage(error):
+                    blocked_providers.add(candidate.provider.name)
                 if not _should_try_next(error):
                     raise
-        raise LLMProviderError(f"all LLM fallbacks failed for {self.name}: {last_error}", retryable=True)
+        raise LLMProviderError(
+            f"all LLM fallbacks failed for {self.name}: {last_error}",
+            retryable=True,
+            status_code=getattr(last_error, "status_code", None),
+            provider_outage=bool(getattr(last_error, "provider_outage", False)),
+        )
 
     async def generate_structured(
         self,
@@ -122,7 +132,10 @@ class FallbackLLMProvider:
         eligible = [candidate for candidate in self.candidates if _candidate_fits(candidate, estimated_tokens)]
         if not eligible:
             eligible = list(self.candidates)
+        blocked_providers: set[str] = set()
         for candidate in eligible:
+            if candidate.provider.name in blocked_providers:
+                continue
             routed_request = request.model_copy(deep=True)
             routed_request.model = candidate.model
             routed_request.max_tokens = _structured_max_tokens(
@@ -212,6 +225,8 @@ class FallbackLLMProvider:
                         "error": str(error)[:300],
                     },
                 )
+                if _provider_outage(error):
+                    blocked_providers.add(candidate.provider.name)
                 if not _should_try_next(error):
                     route.fallback_depth = max(0, len(route.failure_history) - 1)
                     self.last_structured_route = route.as_log()
@@ -223,7 +238,9 @@ class FallbackLLMProvider:
         raise LLMProviderError(
             f"all structured LLM fallbacks failed for {self.name}: {last_error}",
             retryable=True,
+            status_code=getattr(last_error, "status_code", None),
             failure_reason=classify_llm_failure(last_error) if last_error else None,
+            provider_outage=bool(getattr(last_error, "provider_outage", False)),
         )
 
     async def health_check(self) -> ProviderHealth:
@@ -258,6 +275,10 @@ def resolved_provider_model(provider, fallback: str | None = None) -> str | None
     if used:
         return used
     return fallback
+
+
+def _provider_outage(error: Exception) -> bool:
+    return bool(getattr(error, "provider_outage", False))
 
 
 def _should_try_next(error: Exception) -> bool:

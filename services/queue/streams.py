@@ -713,7 +713,7 @@ class RedisStreamConsumer:
                 {
                     "event": retry.model_dump_json(),
                     "targetStream": self.stream,
-                    "notBefore": str(datetime.now(timezone.utc).timestamp() + retry_delay(event.attempt)),
+                    "notBefore": str(datetime.now(timezone.utc).timestamp() + retry_delay(event.attempt, error)),
                 },
             )
         else:
@@ -823,9 +823,19 @@ async def _still_owned(lease) -> bool:
         return False
 
 
-def retry_delay(attempt: int) -> float:
+def retry_delay(attempt: int, error: BaseException | None = None) -> float:
     base = settings.WORKER_RETRY_BASE_SECONDS
-    return min(settings.WORKER_RETRY_MAX_SECONDS, base * (2**attempt) + random.uniform(0, base))
+    delay = min(settings.WORKER_RETRY_MAX_SECONDS, base * (2**attempt) + random.uniform(0, base))
+    if _provider_pressure(error):
+        # Every model already refused. Wait before the whole notes job is run again.
+        delay = max(delay, min(settings.WORKER_RETRY_MAX_SECONDS, 30 * (attempt + 1)))
+    return delay
+
+
+def _provider_pressure(error: BaseException | None) -> bool:
+    from services.llm.errors import provider_pressure
+
+    return provider_pressure(error)
 
 
 async def stream_metrics(stream: str, group: str) -> dict[str, int]:

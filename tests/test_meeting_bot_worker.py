@@ -105,6 +105,62 @@ def test_stop_preserves_recording_when_the_recording_callback_was_missed():
     worker.terminal.assert_not_awaited()
 
 
+def test_call_ended_keeps_checking_until_the_recording_file_exists():
+    worker = object.__new__(bot.MeetingBotWorker)
+    provider_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    response = httpx.Response(200, json={
+        "status_changes": [{"code": "call_ended"}],
+    }, request=httpx.Request("GET", f"https://us-east-1.recall.ai/api/v1/bot/{provider_id}/"))
+    worker.recall = AsyncMock(return_value=response)
+    worker.node = AsyncMock()
+    worker.save = AsyncMock()
+    worker.defer_attendance = AsyncMock()
+    worker.terminal = AsyncMock()
+    run = {
+        "_id": "run-id",
+        "providerId": provider_id,
+        "joinAt": bot.now() - timedelta(minutes=10),
+        "providerStatus": "call_ended",
+        "providerStatusAt": bot.now() - timedelta(seconds=30),
+        "sessionPublished": True,
+        "dashboardEnded": True,
+    }
+    asyncio.run(worker.attendance(run))
+    worker.defer_attendance.assert_not_awaited()
+    worker.recall.assert_awaited()
+    assert worker.save.await_args.kwargs["nextAt"] <= bot.now() + timedelta(seconds=25)
+
+
+def test_pending_recording_is_retried_quickly_and_does_not_count_as_a_failure():
+    worker = object.__new__(bot.MeetingBotWorker)
+    worker.import_recording = AsyncMock(side_effect=bot.RecordingNotReady("Recording media is pending"))
+    worker.save = AsyncMock()
+    worker.terminal = AsyncMock()
+    run = {"_id": "run-id", "state": "importing", "attempts": 3}
+    asyncio.run(worker.step(run))
+    worker.terminal.assert_not_awaited()
+    assert "attempts" not in worker.save.await_args.kwargs
+    assert worker.save.await_args.kwargs["nextAt"] <= bot.now() + timedelta(seconds=20)
+    assert worker.save.await_args.kwargs["mediaWaitStartedAt"] <= bot.now()
+
+
+def test_pending_recording_fails_after_the_wait_limit():
+    worker = object.__new__(bot.MeetingBotWorker)
+    worker.import_recording = AsyncMock(side_effect=bot.RecordingNotReady("Recording media is pending"))
+    worker.save = AsyncMock()
+    worker.terminal = AsyncMock()
+    run = {
+        "_id": "run-id",
+        "state": "importing",
+        "attempts": 1,
+        "mediaWaitStartedAt": bot.now() - timedelta(minutes=21),
+    }
+    asyncio.run(worker.step(run))
+    worker.save.assert_not_awaited()
+    worker.terminal.assert_awaited_once()
+    assert worker.terminal.await_args.args[1] == "failed"
+
+
 def test_attendance_publishes_the_live_meeting_on_the_dashboard():
     worker = object.__new__(bot.MeetingBotWorker)
     worker.save = AsyncMock()
@@ -124,11 +180,19 @@ def test_attendance_publishes_the_live_meeting_on_the_dashboard():
         "providerStatusAt": bot.now() - timedelta(seconds=30),
     }
     asyncio.run(worker.attendance(run))
-    worker.node.assert_awaited_once()
-    assert worker.node.await_args.args[1] == "live"
+    assert [call.args[1] for call in worker.node.await_args_list] == ["check", "live"]
     assert worker.save.await_args.kwargs["sessionPublished"] is True
     assert worker.save.await_args.kwargs["providerStatus"] == "in_call_recording"
     worker.defer_attendance.assert_not_awaited()
+
+
+def test_join_deadline_follows_the_meeting_end_and_otherwise_allows_five_minutes():
+    start = datetime(2026, 11, 27, 5, 0, tzinfo=timezone.utc)
+    assert bot.join_deadline(start, start + timedelta(minutes=45)) == start + timedelta(minutes=45)
+    assert bot.join_deadline(start, None) == start + timedelta(minutes=5)
+    assert bot.join_deadline(start, start - timedelta(minutes=1)) == start + timedelta(minutes=5)
+    assert bot.parsed_end("2026-11-27T05:45:00Z") == start + timedelta(minutes=45)
+    assert bot.parsed_end(None) is None
 
 
 def test_unconfirmed_provider_request_is_recovered_without_creating_a_second_bot():

@@ -26,8 +26,19 @@ log = logging.getLogger(__name__)
 LEASE_SECONDS = 90
 RECOVERY_DELAY = 180
 ATTEMPT_LIMIT = 8
-MAX_PENDING_AUDIO_CHUNKS = 8
+MEDIA_POLL_SECONDS = 15
+MEDIA_WAIT_LIMIT = timedelta(minutes=20)
 LIVE_STATUSES = {"in_call_not_recording", "in_call_recording", "call_ended", "done"}
+POST_CALL_STATUSES = {"call_ended", "done", "fatal"}
+
+
+class RecordingNotReady(RuntimeError):
+    """Recall has ended the call, but the recording file is not available yet."""
+
+
+def other_recording(message: str) -> bool:
+    text = message.lower()
+    return "already being recorded in the browser" in text or "already recording a meeting" in text
 ATTENDANCE_POLL_SECONDS = 15
 
 
@@ -81,6 +92,22 @@ async def store_meeting_card_thumbnail(db, meeting_id, user_id: str, video: Path
         )
     except Exception as exc:
         log.warning("meeting_bot_thumbnail_failed error=%s", type(exc).__name__)
+
+
+def join_deadline(join_at: datetime, ends_at: datetime | None) -> datetime:
+    """Keep trying while the meeting itself is still going. Otherwise allow five minutes."""
+    if ends_at is not None and ends_at > join_at:
+        return ends_at
+    return join_at + timedelta(minutes=5)
+
+
+def parsed_end(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return as_utc(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def recorded_audio(run: dict, bot: dict) -> bool:
@@ -191,7 +218,7 @@ class MeetingBotWorker:
         try:
             await self.save(run, activeCapture=True)
         except DuplicateKeyError:
-            if now() > as_utc(run["joinAt"]) + timedelta(minutes=5):
+            if now() > join_deadline(as_utc(run["joinAt"]), parsed_end(run.get("endsAt"))):
                 await self.terminal(run, "failed", "Another recording bot was active when this meeting started.")
             else:
                 await self.save(run, nextAt=now() + timedelta(seconds=25))
@@ -199,14 +226,24 @@ class MeetingBotWorker:
         try:
             checked = await self.node(run, "check")
         except WorkerRejected as error:
-            await self.terminal(run, "cancelled" if run.get("eventId") else "failed", str(error))
+            message = str(error)
+            # Stay queued and try again. Cancelling here would drop a meeting that is still going
+            # after the other recording stops, and holding the capture slot would deadlock it.
+            if other_recording(message) and now() <= join_deadline(as_utc(run["joinAt"]), parsed_end(run.get("endsAt"))):
+                await self.save(run, activeCapture=False, message=message, attempts=0, nextAt=now() + timedelta(seconds=30))
+                return
+            await self.terminal(run, "cancelled" if run.get("eventId") else "failed", message)
             return
         join_at = as_utc(checked.get("joinAt") or run["joinAt"])
-        if now() > join_at + timedelta(minutes=5):
+        ends_at = parsed_end(checked.get("endsAt")) or parsed_end(run.get("endsAt"))
+        if now() > join_deadline(join_at, ends_at):
             await self.terminal(run, "failed", "The scheduled join time has passed.")
             return
         if run.get("eventId") and join_at > now() + timedelta(seconds=5):
-            await self.save(run, joinAt=join_at, nextAt=join_at, activeCapture=False, url=checked["url"], provider=checked["provider"])
+            await self.save(
+                run, joinAt=join_at, endsAt=ends_at, nextAt=join_at, activeCapture=False, message=None,
+                url=checked["url"], provider=checked["provider"],
+            )
             return
         latest = await self.runs.find_one({"_id": run["_id"], "lease": run["lease"]})
         if not latest:
@@ -214,7 +251,10 @@ class MeetingBotWorker:
         if latest.get("stopRequested"):
             await self.terminal(run, "cancelled")
             return
-        await self.save(run, dispatchStartedAt=now(), provider=checked.get("provider") or run["provider"], joinAt=join_at)
+        await self.save(
+            run, dispatchStartedAt=now(), provider=checked.get("provider") or run["provider"],
+            joinAt=join_at, endsAt=ends_at, message=None,
+        )
         payload = {
             "meeting_url": checked.get("url") or run["url"],
             "bot_name": "KukuNotes Recorder",
@@ -251,8 +291,25 @@ class MeetingBotWorker:
         if not re.fullmatch(r"[a-fA-F0-9-]{36}", provider_id):
             raise InvalidRecording("The recording service returned an invalid bot ID.")
         path = f"/bot/{provider_id}/"
+        if not run.get("stopRequested"):
+            try:
+                await self.node(run, "check")
+            except WorkerRejected as error:
+                message = str(error)
+                if other_recording(message):
+                    response = await self.recall("POST", path + "leave_call/")
+                    if response.status_code not in {200, 400, 404, 409}:
+                        response.raise_for_status()
+                    await self.terminal(run, "cancelled" if run.get("eventId") else "failed", message)
+                    return
         join_at = as_utc(run["joinAt"])
         state = run.get("providerStatus")
+        if run.get("stopRequested") and other_recording(str(run.get("message") or "")):
+            response = await self.recall("POST", path + "leave_call/")
+            if response.status_code not in {200, 400, 404, 409}:
+                response.raise_for_status()
+            await self.terminal(run, "cancelled" if run.get("eventId") else "failed", str(run.get("message")))
+            return
         if run.get("stopRequested") and not run.get("stopSent") and state not in {"call_ended", "done", "fatal"}:
             if join_at > now() and state is None:
                 response = await self.recall("DELETE", path)
@@ -274,8 +331,14 @@ class MeetingBotWorker:
                             sessionPublished=bool(run.get("sessionPublished")))
             return
         grace = as_utc(run.get("providerStatusAt") or join_at) + timedelta(seconds=RECOVERY_DELAY)
-        # Until the dashboard row exists, poll Recall directly. Webhooks are not required.
-        if now() < grace and not run.get("stopRequested") and run.get("sessionPublished"):
+        # During the call, slow the polls after the card exists. Once the call has
+        # ended, keep checking so the recording file is imported without a long wait.
+        if (
+            now() < grace
+            and not run.get("stopRequested")
+            and run.get("sessionPublished")
+            and state not in POST_CALL_STATUSES
+        ):
             await self.defer_attendance(run, grace)
             return
         response = await self.recall("GET", path)
@@ -389,7 +452,7 @@ class MeetingBotWorker:
                     return
                 if not did_record:
                     raise InvalidRecording("The bot did not record. Check host admission and recording permissions.")
-                raise RuntimeError("Recording media is pending or no recording was permitted")
+                raise RecordingNotReady("Recording media is pending or no recording was permitted")
             url, recording_started = media
             if recording_started:
                 started = as_utc(recording_started)
@@ -419,7 +482,6 @@ class MeetingBotWorker:
                 if duration <= 0:
                     raise InvalidRecording("The saved video contains an empty audio chunk.")
                 if sequence > last_registered:
-                    await self.wait_for_audio_capacity(run)
                     await store_audio_chunk(audio, owner, run_id, sequence)
                     await self.node(run, "chunk", {
                         "sequence": sequence, "sizeBytes": audio.stat().st_size,
@@ -438,13 +500,12 @@ class MeetingBotWorker:
         await self.node(run, "finish", completion)
         await self.terminal(run, "processing")
 
-    async def wait_for_audio_capacity(self, run: dict):
-        async with asyncio.timeout(240):
-            while await self.db.transcript_chunks.count_documents({
-                "conversationId": run["_id"],
-                "sttStatus": {"$nin": ["COMPLETED", "FAILED"]},
-            }, limit=MAX_PENDING_AUDIO_CHUNKS) >= MAX_PENDING_AUDIO_CHUNKS:
-                await asyncio.sleep(5)
+    async def retry_when_recording_is_pending(self, run: dict):
+        started = as_utc(run["mediaWaitStartedAt"]) if run.get("mediaWaitStartedAt") else now()
+        if now() - started > MEDIA_WAIT_LIMIT:
+            await self.terminal(run, "failed", "The recording file was not ready in time.")
+            return
+        await self.save(run, mediaWaitStartedAt=started, nextAt=now() + timedelta(seconds=MEDIA_POLL_SECONDS))
 
     async def step(self, run: dict):
         try:
@@ -452,6 +513,8 @@ class MeetingBotWorker:
             await action(run)
         except (InvalidRecording, WorkerRejected) as exc:
             await self.terminal(run, "failed", str(exc))
+        except RecordingNotReady:
+            await self.retry_when_recording_is_pending(run)
         except LeaseExpired:
             return
         except Exception as exc:

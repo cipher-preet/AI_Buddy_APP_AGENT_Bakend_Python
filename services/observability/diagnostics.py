@@ -34,7 +34,6 @@ class ActiveJobCounters:
                 "active_stt_jobs": self._counts.get("stt", 0),
                 "active_audio_jobs": self._counts.get("audio", 0),
                 "active_window_jobs": self._counts.get("window", 0),
-                "active_briefing_jobs": self._counts.get("briefing", 0),
                 "active_processing_jobs": self._counts.get("processing", 0),
             }
 

@@ -121,10 +121,10 @@ def test_semantic_extraction_selects_mistral_glm_flash_with_gemma_fallback():
         models = _candidate_models(router, capability)
         provider, model = router.route(capability)
         assert names == ["mistral", "krutrim"]
-        assert models == ["zai-glm-5-3-flash", "gpt-oss-120b"]
+        assert models == ["zai-glm-5-3-flash", "gemma-4-31b-it"]
         assert getattr(provider, "name", None) == "mistral"
         assert model == "zai-glm-5-3-flash"
-    expected = [("mistral", "zai-glm-5-3-flash"), ("krutrim", "gpt-oss-120b")]
+    expected = [("mistral", "zai-glm-5-3-flash"), ("krutrim", "gemma-4-31b-it")]
     assert conversation_route_spec(LLMCapability.SIMPLE_SUMMARY) == expected
     assert conversation_route_spec(LLMCapability.SEMANTIC_EXTRACTION) == expected
 
@@ -134,13 +134,14 @@ def test_final_synthesis_selects_krutrim_gpt_oss_120b():
     names = _candidate_names(router, LLMCapability.FINAL_SYNTHESIS)
     models = _candidate_models(router, LLMCapability.FINAL_SYNTHESIS)
     provider, model = router.route(LLMCapability.FINAL_SYNTHESIS)
-    assert names == ["krutrim", "krutrim"]
-    assert models == ["gpt-oss-120b", "gemma-4-31b-it"]
+    assert names == ["krutrim", "krutrim", "mistral"]
+    assert models == ["gpt-oss-120b", "gemma-4-31b-it", "zai-glm-5-3-flash"]
     assert getattr(provider, "name", None) == "krutrim"
     assert model == "gpt-oss-120b"
     assert conversation_route_spec(LLMCapability.FINAL_SYNTHESIS) == [
         ("krutrim", "gpt-oss-120b"),
         ("krutrim", "gemma-4-31b-it"),
+        ("mistral", "zai-glm-5-3-flash"),
     ]
 
 
@@ -150,9 +151,9 @@ def test_default_validation_selects_krutrim_gpt_oss_120b():
     models = _candidate_models(router, LLMCapability.VALIDATION)
     provider, model = router.route(LLMCapability.VALIDATION)
     assert names[0] == "krutrim"
-    assert models[0] == "gpt-oss-120b"
+    assert models[0] == "gemma-4-31b-it"
     assert getattr(provider, "name", None) == "krutrim"
-    assert model == "gpt-oss-120b"
+    assert model == "gemma-4-31b-it"
     assert conversation_route_spec(LLMCapability.VALIDATION)[0] == (
         settings.CONVERSATION_VALIDATION_FALLBACK_PROVIDER,
         settings.CONVERSATION_VALIDATION_FALLBACK_MODEL,
@@ -168,13 +169,13 @@ def test_hard_validation_fallback_selects_krutrim_gpt_oss_120b():
     validation = router._cost_optimized_candidates(LLMCapability.VALIDATION)
     fallback = router._cost_optimized_candidates(LLMCapability.FALLBACK)
     assert [(item.provider.name, item.model) for item in validation] == [
-        ("krutrim", "gpt-oss-120b"),
+        ("krutrim", "gemma-4-31b-it"),
         ("mistral", "ministral-14b-latest"),
     ]
-    assert [(item.provider.name, item.model) for item in fallback] == [("krutrim", "gpt-oss-120b")]
+    assert [(item.provider.name, item.model) for item in fallback] == [("krutrim", "gemma-4-31b-it")]
     provider, model = router.route(LLMCapability.FALLBACK)
     assert getattr(provider, "name", None) == "krutrim"
-    assert model == "gpt-oss-120b"
+    assert model == "gemma-4-31b-it"
 
 
 def test_conversation_intelligence_never_selects_free_providers():
@@ -268,7 +269,7 @@ def test_validator_failure_uses_gpt_oss_120b_not_obsolete_provider():
     parsed = asyncio.run(routed.generate_structured(_understanding_request(model), ConversationUnderstandingResponse))
     assert parsed.problems == ["Duplicate outlet appeared twice"]
     assert routed.last_successful_provider == "krutrim"
-    assert routed.last_successful_model == "gpt-oss-120b"
+    assert routed.last_successful_model == "gemma-4-31b-it"
     assert groq.calls == 0
     assert gemini.calls == 0
     assert sarvam.calls == 0
@@ -341,7 +342,7 @@ def test_unconfigured_krutrim_does_not_fall_back_to_free_models():
     assert model == "zai-glm-5-3-flash"
     assert _candidate_names(router, LLMCapability.HIGH_ACCURACY_REASONING) == ["mistral"]
     assert _candidate_names(router, LLMCapability.SEMANTIC_EXTRACTION) == ["mistral"]
-    assert _candidate_names(router, LLMCapability.FINAL_SYNTHESIS) == []
+    assert _candidate_names(router, LLMCapability.FINAL_SYNTHESIS) == ["mistral"]
     assert "groq" not in _candidate_names(router, LLMCapability.VALIDATION)
     assert "gemini" not in _candidate_names(router, LLMCapability.VALIDATION)
     assert "sarvam" not in _candidate_names(router, LLMCapability.VALIDATION)
@@ -356,7 +357,7 @@ def test_conversation_intelligence_order_includes_gemini():
         LLMCapability.HIGH_ACCURACY_REASONING: ["mistral", "krutrim"],
         LLMCapability.SEMANTIC_EXTRACTION: ["mistral", "krutrim"],
         LLMCapability.SIMPLE_SUMMARY: ["mistral", "krutrim"],
-        LLMCapability.FINAL_SYNTHESIS: ["krutrim", "krutrim"],
+        LLMCapability.FINAL_SYNTHESIS: ["krutrim", "krutrim", "mistral"],
         LLMCapability.VALIDATION: ["krutrim", "mistral"],
         LLMCapability.FALLBACK: ["krutrim"],
     }

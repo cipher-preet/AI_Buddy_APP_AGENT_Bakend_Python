@@ -30,6 +30,16 @@ class GenerateMindmapBody(BaseModel):
     timeZone: str | None = None
 
 
+class MindmapNodePosition(BaseModel):
+    id: str = Field(min_length=1, max_length=200)
+    x: float
+    y: float
+
+
+class MindmapLayoutBody(BaseModel):
+    positions: list[MindmapNodePosition] = Field(min_length=1, max_length=400)
+
+
 @router.post("/generate")
 async def generate_mindmap(
     body: GenerateMindmapBody,
@@ -162,6 +172,44 @@ async def remove_mindmap_node(
             missing_detail="Mind map not found.",
         )
         document = await store.remove_node(mindmap_id.strip(), node_id.strip())
+    except AccessDenied as error:
+        raise_for_access(error)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to update mind map: {type(error).__name__}",
+        ) from error
+
+    if document is None:
+        raise HTTPException(status_code=404, detail="Mind map not found.")
+    return {"success": True, "mindmap": public_mindmap_doc(document)}
+
+
+@router.patch("/{mindmap_id}/layout")
+async def update_mindmap_layout(
+    mindmap_id: str,
+    body: MindmapLayoutBody,
+    actor: AuthenticatedUser = Depends(require_user),
+):
+    """Owners and teammates who can open the shared space may rearrange nodes."""
+    store = MindmapStore(get_database())
+    current = await store.get(mindmap_id.strip())
+    if current is None:
+        raise HTTPException(status_code=404, detail="Mind map not found.")
+    try:
+        await require_owned_resource(
+            get_database(),
+            actor.user_id,
+            current,
+            operation="read",
+            missing_detail="Mind map not found.",
+        )
+        document = await store.update_positions(
+            mindmap_id.strip(),
+            [item.model_dump() for item in body.positions],
+        )
     except AccessDenied as error:
         raise_for_access(error)
     except ValueError as error:

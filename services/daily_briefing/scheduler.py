@@ -87,7 +87,6 @@ class DailyBriefingScheduler:
         started = time.perf_counter()
         if not settings.DAILY_BRIEFING_ENABLED:
             counts["disabled"] = 1
-            self._emit_scan(counts, started)
             return counts
 
         now = self.now_factory()

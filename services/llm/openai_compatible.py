@@ -13,6 +13,7 @@ from pydantic import BaseModel, ValidationError
 from apps.api_gateway.config.setting import settings
 from services.llm.async_runtime import LoopBoundAsyncClient, LoopLocalSemaphore, is_async_lifecycle_error
 from services.llm.errors import AsyncLifecycleError, LLMProviderError, StructuredOutputError, is_retryable_status
+from services.llm.pressure import note_provider_pressure, provider_slot
 from services.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StructuredLLMRequest
 from services.llm.schema_adapter import (
     HTTP_ERROR,
@@ -384,13 +385,22 @@ class OpenAICompatibleProvider:
         lifecycle_refreshed = False
         for attempt in range(self.max_retries + 1):
             try:
-                client = await self._http_client()
-                headers = {**self._default_headers, self._auth_header: self._auth_value}
-                response = await client.post(
-                    path,
-                    headers=headers,
-                    json=payload,
-                )
+                async with provider_slot(self.name):
+                    client = await self._http_client()
+                    headers = {**self._default_headers, self._auth_header: self._auth_value}
+                    response = await client.post(
+                        path,
+                        headers=headers,
+                        json=payload,
+                    )
+                    if response.status_code in {429, 502, 503, 504}:
+                        # 3505 means this model has no capacity. Do not call it again for a while.
+                        refused = response.text[:1000]
+                        note_provider_pressure(
+                            self.name,
+                            response.headers.get("retry-after"),
+                            capacity=_model_out_of_capacity(response.status_code, refused),
+                        )
                 if response.status_code < 400:
                     # OpenRouter free providers may return HTTP 200 with an embedded error
                     # (e.g. Nvidia 502/503). Do not log that as success.
@@ -452,6 +462,15 @@ class OpenAICompatibleProvider:
                 retryable = is_retryable_status(response.status_code)
                 failure_reason = RATE_LIMITED if response.status_code == 429 else HTTP_ERROR
                 body = response.text[:1000]
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    # This provider is paused. A different provider may run once; otherwise the queue waits.
+                    raise LLMProviderError(
+                        f"{self.name} error {response.status_code}: {body}",
+                        retryable=True,
+                        status_code=response.status_code,
+                        failure_reason=failure_reason,
+                        provider_outage=_provider_wide_outage(response.status_code, body),
+                    )
                 if response.status_code in {400, 422} and any(
                     token in body.casefold() for token in ("json_schema", "response_format", "schema", "strict")
                 ):
@@ -525,6 +544,27 @@ class OpenAICompatibleProvider:
         if max_tokens is None or self.max_tokens_limit is None:
             return max_tokens
         return min(max_tokens, self.max_tokens_limit)
+
+
+def _model_out_of_capacity(status: int, body: str) -> bool:
+    """Mistral 3505/3801: the model has no capacity. Docs say use another model for a while."""
+    if status not in {429, 503}:
+        return False
+    text = body.casefold().replace(" ", "")
+    return (
+        "backend_out_of_capacity" in text
+        or "notenoughcapacity" in text
+        or '"code":"3505"' in text
+        or '"code":"3801"' in text
+    )
+
+
+def _provider_wide_outage(status: int, body: str) -> bool:
+    """Krutrim db_unavailable is the account, not one model. Sibling models on that key fail the same way."""
+    if status not in {500, 502, 503, 504}:
+        return False
+    text = body.casefold()
+    return "db_unavailable" in text or "verifying your key" in text
 
 
 def _retry_delay(attempt: int, retry_after: str | None) -> float:

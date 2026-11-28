@@ -35,6 +35,7 @@ from services.conversation.meeting_pipeline.schemas import (
 )
 from services.conversation.transcript import estimate_tokens
 from services.llm.async_runtime import reraise_if_hard_runtime
+from services.llm.errors import provider_pressure
 from services.llm.router import LLMCapability, LLMRouter
 
 _NOTE_KINDS = frozenset(
@@ -110,6 +111,8 @@ class GlobalArtifactConsolidator:
                 result = await self._consolidate_partitions(partitions, ledger, sequence_text)
             except Exception as error:
                 reraise_if_hard_runtime(error)
+                if provider_pressure(error):
+                    raise
                 smaller = partition_candidates(ledger.candidates, sequence_text, max(2000, budget // 2), max(8, size // 2))
                 if len(smaller) <= 1:
                     raise

@@ -59,6 +59,13 @@ class ConversationInactivityScanner:
             finalized += 1
         stale_cutoff = utc_now() - timedelta(seconds=max(30, settings.REDIS_CLAIM_IDLE_MS // 1000))
         stale_conversations = await self.repository.find_stale_unfinalized_conversations(stale_cutoff)
+        abandoned_before = utc_now() - timedelta(seconds=float(settings.CONVERSATION_PROCESSING_TIMEOUT_SECONDS))
+        find_abandoned = getattr(self.repository, "find_abandoned_processing_conversations", None)
+        if find_abandoned is not None:
+            seen = {str(conversation.id) for conversation in stale_conversations}
+            for conversation in await find_abandoned(abandoned_before):
+                if str(conversation.id) not in seen:
+                    stale_conversations.append(conversation)
         for conversation in stale_conversations:
             conversation_id = str(conversation.id)
             republish_count = conversation_republishes.record(conversation_id)
@@ -66,7 +73,11 @@ class ConversationInactivityScanner:
             updated_age_seconds = (
                 int((utc_now() - updated_at).total_seconds()) if updated_at is not None else None
             )
-            if conversation.status == ConversationStatus.READY_FOR_PROCESSING:
+            if conversation.status in {
+                ConversationStatus.READY_FOR_PROCESSING,
+                ConversationStatus.RETRY_PENDING,
+                ConversationStatus.PROCESSING,
+            }:
                 event = EventEnvelope(
                     eventType="conversation.processing.requested",
                     correlationId=conversation_id,
